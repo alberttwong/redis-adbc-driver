@@ -102,12 +102,13 @@ func (t *tableMeta) applyIndexPolicy(only map[string]bool, noIndex map[string]bo
 	n := 0
 	for i := range t.Columns {
 		c := &t.Columns[i]
-		want := indexable(c.Type) && !noIndex[c.Name]
+		// Only names usable as RediSearch attributes are indexed.
+		want := indexable(c.Type) && !noIndex[c.Name] && simpleName(c.Name)
 		if only != nil {
 			want = false
 			for name := range only {
 				if strings.EqualFold(name, c.Name) {
-					want = indexable(c.Type)
+					want = indexable(c.Type) && simpleName(c.Name)
 				}
 			}
 		}

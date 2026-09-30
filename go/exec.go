@@ -115,6 +115,10 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		n, err := e.runDelete(ctx, st, params)
 		return execResult{affected: n}, err
 	case *CreateTableStmt:
+		if st.AsSelect != nil {
+			n, err := e.runCreateTableAs(ctx, st)
+			return execResult{affected: n}, err
+		}
 		return execResult{affected: -1}, e.runCreateTable(ctx, st)
 	case *DropTableStmt:
 		schema, name, err := e.resolveTable(st.Table)
@@ -153,6 +157,105 @@ func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) erro
 	}
 	_, err = e.store.createTable(ctx, meta, st.IfNotExists)
 	return err
+}
+
+// runCreateTableAs implements CREATE TABLE … AS SELECT: the table's columns
+// take the names and types of the query's result, and the result rows are
+// inserted. It returns the number of rows inserted.
+func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (int64, error) {
+	schema, name, err := e.resolveTable(st.Table)
+	if err != nil {
+		return 0, err
+	}
+	if st.IfNotExists {
+		exists, err := e.store.tableExists(ctx, schema, name)
+		if err != nil || exists {
+			return 0, err
+		}
+	}
+	plan, err := e.planSelect(ctx, st.AsSelect, nil)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := e.runSelect(ctx, plan, nil)
+	if err != nil {
+		return 0, err
+	}
+	meta := &tableMeta{Schema: schema, Name: name}
+	for _, c := range plan.columns() {
+		t := c.Type
+		if t.Kind == KindNull {
+			t = typeString // SELECT NULL AS x: no type information
+		}
+		meta.Columns = append(meta.Columns, columnMeta{Name: c.Name, Type: t, Nullable: true})
+	}
+	if err := meta.applyIndexPolicy(nil, nil); err != nil {
+		return 0, err
+	}
+	if _, err := e.store.createTable(ctx, meta, st.IfNotExists); err != nil {
+		return 0, err
+	}
+	coerced := make([][]Value, len(rows))
+	for i, row := range rows {
+		out := make([]Value, len(row))
+		for j, v := range row {
+			cv, err := Coerce(v, meta.Columns[j].Type)
+			if err != nil {
+				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", meta.Columns[j].Name, err)
+			}
+			out[j] = cv
+		}
+		coerced[i] = out
+	}
+	return e.store.insertRows(ctx, meta, coerced)
+}
+
+// replaceAliases rewrites references to SELECT aliases (that are not also
+// table columns) into the aliased expressions.
+func replaceAliases(e Expr, aliases map[string]Expr, meta *tableMeta) Expr {
+	switch x := e.(type) {
+	case *ColumnRef:
+		if meta != nil {
+			if _, ok := meta.column(x.Name); ok {
+				return x
+			}
+		}
+		if a, ok := aliases[strings.ToLower(x.Name)]; ok {
+			return a
+		}
+		return x
+	case *Unary:
+		return &Unary{Op: x.Op, X: replaceAliases(x.X, aliases, meta)}
+	case *Binary:
+		return &Binary{Op: x.Op, L: replaceAliases(x.L, aliases, meta), R: replaceAliases(x.R, aliases, meta)}
+	case *IsNull:
+		return &IsNull{X: replaceAliases(x.X, aliases, meta), Not: x.Not}
+	case *Cast:
+		return &Cast{X: replaceAliases(x.X, aliases, meta), T: x.T}
+	case *Func:
+		if aggregateFuncs[x.Name] {
+			return x
+		}
+		f := *x
+		f.Args = make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			f.Args[i] = replaceAliases(a, aliases, meta)
+		}
+		return &f
+	case *Case:
+		c := &Case{Else: nil}
+		if x.Operand != nil {
+			c.Operand = replaceAliases(x.Operand, aliases, meta)
+		}
+		for _, w := range x.Whens {
+			c.Whens = append(c.Whens, WhenClause{When: replaceAliases(w.When, aliases, meta), Then: replaceAliases(w.Then, aliases, meta)})
+		}
+		if x.Else != nil {
+			c.Else = replaceAliases(x.Else, aliases, meta)
+		}
+		return c
+	}
+	return e
 }
 
 // ---- INSERT ----
@@ -228,6 +331,8 @@ type selectPlan struct {
 	items     []planItem
 	aggregate bool
 	order     []planOrder
+	// having is the HAVING predicate with output aliases resolved.
+	having Expr
 }
 
 func (p *selectPlan) columns() []resultColumn {
@@ -283,11 +388,45 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	}
 	if len(sel.GroupBy) > 0 {
 		plan.aggregate = true
-		for _, g := range sel.GroupBy {
+		aliases := map[string]Expr{}
+		for i, it := range sel.Items {
+			if !it.Star && it.Alias != "" {
+				aliases[strings.ToLower(it.Alias)] = plan.items[itemStart[i]].expr
+			}
+		}
+		for i, g := range sel.GroupBy {
+			// GROUP BY <ordinal> or <output alias>
+			if lit, ok := g.(*Literal); ok && lit.V.T.Kind.isInteger() && !lit.V.Null {
+				n := int(lit.V.I)
+				if n < 1 || n > len(plan.items) {
+					return nil, errorf(adbc.StatusInvalidArgument, "GROUP BY position %d is out of range", n)
+				}
+				g = plan.items[n-1].expr
+			} else {
+				g = replaceAliases(g, aliases, plan.meta)
+			}
 			if err := bindColumns(g, plan.meta); err != nil {
 				return nil, err
 			}
+			if isAggregate(g) {
+				return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in GROUP BY")
+			}
+			sel.GroupBy[i] = g
 		}
+	}
+	if sel.Having != nil {
+		plan.aggregate = true
+		aliases := map[string]Expr{}
+		for i, it := range sel.Items {
+			if !it.Star && it.Alias != "" {
+				aliases[strings.ToLower(it.Alias)] = plan.items[itemStart[i]].expr
+			}
+		}
+		having := replaceAliases(sel.Having, aliases, plan.meta)
+		if err := bindColumns(having, plan.meta); err != nil {
+			return nil, err
+		}
+		plan.having = having
 	}
 	if sel.Where != nil {
 		if isAggregate(sel.Where) {
@@ -496,60 +635,6 @@ func collectAggregates(e Expr, out *[]*Func) {
 			*out = append(*out, f)
 		}
 	})
-}
-
-// groupEnv evaluates expressions over a group, substituting reduced values
-// for aggregate calls.
-type groupEnv struct {
-	*evalEnv
-	aggs map[*Func]Value
-}
-
-func (g *groupEnv) eval(e Expr) (Value, error) {
-	if f, ok := e.(*Func); ok && aggregateFuncs[f.Name] {
-		return g.aggs[f], nil
-	}
-	switch x := e.(type) {
-	case *Unary:
-		v, err := g.eval(x.X)
-		if err != nil {
-			return Value{}, err
-		}
-		return g.evalEnv.eval(&Unary{Op: x.Op, X: &Literal{V: v}})
-	case *Binary:
-		l, err := g.eval(x.L)
-		if err != nil {
-			return Value{}, err
-		}
-		r, err := g.eval(x.R)
-		if err != nil {
-			return Value{}, err
-		}
-		return g.evalEnv.eval(&Binary{Op: x.Op, L: &Literal{V: l}, R: &Literal{V: r}})
-	case *Cast:
-		v, err := g.eval(x.X)
-		if err != nil {
-			return Value{}, err
-		}
-		return Coerce(v, x.T)
-	case *IsNull:
-		v, err := g.eval(x.X)
-		if err != nil {
-			return Value{}, err
-		}
-		return boolValue(v.Null != x.Not), nil
-	case *Func:
-		args := make([]Expr, len(x.Args))
-		for i, a := range x.Args {
-			v, err := g.eval(a)
-			if err != nil {
-				return Value{}, err
-			}
-			args[i] = &Literal{V: v}
-		}
-		return g.evalEnv.eval(&Func{Name: x.Name, Args: args})
-	}
-	return g.evalEnv.eval(e)
 }
 
 // ---- UPDATE / DELETE ----
