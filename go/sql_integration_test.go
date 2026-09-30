@@ -286,7 +286,6 @@ func TestSQLCreateTableAs(t *testing.T) {
 	h.expectError(`CREATE TABLE it_ctas_copy AS SELECT id FROM it_orders`, "already exists")
 }
 
-
 func TestSQLSubqueries(t *testing.T) {
 	h := newSQLHarness(t)
 	h.setupOrders()

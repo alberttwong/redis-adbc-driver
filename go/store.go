@@ -182,9 +182,11 @@ func tableKeySuffix(schema, table string) string {
 	return escapeKeyPart(schema) + ":" + escapeKeyPart(table)
 }
 
-func metaKey(schema, table string) string { return metaPrefix + "table:" + tableKeySuffix(schema, table) }
-func seqKey(schema, table string) string  { return metaPrefix + "seq:" + tableKeySuffix(schema, table) }
-func tablesKey(schema string) string      { return metaPrefix + "tables:" + escapeKeyPart(schema) }
+func metaKey(schema, table string) string {
+	return metaPrefix + "table:" + tableKeySuffix(schema, table)
+}
+func seqKey(schema, table string) string    { return metaPrefix + "seq:" + tableKeySuffix(schema, table) }
+func tablesKey(schema string) string        { return metaPrefix + "tables:" + escapeKeyPart(schema) }
 func rowPrefix(schema, table string) string { return tableKeySuffix(schema, table) + ":" }
 func indexName(schema, table string) string { return "idx:" + tableKeySuffix(schema, table) }
 

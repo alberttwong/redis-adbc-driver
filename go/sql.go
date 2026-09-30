@@ -28,6 +28,7 @@ import (
 type Expr interface{ exprNode() }
 
 type Literal struct{ V Value }
+
 // ColumnRef is a column reference, optionally qualified (alias.column).
 // Binding resolves Name to the canonical column name. Outer > 0 marks a
 // correlated reference to a column of an enclosing query, Outer levels up;
@@ -84,6 +85,7 @@ type Cast struct {
 	X Expr
 	T ColType
 }
+
 // Case is CASE [operand] WHEN … THEN … [ELSE …] END. With an operand, each
 // WHEN value is compared to it with =; without one, each WHEN is a condition.
 type Case struct {
@@ -160,12 +162,12 @@ type SelectStmt struct {
 	From       *TableName
 	FromSelect *SelectStmt
 	FromAlias  string
-	Where   Expr
-	GroupBy []Expr
-	Having  Expr
-	OrderBy []OrderItem
-	Limit   *int64
-	Offset  *int64
+	Where      Expr
+	GroupBy    []Expr
+	Having     Expr
+	OrderBy    []OrderItem
+	Limit      *int64
+	Offset     *int64
 }
 
 type InsertStmt struct {

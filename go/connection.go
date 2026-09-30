@@ -28,7 +28,7 @@ import (
 type connectionImpl struct {
 	driverbase.ConnectionImplBase
 
-	store   *store
+	store    *store
 	schema   string
 	pushdown string
 	version  string
