@@ -30,10 +30,10 @@ The full validation suite (322 passed, 0 failed) has been run against:
 | Redis Open Source (`redis:8.4` Docker image) | 8.4.4, Search 8.4.10 | `redis://` |
 | Redis Open Source cluster, 3 shards (OSS Cluster API) | 8.4.4, Search 8.4.10 | `redis://` |
 | Redis Cloud, single shard | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`)* |
+| Redis Cloud Pro, 2 shards, through the proxy endpoint | 8.6.2 | `redis://` |
+| Redis Cloud Pro, 2 shards, OSS Cluster API enabled | 8.6.2 | `redis://` |
 
-\* Run before cluster support was added; not yet re-run with it.
-
-Multi-shard Redis Cloud / Redis Software databases have not been tested yet.
+\* Run before cluster support was added; not re-run since.
 
 The remaining 12 skipped tests and 1 expected failure are features the
 driver doesn't offer: constraints, statistics, a second catalog, temporary
