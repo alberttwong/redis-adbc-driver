@@ -24,8 +24,9 @@ class RedisQuirks(model.DriverQuirks):
     driver = "adbc_driver_redis"
     driver_name = "ADBC Driver for Redis"
     vendor_name = "Redis"
-    vendor_version = re.compile(r"8\.4\.\d+")
-    short_version = "8.4"
+    # Any Redis 8.x (the Query Engine is built in from 8.0).
+    vendor_version = re.compile(r"8\.\d+\.\d+")
+    short_version = "8"
     features = model.DriverFeatures(
         connection_get_table_schema=True,
         # There is a single catalog ("redis"); schemas are key namespaces.
