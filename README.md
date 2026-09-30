@@ -21,6 +21,47 @@ An [ADBC](https://arrow.apache.org/adbc/) driver for Redis 8.4+, built on
 with the [ADBC driver validation suite](https://github.com/adbc-drivers/validation).
 It supports SQL queries and Arrow bulk ingestion.
 
+## Server requirements
+
+You don't create any indexes or enable any settings yourself. The one hard
+requirement is the Query Engine.
+
+**What you need**
+
+- **Redis with the Query Engine (RediSearch).** It is built into Redis 8.x
+  (e.g. the `redis:8.4` image). On older versions use Redis Stack, or Redis
+  Cloud / Redis Software with Search enabled. The driver runs `FT._LIST`
+  when it connects and refuses to connect if search isn't available.
+- **A standalone Redis server.** The driver uses a single-node client and
+  multi-key transactions, so Redis Cluster isn't supported yet. Only
+  database 0 has been tested.
+- **ACL permissions** (if ACLs are enabled):
+  - commands: `FT.*`, `HSET/HMGET/HDEL/DEL`, `GET/SETNX/EXISTS/INCRBY`,
+    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC`, `INFO`, `PING`, `HELLO`
+  - keys: `adbc:*`, plus the row prefix of each schema you use (`public:*`
+    by default)
+
+**What the driver does for you**
+
+- `CREATE TABLE` and bulk ingest create the table's index
+  (`FT.CREATE idx:<schema>:<table> …`) and its metadata keys. `DROP TABLE`
+  removes the index and all of the table's rows.
+- Every filterable column is indexed by default. Narrow this with `NOINDEX`
+  in `CREATE TABLE` or `adbc.redis.ingest.index_columns` on ingest. Queries
+  still work on columns that aren't indexed: the driver scans the table's
+  rows and filters them itself, which is slower on large tables but correct.
+- Every query passes `TIMEOUT 0`, so the server's default search timeout
+  (which can return partial results) doesn't apply. You don't need to change
+  any `search-*` settings or enable keyspace notifications.
+
+**Limitation: only tables created through the driver are visible**
+
+A table exists for the driver only if its metadata key
+(`adbc:meta:<schema>:<table>`) and its index (`idx:<schema>:<table>`) exist.
+HASHes and indexes created some other way (for example your own
+`row:*` / `idx:rows` layout) won't appear as tables. To query existing data,
+load it through the driver; bulk ingest from Arrow is the quickest route.
+
 ## Quick start
 
 Requirements: Go 1.26+, a C toolchain (cgo), Docker, and
