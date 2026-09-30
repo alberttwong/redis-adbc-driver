@@ -76,7 +76,7 @@ func (r *aggRequest) args(maxRows int64) []any {
 
 // countMatches returns the number of documents matching the query.
 func (s *store) countMatches(ctx context.Context, index, query string) (int64, error) {
-	reply, err := s.client.Do(ctx, "FT.SEARCH", index, query, "LIMIT", 0, 0, "TIMEOUT", 0, "DIALECT", 2).Result()
+	reply, err := s.searchDo(ctx, index, "FT.SEARCH", index, query, "LIMIT", 0, 0, "TIMEOUT", 0, "DIALECT", 2).Result()
 	if err != nil {
 		return 0, wrapRedis(err, "FT.SEARCH failed")
 	}
@@ -108,7 +108,13 @@ func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error
 			maxRows = n
 		}
 	}
-	reply, err := s.client.Do(ctx, req.args(maxRows)...).Result()
+	// The cursor lives on the node that ran the query, so every page is read
+	// through the same connection.
+	node, err := s.search(ctx, req.index)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := node.Do(ctx, req.args(maxRows)...).Result()
 	if err != nil {
 		return nil, wrapRedis(err, "FT.AGGREGATE failed")
 	}
@@ -122,9 +128,9 @@ func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error
 		if cursor == 0 {
 			return rows, nil
 		}
-		reply, err = s.client.Do(ctx, "FT.CURSOR", "READ", req.index, cursor, "COUNT", cursorCount).Result()
+		reply, err = node.Do(ctx, "FT.CURSOR", "READ", req.index, cursor, "COUNT", cursorCount).Result()
 		if err != nil {
-			_ = s.client.Do(ctx, "FT.CURSOR", "DEL", req.index, cursor).Err()
+			_ = node.Do(ctx, "FT.CURSOR", "DEL", req.index, cursor).Err()
 			return nil, wrapRedis(err, "FT.CURSOR READ failed")
 		}
 	}

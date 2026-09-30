@@ -28,7 +28,12 @@ The full validation suite (322 passed, 0 failed) has been run against:
 | Server | Version | Connection |
 |-|-|-|
 | Redis Open Source (`redis:8.4` Docker image) | 8.4.4, Search 8.4.10 | `redis://` |
-| Redis Cloud | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`) |
+| Redis Open Source cluster, 3 shards (OSS Cluster API) | 8.4.4, Search 8.4.10 | `redis://` |
+| Redis Cloud, single shard | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`)* |
+
+\* Run before cluster support was added; not yet re-run with it.
+
+Multi-shard Redis Cloud / Redis Software databases have not been tested yet.
 
 The remaining 12 skipped tests and 1 expected failure are features the
 driver doesn't offer: constraints, statistics, a second catalog, temporary
@@ -45,12 +50,21 @@ requirement is the Query Engine.
   (e.g. the `redis:8.4` image). On older versions use Redis Stack, or Redis
   Cloud / Redis Software with Search enabled. The driver runs `FT._LIST`
   when it connects and refuses to connect if search isn't available.
-- **A standalone Redis server.** The driver uses a single-node client and
-  multi-key transactions, so Redis Cluster isn't supported yet. Only
-  database 0 has been tested.
+- **A standalone server, Redis Cloud / Redis Software, or a Redis Cluster.**
+  The driver picks its client automatically (`adbc.redis.cluster=auto`):
+  - If the server reports `cluster_enabled:1` (OSS Cluster API), it uses a
+    cluster client. Rows spread across shards, and all search commands for a
+    table go through one node, which coordinates the query across shards.
+  - Otherwise it uses a single endpoint: standalone Redis, or Redis
+    Cloud / Redis Software through their proxy.
+
+  Driver metadata shares one hash slot (`adbc:{meta}:…`), so the driver's
+  multi-key transactions never cross slots. A cluster only has database 0;
+  on standalone servers only database 0 has been tested.
 - **ACL permissions** (if ACLs are enabled):
-  - commands: `FT.*`, `HSET/HMGET/HDEL/DEL`, `GET/SETNX/EXISTS/INCRBY`,
-    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC`, `INFO`, `PING`, `HELLO`
+  - commands: `FT.*`, `HSET/HMGET/HDEL/DEL`, `GET/SET/SETNX/EXISTS/INCRBY`,
+    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC`, `INFO`, `PING`, `HELLO`,
+    plus `CLUSTER` on an OSS Cluster API endpoint (to discover the shards)
   - keys: `adbc:*`, plus the row prefix of each schema you use (`public:*`
     by default)
 
@@ -70,7 +84,7 @@ requirement is the Query Engine.
 **Limitation: only tables created through the driver are visible**
 
 A table exists for the driver only if its metadata key
-(`adbc:meta:<schema>:<table>`) and its index (`idx:<schema>:<table>`) exist.
+(`adbc:{meta}:table:<schema>:<table>`) and its index (`idx:<schema>:<table>`) exist.
 HASHes and indexes created some other way (for example your own
 `row:*` / `idx:rows` layout) won't appear as tables. To query existing data,
 load it through the driver; bulk ingest from Arrow is the quickest route.
@@ -223,8 +237,11 @@ Stop Redis with `docker compose down`.
   decimal, date/time and timestamp columns as `NUMERIC SORTABLE`, strings as
   `TAG CASESENSITIVE INDEXEMPTY SORTABLE UNF`. Binary columns and columns
   declared `NOINDEX` are stored in the HASH only.
-- **Metadata**: `adbc:meta:<schema>:<table>` (column types as JSON),
-  `adbc:seq:*` (row ids), `adbc:tables:<schema>`, `adbc:schemas`.
+- **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
+  (column types as JSON), `adbc:{meta}:seq:*` (row ids),
+  `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`. Metadata written by
+  v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
+  the first connection.
 
 How SQL is executed:
 
@@ -275,6 +292,7 @@ only) and no joins.
 | `uri` | database | `redis://[user:pass@]host:port/db`, or `rediss://…` for TLS |
 | `username`, `password` | database | Credentials (override the URI) |
 | `adbc.redis.address`, `adbc.redis.db` | database | Used when no URI is given |
+| `adbc.redis.cluster` | database | `auto` (default) / `true` / `false`: OSS Cluster API client or single endpoint |
 | `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`) |
 | `adbc.redis.aggregate_pushdown` | database, statement | `exact` / `all` / `none` |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |
@@ -300,6 +318,16 @@ an empty database: the suite leaves its test tables (`test_*`, `getobjects*`,
 
 ```bash
 REDIS_URI='rediss://default:<password>@<host>:<port>/0' uv run pytest -v tests/
+```
+
+To test against a local 3-shard Redis Cluster (from `go`):
+
+```bash
+docker compose --profile cluster up --detach --wait redis-cluster
+```
+
+```bash
+cd validation && REDIS_URI=redis://localhost:7001/0 uv run pytest -v tests/
 ```
 
 Using the driver from Python:

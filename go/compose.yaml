@@ -24,3 +24,33 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # A 3-shard Redis Cluster (OSS Cluster API) in one container, so the nodes'
+  # announced 127.0.0.1 addresses work from the host. Start it with:
+  #   docker compose --profile cluster up --detach --wait redis-cluster
+  redis-cluster:
+    image: redis:8.4
+    container_name: redis-adbc-cluster
+    profiles: ["cluster"]
+    ports:
+      - "7001:7001"
+      - "7002:7002"
+      - "7003:7003"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        for p in 7001 7002 7003; do
+          mkdir -p /data/$$p
+          redis-server --port $$p --cluster-enabled yes \
+            --cluster-config-file /data/$$p/nodes.conf --dir /data/$$p \
+            --cluster-announce-ip 127.0.0.1 --save "" --appendonly no \
+            --loadmodule /usr/local/lib/redis/modules/redisearch.so --daemonize yes
+        done
+        sleep 1
+        yes yes | redis-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 0
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 7001 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -628,7 +628,12 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 	}
 	for start := 0; start < len(keys); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(keys))
-		if err := e.store.client.Del(ctx, keys[start:end]...).Err(); err != nil {
+		// One DEL per key: rows live in different hash slots.
+		pipe := e.store.client.Pipeline()
+		for _, k := range keys[start:end] {
+			pipe.Del(ctx, k)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
 			return 0, wrapRedis(err, "failed to delete rows")
 		}
 	}

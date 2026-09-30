@@ -32,15 +32,19 @@ package redis
 //
 //	idx:<schema>:<table>            FT index ON HASH PREFIX 1 <schema>:<table>:
 //
-// Driver metadata:
+// Driver metadata lives under one hash tag ({meta}), so every metadata key
+// is in the same hash slot and metadata transactions (MULTI/EXEC) also work
+// on sharded databases. Row keys have no hash tag, so rows spread across
+// shards:
 //
-//	adbc:meta:<schema>:<table>      STRING JSON column definitions
-//	adbc:seq:<schema>:<table>       STRING row id counter
-//	adbc:tables:<schema>            SET    table names
-//	adbc:schemas                    SET    schema names
+//	adbc:{meta}:table:<schema>:<table>   STRING JSON column definitions
+//	adbc:{meta}:seq:<schema>:<table>     STRING row id counter
+//	adbc:{meta}:tables:<schema>          SET    table names
+//	adbc:{meta}:schemas                  SET    schema names
 //
 // Schema and table names are percent-escaped in key names so that ':' in a
-// name cannot make two tables share a key prefix.
+// name cannot make two tables share a key prefix, and '{' / '}' cannot form
+// a hash tag.
 
 import (
 	"context"
@@ -59,7 +63,8 @@ const (
 	catalogName   = "redis"
 	defaultSchema = "public"
 	rowIDField    = "__rowid"
-	schemasKey    = "adbc:schemas"
+	metaPrefix    = "adbc:{meta}:"
+	schemasKey    = metaPrefix + "schemas"
 
 	// maxIndexed caps the number of indexed (SORTABLE) attributes per table;
 	// further columns are stored but not indexed.
@@ -158,7 +163,7 @@ func escapeKeyPart(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '%' || c == ':' || c == '*' || c == '?' || c == '[' || c == ']' || c == '\\' || c <= ' ' || c == 0x7f {
+		if c == '%' || c == ':' || c == '{' || c == '}' || c == '*' || c == '?' || c == '[' || c == ']' || c == '\\' || c <= ' ' || c == 0x7f {
 			fmt.Fprintf(&b, "%%%02X", c)
 		} else {
 			b.WriteByte(c)
@@ -171,9 +176,9 @@ func tableKeySuffix(schema, table string) string {
 	return escapeKeyPart(schema) + ":" + escapeKeyPart(table)
 }
 
-func metaKey(schema, table string) string   { return "adbc:meta:" + tableKeySuffix(schema, table) }
-func seqKey(schema, table string) string    { return "adbc:seq:" + tableKeySuffix(schema, table) }
-func tablesKey(schema string) string        { return "adbc:tables:" + escapeKeyPart(schema) }
+func metaKey(schema, table string) string { return metaPrefix + "table:" + tableKeySuffix(schema, table) }
+func seqKey(schema, table string) string  { return metaPrefix + "seq:" + tableKeySuffix(schema, table) }
+func tablesKey(schema string) string      { return metaPrefix + "tables:" + escapeKeyPart(schema) }
 func rowPrefix(schema, table string) string { return tableKeySuffix(schema, table) + ":" }
 func indexName(schema, table string) string { return "idx:" + tableKeySuffix(schema, table) }
 
@@ -204,7 +209,100 @@ func wrapRedis(err error, context string) error {
 // ---- store ----
 
 type store struct {
-	client *goredis.Client
+	// client is a *goredis.Client, or a *goredis.ClusterClient when the
+	// server exposes the OSS Cluster API.
+	client goredis.UniversalClient
+}
+
+// search returns the connection used for FT.* commands. On a cluster every
+// search command for an index (including FT.CURSOR READ, whose cursor lives
+// on the node that created it) goes to the same node, which coordinates the
+// query across shards.
+// searchConn is the subset of a client used for FT.* commands.
+type searchConn interface {
+	Do(ctx context.Context, args ...any) *goredis.Cmd
+}
+
+func (s *store) search(ctx context.Context, index string) (searchConn, error) {
+	cc, ok := s.client.(*goredis.ClusterClient)
+	if !ok {
+		return s.client, nil
+	}
+	node, err := cc.MasterForKey(ctx, index)
+	if err != nil {
+		return nil, wrapRedis(err, "failed to pick a node for search")
+	}
+	return node, nil
+}
+
+// searchDo runs one FT.* command for an index.
+func (s *store) searchDo(ctx context.Context, index string, args ...any) *goredis.Cmd {
+	node, err := s.search(ctx, index)
+	if err != nil {
+		cmd := goredis.NewCmd(ctx, args...)
+		cmd.SetErr(err)
+		return cmd
+	}
+	return node.Do(ctx, args...)
+}
+
+// migrateLegacyMetadata moves metadata written by v0.0.1 (adbc:meta:*,
+// adbc:seq:*, adbc:tables:*, adbc:schemas) to the hash-tagged key names.
+// New keys are written before old ones are removed, so an interrupted
+// migration is simply redone on the next connection.
+func (s *store) migrateLegacyMetadata(ctx context.Context) error {
+	const legacySchemas = "adbc:schemas"
+	n, err := s.client.Exists(ctx, legacySchemas).Result()
+	if err != nil || n == 0 {
+		return wrapRedis(err, "failed to check for legacy metadata")
+	}
+	schemas, err := s.client.SMembers(ctx, legacySchemas).Result()
+	if err != nil {
+		return wrapRedis(err, "failed to read legacy metadata")
+	}
+	if !slices.Contains(schemas, defaultSchema) {
+		schemas = append(schemas, defaultSchema)
+	}
+	for _, schema := range schemas {
+		oldTables := "adbc:tables:" + escapeKeyPart(schema)
+		tables, err := s.client.SMembers(ctx, oldTables).Result()
+		if err != nil {
+			return wrapRedis(err, "failed to read legacy metadata")
+		}
+		for _, table := range tables {
+			suffix := tableKeySuffix(schema, table)
+			for _, kv := range [][2]string{
+				{"adbc:meta:" + suffix, metaKey(schema, table)},
+				{"adbc:seq:" + suffix, seqKey(schema, table)},
+			} {
+				v, err := s.client.Get(ctx, kv[0]).Result()
+				if errors.Is(err, goredis.Nil) {
+					continue
+				}
+				if err != nil {
+					return wrapRedis(err, "failed to read legacy metadata")
+				}
+				if err := s.client.Set(ctx, kv[1], v, 0).Err(); err != nil {
+					return wrapRedis(err, "failed to migrate metadata")
+				}
+			}
+			if err := s.client.SAdd(ctx, tablesKey(schema), table).Err(); err != nil {
+				return wrapRedis(err, "failed to migrate metadata")
+			}
+			for _, k := range []string{"adbc:meta:" + suffix, "adbc:seq:" + suffix} {
+				if err := s.client.Del(ctx, k).Err(); err != nil {
+					return wrapRedis(err, "failed to remove legacy metadata")
+				}
+			}
+		}
+		if err := s.client.SAdd(ctx, schemasKey, schema).Err(); err != nil {
+			return wrapRedis(err, "failed to migrate metadata")
+		}
+		if err := s.client.Del(ctx, oldTables).Err(); err != nil {
+			return wrapRedis(err, "failed to remove legacy metadata")
+		}
+	}
+	return wrapRedis(s.client.Del(ctx, legacySchemas).Err(), "failed to remove legacy metadata")
 }
 
 func (s *store) getTable(ctx context.Context, schema, table string) (*tableMeta, error) {
@@ -265,7 +363,7 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	}
 
 	// Drop any stale index left behind by an interrupted DROP TABLE.
-	_ = s.client.Do(ctx, "FT.DROPINDEX", meta.index(), "DD").Err()
+	_ = s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err()
 
 	args := []any{"FT.CREATE", meta.index(), "ON", "HASH", "PREFIX", 1, meta.prefix(),
 		"SKIPINITIALSCAN", "SCHEMA", rowIDField, "NUMERIC", "SORTABLE"}
@@ -278,7 +376,7 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 			args = append(args, c.Name, "NUMERIC", "SORTABLE")
 		}
 	}
-	if err := s.client.Do(ctx, args...).Err(); err != nil {
+	if err := s.searchDo(ctx, meta.index(), args...).Err(); err != nil {
 		s.client.Del(ctx, metaKey(meta.Schema, meta.Name))
 		return false, wrapRedis(err, "failed to create search index")
 	}
@@ -305,7 +403,7 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 		return tableNotFound(schema, table)
 	}
 	// DD deletes every document the index knows about.
-	if err := s.client.Do(ctx, "FT.DROPINDEX", indexName(schema, table), "DD").Err(); err != nil &&
+	if err := s.searchDo(ctx, indexName(schema, table), "FT.DROPINDEX", indexName(schema, table), "DD").Err(); err != nil &&
 		!isUnknownIndex(err) {
 		return wrapRedis(err, "failed to drop search index")
 	}
