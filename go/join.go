@@ -71,6 +71,16 @@ func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, [
 		if err != nil {
 			return err
 		}
+		if meta.view != nil {
+			// Joins read each item fully; compute the view now.
+			rows, err := e.runView(ctx, meta.view, nil, nil, e.params)
+			if err != nil {
+				return err
+			}
+			m := *meta
+			m.view, m.mem = nil, rows
+			meta = &m
+		}
 		if name == "" {
 			return errorf(adbc.StatusInvalidArgument, "a subquery in FROM must have an alias")
 		}

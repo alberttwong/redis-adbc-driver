@@ -114,6 +114,14 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 			return execResult{}, err
 		}
 		return execResult{affected: -1}, e.store.dropTable(ctx, schema, name, st.IfExists)
+	case *CreateViewStmt:
+		return execResult{affected: -1}, e.runCreateView(ctx, st, ps.NumParams)
+	case *DropViewStmt:
+		schema, name, err := e.resolveTable(st.Name)
+		if err != nil {
+			return execResult{}, err
+		}
+		return execResult{affected: -1}, e.store.dropView(ctx, schema, name, st.IfExists)
 	case *CreateSchemaStmt:
 		return execResult{affected: -1}, e.store.createSchema(ctx, st.Name, st.IfNotExists)
 	case *DropSchemaStmt:

@@ -315,6 +315,19 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 			}
 		}
 		meta, err := e.loadTable(ctx, *table)
+		var ae adbc.Error
+		if err != nil && asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
+			// Not a table: maybe a view.
+			schema, name, rerr := e.resolveTable(*table)
+			if rerr != nil {
+				return nil, "", err
+			}
+			v, verr := e.store.getView(ctx, schema, name)
+			if verr != nil {
+				return nil, "", err
+			}
+			meta, err = e.viewRelation(ctx, v, alias)
+		}
 		return meta, alias, err
 	}
 	return nil, "", nil

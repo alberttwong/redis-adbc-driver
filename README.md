@@ -231,6 +231,13 @@ SELECT c.country, COUNT(DISTINCT c.customer_id) AS customers, SUM(s.quantity * s
 FROM customers c, sales s WHERE s.customer_id = c.customer_id
 GROUP BY c.country ORDER BY revenue DESC LIMIT 3;
 
+-- Views. A single-table view stays lazy: filters on the view are pushed into
+-- the base table's index together with the view's own WHERE
+CREATE VIEW shipped_sales AS
+SELECT order_id, customer_id, country, product, quantity FROM sales WHERE status = 'shipped';
+SELECT COUNT(*) FROM shipped_sales WHERE country = 'JPN' AND quantity >= 15;
+DROP VIEW shipped_sales;
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -296,7 +303,9 @@ Stop Redis with `docker compose down`.
   declared `NOINDEX` are stored in the HASH only.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
   (column types as JSON), `adbc:{meta}:seq:*` (row ids),
-  `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`. Metadata written by
+  `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
+  `adbc:{meta}:view:<schema>:<view>` (the SELECT text and its columns) and
+  `adbc:{meta}:views:<schema>`. Tables and views share one namespace. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
 
@@ -310,6 +319,7 @@ How SQL is executed:
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
@@ -333,7 +343,9 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 - `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [NOINDEX], …)`,
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
-  `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`
+  `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`,
+  `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS SELECT …`,
+  `DROP VIEW [IF EXISTS] v`
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
   parameters, and `INSERT INTO t [(cols)] SELECT …`
 - `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM item {, item |

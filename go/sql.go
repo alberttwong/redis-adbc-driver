@@ -247,6 +247,24 @@ func (*UpdateStmt) stmtNode()       {}
 func (*DeleteStmt) stmtNode()       {}
 func (*CreateSchemaStmt) stmtNode() {}
 func (*DropSchemaStmt) stmtNode()   {}
+func (*CreateViewStmt) stmtNode()   {}
+func (*DropViewStmt) stmtNode()     {}
+
+// CreateViewStmt is CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS
+// SELECT …; Text is the SELECT's source text, which is what gets stored.
+type CreateViewStmt struct {
+	Name        TableName
+	Columns     []string
+	Select      *SelectStmt
+	Text        string
+	OrReplace   bool
+	IfNotExists bool
+}
+
+type DropViewStmt struct {
+	Name     TableName
+	IfExists bool
+}
 
 // ParsedStmt is a statement with the number of parameters it references.
 type ParsedStmt struct {
@@ -939,8 +957,47 @@ func (p *parser) parseCreate() (Stmt, error) {
 		st.Name = name
 		return st, nil
 	}
+	orReplace := p.acceptKeyword("OR", "REPLACE")
 	if p.acceptKeyword("TEMPORARY") || p.acceptKeyword("TEMP") {
-		return nil, &sqlError{msg: "temporary tables are not supported"}
+		return nil, &sqlError{msg: "temporary tables and views are not supported"}
+	}
+	if p.acceptKeyword("VIEW") {
+		st := &CreateViewStmt{OrReplace: orReplace}
+		st.IfNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		st.Name = name
+		if p.acceptOp("(") {
+			for {
+				c, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				st.Columns = append(st.Columns, c)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		start := p.peek().pos
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		st.Select = sel.(*SelectStmt)
+		st.Text = strings.TrimSpace(p.src[start:p.toks[p.pos-1].end])
+		return st, nil
+	}
+	if orReplace {
+		return nil, syntaxErr("OR REPLACE is only supported for views")
 	}
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
@@ -1047,6 +1104,16 @@ func (p *parser) skipBalanced() error {
 func (p *parser) parseDrop() (Stmt, error) {
 	if err := p.expectKeyword("DROP"); err != nil {
 		return nil, err
+	}
+	if p.acceptKeyword("VIEW") {
+		st := &DropViewStmt{}
+		st.IfExists = p.acceptKeyword("IF", "EXISTS")
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		st.Name = name
+		return st, nil
 	}
 	if p.acceptKeyword("SCHEMA") {
 		st := &DropSchemaStmt{}

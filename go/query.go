@@ -381,6 +381,21 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 // scanMem filters an in-memory relation.
 func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
 	source := req.meta.mem
+	if req.meta.view != nil {
+		need := maps.Clone(req.need)
+		if need == nil {
+			need = map[string]bool{}
+		}
+		if req.where.residual != nil {
+			// The residual is re-checked on the view's rows below.
+			columnRefs(req.where.residual, need)
+		}
+		rows, err := e.runView(ctx, req.meta.view, req.where.residual, need, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		source = rows
+	}
 	if req.meta.join != nil {
 		need := maps.Clone(req.need)
 		if need == nil {

@@ -143,6 +143,8 @@ type tableMeta struct {
 	// join is set for the relation produced by a FROM clause with joins; its
 	// rows are computed when the query is scanned.
 	join *joinPlan
+	// view is set for a simple view, computed when the query is scanned.
+	view *lazyView
 }
 
 // resolve finds a column by name: exact match first, then case-insensitive.
@@ -372,6 +374,14 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	raw, err := json.Marshal(meta)
 	if err != nil {
 		return false, errorf(adbc.StatusInternal, "failed to encode metadata: %v", err)
+	}
+	if exists, err := s.viewExists(ctx, meta.Schema, meta.Name); err != nil {
+		return false, err
+	} else if exists {
+		if ifNotExists {
+			return false, nil
+		}
+		return false, errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", meta.Schema, meta.Name)
 	}
 	ok, err := s.client.SetNX(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Result()
 	if err != nil {
