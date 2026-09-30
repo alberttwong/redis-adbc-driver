@@ -30,6 +30,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,9 +65,16 @@ func isConstant(e Expr) bool {
 	walkExpr(e, func(x Expr) {
 		switch f := x.(type) {
 		case *ColumnRef:
-			constant = false
+			// Outer references are fixed while this query runs.
+			if f.Outer == 0 {
+				constant = false
+			}
 		case *Func:
 			if aggregateFuncs[f.Name] {
+				constant = false
+			}
+		case *Subquery:
+			if f.correlated {
 				constant = false
 			}
 		}
@@ -126,12 +134,17 @@ func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 // NUMERIC columns and equality on TAG (string) columns. Predicates the index
 // may answer inexactly (double rounding of large integers) are pushed down
 // inclusively and also kept in the residual.
-func planWhere(where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
+func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
 	wp := wherePlan{query: "*"}
 	if where == nil {
 		return wp, nil
 	}
-	env := &evalEnv{params: params}
+	if meta.isMem {
+		// In-memory relations have no index: filter every row.
+		wp.residual = where
+		return wp, nil
+	}
+	env := e.newEnv(ctx, nil, params)
 	parts := conjuncts(where, nil)
 	var residual []Expr
 	addResidual := func(e Expr) { residual = append(residual, e) }
@@ -161,6 +174,16 @@ func planWhere(where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
 
 	var terms []string
 	for _, c := range parts {
+		// col IN (SELECT …) / col IN (a, b, …) / col = a OR col = b:
+		// an index union query. The predicate is re-checked on fetched rows
+		// (it also carries SQL's NULL semantics).
+		if term, ok, err := e.unionTerm(ctx, c, meta, env); err != nil {
+			return wp, err
+		} else if ok {
+			terms = append(terms, term)
+			addResidual(c)
+			continue
+		}
 		colRef, op, other, ok := comparison(c)
 		if !ok {
 			addResidual(c)
@@ -288,6 +311,9 @@ type scanRequest struct {
 // needed columns from the row HASHes, and applies the residual predicate.
 func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
 	meta := req.meta
+	if meta.isMem {
+		return e.scanMem(ctx, req, params)
+	}
 	keys := req.where.keys
 	if keys == nil {
 		ar := &aggRequest{
@@ -325,7 +351,7 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 	if err != nil {
 		return nil, nil, err
 	}
-	env := &evalEnv{types: meta.types(), params: params}
+	env := e.newEnv(ctx, meta.types(), params)
 	outKeys := make([]string, 0, len(keys))
 	rows := make([]map[string]Value, 0, len(keys))
 	for i, raw := range fetched {
@@ -352,28 +378,51 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 	return outKeys, rows, nil
 }
 
+// scanMem filters an in-memory relation.
+func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
+	if req.where.residual == nil {
+		return nil, req.meta.mem, nil
+	}
+	env := e.newEnv(ctx, req.meta.types(), params)
+	var rows []map[string]Value
+	for _, r := range req.meta.mem {
+		env.row = r
+		ok, err := env.eval(req.where.residual)
+		if err != nil {
+			return nil, nil, invalidArg(err)
+		}
+		if b, valid := truthy(ok); valid && b {
+			rows = append(rows, r)
+		}
+	}
+	return nil, rows, nil
+}
+
 // ---- SELECT ----
 
 func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
 	if plan.meta == nil {
-		return e.selectWithoutTable(plan, params)
+		return e.selectWithoutTable(ctx, plan, params)
 	}
 	if plan.aggregate {
 		return e.selectAggregate(ctx, plan, params)
 	}
 	meta := plan.meta
-	wp, err := planWhere(plan.sel.Where, meta, params)
+	wp, err := e.planWhere(ctx, plan.sel.Where, meta, params)
 	if err != nil {
 		return nil, err
 	}
-	req := scanRequest{meta: meta, where: wp, need: map[string]bool{}}
+	req := scanRequest{meta: meta, where: wp, need: maps.Clone(plan.extraNeed)}
+	if req.need == nil {
+		req.need = map[string]bool{}
+	}
 	for _, it := range plan.items {
 		columnRefs(it.expr, req.need)
 	}
 
 	// ORDER BY on indexed columns sorts inside the index; anything else is
 	// sorted by the driver after fetching.
-	indexSort := wp.keys == nil
+	indexSort := wp.keys == nil && !meta.isMem
 	for _, o := range plan.order {
 		c, ok := o.expr.(*ColumnRef)
 		if !ok {
@@ -393,7 +442,7 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 			columnRefs(o.expr, req.need)
 		}
 	}
-	if len(plan.order) == 0 && wp.keys == nil {
+	if len(plan.order) == 0 && wp.keys == nil && !meta.isMem {
 		// Implicit insertion order.
 		req.sortBy = []sortKey{{field: rowIDField}}
 		indexSort = true
@@ -412,7 +461,7 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	if err != nil {
 		return nil, err
 	}
-	env := &evalEnv{types: meta.types(), params: params}
+	env := e.newEnv(ctx, meta.types(), params)
 	if !indexSort && len(plan.order) > 0 {
 		keys := make([][]Value, len(rows))
 		for i, r := range rows {
@@ -459,7 +508,7 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 
 func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
 	meta := plan.meta
-	wp, err := planWhere(plan.sel.Where, meta, params)
+	wp, err := e.planWhere(ctx, plan.sel.Where, meta, params)
 	if err != nil {
 		return nil, err
 	}
@@ -474,7 +523,7 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 		collectAggregates(plan.having, &aggs)
 	}
 	types := meta.types()
-	env := &evalEnv{types: types, params: params}
+	env := e.newEnv(ctx, types, params)
 
 	groups, ok, err := e.indexAggregate(ctx, plan, wp, aggs)
 	if err != nil {
@@ -554,7 +603,7 @@ func pushableKind(k Kind, mode string) bool {
 // exactly by the index; the caller then aggregates in the driver.
 func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wherePlan, aggs []*Func) ([]aggGroup, bool, error) {
 	meta := plan.meta
-	if e.pushdown == PushdownNone || wp.residual != nil || wp.keys != nil {
+	if e.pushdown == PushdownNone || wp.residual != nil || wp.keys != nil || meta.isMem || len(plan.extraNeed) > 0 {
 		return nil, false, nil
 	}
 	groupCols := make([]columnMeta, 0, len(plan.sel.GroupBy))
@@ -578,7 +627,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 	outside := map[string]bool{}
 	collectOutside := func(e Expr) {
 		walkOutsideAggregates(e, func(x Expr) {
-			if c, ok := x.(*ColumnRef); ok {
+			if c, ok := x.(*ColumnRef); ok && c.Outer == 0 {
 				outside[c.Name] = true
 			}
 		})
@@ -737,7 +786,10 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 // them in the driver.
 func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp wherePlan, aggs []*Func, params []Value) ([]aggGroup, error) {
 	meta := plan.meta
-	req := scanRequest{meta: meta, where: wp, need: map[string]bool{}}
+	req := scanRequest{meta: meta, where: wp, need: maps.Clone(plan.extraNeed)}
+	if req.need == nil {
+		req.need = map[string]bool{}
+	}
 	for _, it := range plan.items {
 		columnRefs(it.expr, req.need)
 	}
@@ -755,7 +807,7 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 		return nil, err
 	}
 	types := meta.types()
-	env := &evalEnv{types: types, params: params}
+	env := e.newEnv(ctx, types, params)
 	type group struct {
 		rep  map[string]Value
 		accs []*accumulator
@@ -832,14 +884,118 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 // matchRows returns the keys and requested values of the rows matching a
 // WHERE clause.
 func (e *executor) matchRows(ctx context.Context, meta *tableMeta, where Expr, params []Value, need map[string]bool) ([]string, []map[string]Value, error) {
+	need = maps.Clone(need)
+	if need == nil {
+		need = map[string]bool{}
+	}
 	if where != nil {
-		if err := bindColumns(where, meta); err != nil {
+		needs, err := e.bindIn(ctx, where, meta, meta.Name)
+		if err != nil {
 			return nil, nil, err
 		}
+		for k := range needs {
+			need[k] = true
+		}
 	}
-	wp, err := planWhere(where, meta, params)
+	wp, err := e.planWhere(ctx, where, meta, params)
 	if err != nil {
 		return nil, nil, err
 	}
 	return e.scan(ctx, scanRequest{meta: meta, where: wp, need: need}, params)
+}
+
+// maxUnionTerms caps the number of values pushed down as an index union.
+const maxUnionTerms = 1000
+
+// unionTerm turns a membership predicate on an indexed column into a
+// RediSearch union query: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`.
+func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *evalEnv) (string, bool, error) {
+	var col *ColumnRef
+	var values []Value
+	switch x := c.(type) {
+	case *Subquery:
+		if x.Kind != SubqueryIn || x.Not || x.correlated {
+			return "", false, nil
+		}
+		ref, ok := x.X.(*ColumnRef)
+		if !ok || ref.Outer != 0 {
+			return "", false, nil
+		}
+		rows, err := e.subqueryRows(ctx, x, env)
+		if err != nil {
+			return "", false, err
+		}
+		if len(rows) > maxUnionTerms {
+			return "", false, nil
+		}
+		col = ref
+		for _, r := range rows {
+			values = append(values, r[0])
+		}
+	case *Binary:
+		if x.Op != "OR" {
+			return "", false, nil
+		}
+		var leaves []Expr
+		var flatten func(Expr)
+		flatten = func(n Expr) {
+			if b, ok := n.(*Binary); ok && b.Op == "OR" {
+				flatten(b.L)
+				flatten(b.R)
+				return
+			}
+			leaves = append(leaves, n)
+		}
+		flatten(x)
+		if len(leaves) > maxUnionTerms {
+			return "", false, nil
+		}
+		for _, leaf := range leaves {
+			ref, op, other, ok := comparison(leaf)
+			if !ok || op != "=" || ref.Outer != 0 || (col != nil && ref.Name != col.Name) {
+				return "", false, nil
+			}
+			v, err := env.eval(other)
+			if err != nil {
+				return "", false, invalidArg(err)
+			}
+			col = ref
+			values = append(values, v)
+		}
+	default:
+		return "", false, nil
+	}
+	cm, ok := meta.column(col.Name)
+	if !ok || !cm.Indexed || !simpleName(cm.Name) {
+		return "", false, nil
+	}
+	var parts []string
+	for _, v := range values {
+		if v.Null {
+			continue
+		}
+		cv, err := Coerce(v, cm.Type)
+		if err != nil {
+			continue // cannot equal any stored value
+		}
+		if cm.Type.Kind == KindString {
+			if strings.Contains(cv.S, tagSeparator) {
+				return "", false, nil
+			}
+			parts = append(parts, escapeTag(cv.S))
+		} else if cm.Type.Kind.indexedAsNumeric() {
+			b := encodeStored(cv)
+			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.Name, b, b))
+		} else {
+			return "", false, nil
+		}
+	}
+	if len(parts) == 0 {
+		// Nothing can match; __rowid is never negative.
+		return "@" + rowIDField + ":[-1 -1]", true, nil
+	}
+	if cm.Type.Kind == KindString {
+		return fmt.Sprintf("@%s:{%s}", cm.Name, strings.Join(parts, " | ")), true, nil
+	}
+	return "(" + strings.Join(parts, " | ") + ")", true, nil
 }

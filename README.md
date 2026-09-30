@@ -191,6 +191,28 @@ SELECT country, COUNT(*) AS orders, SUM(quantity * unit_price) AS revenue
 FROM sales WHERE status = 'shipped' GROUP BY country;
 SELECT * FROM country_revenue ORDER BY revenue DESC LIMIT 3;
 
+-- Subqueries. An uncorrelated one runs once; its result is pushed into the
+-- outer query's index filter (a range here, a union query for IN)
+SELECT COUNT(*) AS above_avg FROM sales WHERE unit_price > (SELECT AVG(unit_price) FROM sales);
+SELECT name, country FROM customers
+WHERE customer_id IN (SELECT customer_id FROM sales WHERE quantity = 20 AND status = 'returned')
+ORDER BY name LIMIT 5;
+
+-- Correlated subqueries run per outer row (memoised on the outer values)
+SELECT c.name, (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.customer_id) AS orders
+FROM customers c ORDER BY orders DESC, c.name LIMIT 3;
+
+-- CTEs and derived tables are computed once and held in memory
+WITH per_customer AS (
+  SELECT customer_id, SUM(quantity) AS units FROM sales GROUP BY customer_id
+)
+SELECT customer_id, units FROM per_customer
+WHERE units > (SELECT AVG(units) FROM per_customer)
+ORDER BY units DESC LIMIT 3;
+SELECT bucket, COUNT(*) AS orders
+FROM (SELECT CASE WHEN quantity >= 15 THEN 'bulk' ELSE 'regular' END AS bucket FROM sales) AS t
+GROUP BY bucket ORDER BY bucket;
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -267,6 +289,9 @@ How SQL is executed:
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" LOAD 1 @__key SORTBY … LIMIT … WITHCURSOR`, then pipelined `HMGET` of only the needed columns |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
+| `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
+| Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
+| CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
 Pushed down into the index: numeric range/equality predicates on indexed
@@ -290,20 +315,26 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
   `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`
-- `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n` parameters
-- `SELECT … FROM t [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
+- `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
+  parameters, and `INSERT INTO t [(cols)] SELECT …`
+- `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM t | (SELECT …) [AS alias]
+  [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
-  `CAST`, `IS [NOT] NULL`,
+  `CAST`, `IS [NOT] NULL`, subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
+  `UPDATE`/`DELETE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
 - `SELECT` without `FROM` for literal expressions
 - `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
+- Not supported: joins (coming next), `WITH RECURSIVE`, `LATERAL`,
+  `ANY`/`ALL` comparisons
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE]`
 
 Tables can be qualified as `schema.table` or `redis.schema.table`. Schemas
 are key namespaces (default `public`). There are no transactions (autocommit
-only) and no joins.
+only).
 
 ## Options
 

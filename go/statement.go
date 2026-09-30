@@ -279,6 +279,11 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 		combined := execResult{affected: 0}
 		if _, ok := ps.Stmt.(*SelectStmt); ok {
 			// Establish the result schema even when no rows are bound.
+			exec.cache = newExecCache()
+			exec.paramTypes = paramTypes
+			if len(paramRows) > 0 {
+				exec.params = paramRows[0]
+			}
 			plan, err := exec.planSelect(ctx, ps.Stmt.(*SelectStmt), paramTypes)
 			if err != nil {
 				return execResult{}, err

@@ -15,6 +15,7 @@
 package redis
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -26,6 +27,10 @@ import (
 // evalEnv supplies column values (keyed by canonical column name) and bound
 // parameters to expression evaluation.
 type evalEnv struct {
+	ctx   context.Context
+	exec  *executor
+	outer *evalEnv // enclosing query's row, for correlated references
+
 	row    map[string]Value
 	types  map[string]ColType
 	params []Value
@@ -72,6 +77,9 @@ func walkExpr(e Expr, fn func(Expr)) {
 			walkExpr(w.Then, fn)
 		}
 		walkExpr(x.Else, fn)
+	case *Subquery:
+		// The body is a separate scope; only the IN operand belongs here.
+		walkExpr(x.X, fn)
 	}
 }
 
@@ -106,13 +114,15 @@ func walkOutsideAggregates(e Expr, fn func(Expr)) {
 			walkOutsideAggregates(w.Then, fn)
 		}
 		walkOutsideAggregates(x.Else, fn)
+	case *Subquery:
+		walkOutsideAggregates(x.X, fn)
 	}
 }
 
 // columnRefs returns the distinct column names referenced by an expression.
 func columnRefs(e Expr, out map[string]bool) {
 	walkExpr(e, func(x Expr) {
-		if c, ok := x.(*ColumnRef); ok {
+		if c, ok := x.(*ColumnRef); ok && c.Outer == 0 {
 			out[c.Name] = true
 		}
 	})
@@ -139,6 +149,9 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		}
 		return env.params[x.Index], nil
 	case *ColumnRef:
+		if x.Outer > 0 {
+			return env.lookupUp(x.Name, x.Outer)
+		}
 		if v, ok := env.row[x.Name]; ok {
 			return v, nil
 		}
@@ -220,6 +233,8 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		return env.evalFunc(x)
 	case *Case:
 		return env.evalCase(x)
+	case *Subquery:
+		return env.evalSubquery(x)
 	}
 	return Value{}, fmt.Errorf("unsupported expression %T", e)
 }
@@ -575,6 +590,9 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 		}
 		return typeNull, nil
 	case *ColumnRef:
+		if x.Outer > 0 {
+			return x.OuterType, nil
+		}
 		if t, ok := cols[x.Name]; ok {
 			return t, nil
 		}
@@ -614,6 +632,11 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 			args[i] = t
 		}
 		return inferFuncType(x, args), nil
+	case *Subquery:
+		if x.Kind == SubqueryScalar && x.plan != nil {
+			return x.plan.items[0].typ, nil
+		}
+		return typeBool, nil
 	case *Case:
 		results := make([]Expr, 0, len(x.Whens)+1)
 		for _, w := range x.Whens {

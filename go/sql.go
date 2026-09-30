@@ -28,7 +28,45 @@ import (
 type Expr interface{ exprNode() }
 
 type Literal struct{ V Value }
-type ColumnRef struct{ Name string }
+// ColumnRef is a column reference, optionally qualified (alias.column).
+// Binding resolves Name to the canonical column name. Outer > 0 marks a
+// correlated reference to a column of an enclosing query, Outer levels up;
+// OuterType is then that column's type.
+type ColumnRef struct {
+	Name      string
+	Qualifier string
+	Outer     int
+	OuterType ColType
+}
+
+// Subquery is a SELECT used as an expression: a scalar subquery
+// `(SELECT …)`, `EXISTS (SELECT …)`, or `X [NOT] IN (SELECT …)`.
+type Subquery struct {
+	Select *SelectStmt
+	Kind   SubqueryKind
+	X      Expr // IN operand
+	Not    bool // NOT IN
+
+	// Set while binding.
+	plan       *selectPlan
+	correlated bool
+	// outerRefs are the outer columns the body reads, relative to the
+	// environment that evaluates the subquery (used as the memo key).
+	outerRefs []outerRef
+}
+
+type SubqueryKind int
+
+const (
+	SubqueryScalar SubqueryKind = iota
+	SubqueryExists
+	SubqueryIn
+)
+
+type outerRef struct {
+	name string
+	up   int
+}
 type Param struct{ Index int }
 type Unary struct {
 	Op string
@@ -75,6 +113,7 @@ func (*IsNull) exprNode()    {}
 func (*Cast) exprNode()      {}
 func (*Func) exprNode()      {}
 func (*Case) exprNode()      {}
+func (*Subquery) exprNode()  {}
 
 type TableName struct {
 	Catalog string
@@ -106,9 +145,21 @@ type OrderItem struct {
 	Desc bool
 }
 
+// CTE is one `name [(columns)] AS (SELECT …)` of a WITH clause.
+type CTE struct {
+	Name    string
+	Columns []string
+	Select  *SelectStmt
+}
+
 type SelectStmt struct {
-	Items   []SelectItem
-	From    *TableName
+	With  []CTE
+	Items []SelectItem
+	// FROM is a table (From) or a derived table (FromSelect); FromAlias is
+	// the optional alias.
+	From       *TableName
+	FromSelect *SelectStmt
+	FromAlias  string
 	Where   Expr
 	GroupBy []Expr
 	Having  Expr
@@ -121,6 +172,8 @@ type InsertStmt struct {
 	Table   TableName
 	Columns []string
 	Rows    [][]Expr
+	// Select is set for INSERT INTO … SELECT.
+	Select *SelectStmt
 }
 
 type ColumnDef struct {
@@ -495,7 +548,7 @@ func (p *parser) parseTableName() (TableName, error) {
 
 func (p *parser) parseStatement() (Stmt, error) {
 	switch {
-	case p.isKeyword("SELECT"):
+	case p.isKeyword("SELECT"), p.isKeyword("WITH"):
 		return p.parseSelect()
 	case p.isKeyword("INSERT"):
 		return p.parseInsert()
@@ -519,11 +572,69 @@ var reservedAfterExpr = map[string]bool{
 	"WHEN": true, "THEN": true, "ELSE": true, "END": true,
 }
 
+// isQueryStart reports whether the next token begins a (sub)query.
+func (p *parser) isQueryStart() bool { return p.isKeyword("SELECT") || p.isKeyword("WITH") }
+
+// parseSubquery parses `SELECT … )` after an opening parenthesis.
+func (p *parser) parseSubquery() (*SelectStmt, error) {
+	st, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return st.(*SelectStmt), nil
+}
+
 func (p *parser) parseSelect() (Stmt, error) {
+	var with []CTE
+	if p.acceptKeyword("WITH") {
+		if p.acceptKeyword("RECURSIVE") {
+			return nil, &sqlError{msg: "WITH RECURSIVE is not supported"}
+		}
+		for {
+			name, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			cte := CTE{Name: name}
+			if p.acceptOp("(") {
+				for {
+					c, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					cte.Columns = append(cte.Columns, c)
+					if !p.acceptOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+			}
+			if err := p.expectKeyword("AS"); err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			body, err := p.parseSubquery()
+			if err != nil {
+				return nil, err
+			}
+			cte.Select = body
+			with = append(with, cte)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	sel := &SelectStmt{}
+	sel := &SelectStmt{With: with}
 	p.acceptKeyword("ALL")
 	for {
 		start := p.peek().pos
@@ -552,18 +663,30 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 	}
 	if p.acceptKeyword("FROM") {
-		t, err := p.parseTableName()
-		if err != nil {
-			return nil, err
-		}
-		sel.From = &t
-		// Optional table alias.
-		if p.acceptKeyword("AS") {
-			if _, err := p.parseIdent(); err != nil {
+		if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH")) {
+			p.pos++
+			sub, err := p.parseSubquery()
+			if err != nil {
 				return nil, err
 			}
-		} else if t := p.peek(); t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)] {
+			sel.FromSelect = sub
+		} else {
+			t, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			sel.From = &t
+		}
+		// Optional alias.
+		if p.acceptKeyword("AS") {
+			alias, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			sel.FromAlias = alias
+		} else if t := p.peek(); t.kind == tokQuotedIdent || (t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)]) {
 			p.pos++
+			sel.FromAlias = t.text
 		}
 	}
 	if p.acceptKeyword("WHERE") {
@@ -681,6 +804,14 @@ func (p *parser) parseInsert() (Stmt, error) {
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
 		}
+	}
+	if p.isQueryStart() {
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		ins.Select = sel.(*SelectStmt)
+		return ins, nil
 	}
 	if err := p.expectKeyword("VALUES"); err != nil {
 		return nil, err
@@ -1130,6 +1261,14 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp("("); err != nil {
 				return nil, err
 			}
+			if p.isQueryStart() {
+				sub, err := p.parseSubquery()
+				if err != nil {
+					return nil, err
+				}
+				l = &Subquery{Select: sub, Kind: SubqueryIn, X: l, Not: not}
+				continue
+			}
 			var e Expr
 			for {
 				item, err := p.parseExpr()
@@ -1282,6 +1421,13 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case tokOp:
 		if t.text == "(" {
 			p.pos++
+			if p.isQueryStart() {
+				sub, err := p.parseSubquery()
+				if err != nil {
+					return nil, err
+				}
+				return &Subquery{Select: sub, Kind: SubqueryScalar}, nil
+			}
 			e, err := p.parseExpr()
 			if err != nil {
 				return nil, err
@@ -1294,15 +1440,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return nil, syntaxErr("unexpected %q", t.text)
 	case tokQuotedIdent:
 		p.pos++
-		name := t.text
-		for p.acceptOp(".") {
-			n, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			name = n
-		}
-		return &ColumnRef{Name: name}, nil
+		return p.parseColumnRef(t.text)
 	case tokIdent:
 		upper := strings.ToUpper(t.text)
 		switch upper {
@@ -1318,6 +1456,15 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "CASE":
 			p.pos++
 			return p.parseCase()
+		case "EXISTS":
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				sub, err := p.parseSubquery()
+				if err != nil {
+					return nil, err
+				}
+				return &Subquery{Select: sub, Kind: SubqueryExists}, nil
+			}
 		case "CAST", "TRY_CAST":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
@@ -1397,15 +1544,25 @@ func (p *parser) parsePrimary() (Expr, error) {
 			}
 			return f, nil
 		}
-		name := t.text
-		for p.acceptOp(".") {
-			n, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			name = n
-		}
-		return &ColumnRef{Name: name}, nil
+		return p.parseColumnRef(t.text)
 	}
 	return nil, syntaxErr("unexpected end of input")
+}
+
+// parseColumnRef parses the rest of [schema.][table.]column after its first
+// part; the part just before the column is kept as the qualifier.
+func (p *parser) parseColumnRef(first string) (Expr, error) {
+	parts := []string{first}
+	for p.acceptOp(".") {
+		n, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, n)
+	}
+	ref := &ColumnRef{Name: parts[len(parts)-1]}
+	if len(parts) > 1 {
+		ref.Qualifier = parts[len(parts)-2]
+	}
+	return ref, nil
 }
