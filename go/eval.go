@@ -29,6 +29,9 @@ type evalEnv struct {
 	row    map[string]Value
 	types  map[string]ColType
 	params []Value
+	// aggs holds the reduced value of each aggregate call when evaluating
+	// over a group (SELECT items, HAVING and ORDER BY of grouped queries).
+	aggs map[*Func]Value
 }
 
 var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true}
@@ -62,6 +65,47 @@ func walkExpr(e Expr, fn func(Expr)) {
 		for _, a := range x.Args {
 			walkExpr(a, fn)
 		}
+	case *Case:
+		walkExpr(x.Operand, fn)
+		for _, w := range x.Whens {
+			walkExpr(w.When, fn)
+			walkExpr(w.Then, fn)
+		}
+		walkExpr(x.Else, fn)
+	}
+}
+
+// walkOutsideAggregates visits the nodes of e that are not inside an
+// aggregate call.
+func walkOutsideAggregates(e Expr, fn func(Expr)) {
+	if e == nil {
+		return
+	}
+	if f, ok := e.(*Func); ok && aggregateFuncs[f.Name] {
+		return
+	}
+	fn(e)
+	switch x := e.(type) {
+	case *Unary:
+		walkOutsideAggregates(x.X, fn)
+	case *Binary:
+		walkOutsideAggregates(x.L, fn)
+		walkOutsideAggregates(x.R, fn)
+	case *IsNull:
+		walkOutsideAggregates(x.X, fn)
+	case *Cast:
+		walkOutsideAggregates(x.X, fn)
+	case *Func:
+		for _, a := range x.Args {
+			walkOutsideAggregates(a, fn)
+		}
+	case *Case:
+		walkOutsideAggregates(x.Operand, fn)
+		for _, w := range x.Whens {
+			walkOutsideAggregates(w.When, fn)
+			walkOutsideAggregates(w.Then, fn)
+		}
+		walkOutsideAggregates(x.Else, fn)
 	}
 }
 
@@ -174,12 +218,46 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		return binaryOp(x.Op, l, r)
 	case *Func:
 		return env.evalFunc(x)
+	case *Case:
+		return env.evalCase(x)
 	}
 	return Value{}, fmt.Errorf("unsupported expression %T", e)
 }
 
+func (env *evalEnv) evalCase(c *Case) (Value, error) {
+	var operand Value
+	if c.Operand != nil {
+		v, err := env.eval(c.Operand)
+		if err != nil {
+			return Value{}, err
+		}
+		operand = v
+	}
+	for _, w := range c.Whens {
+		v, err := env.eval(w.When)
+		if err != nil {
+			return Value{}, err
+		}
+		if c.Operand != nil {
+			if v, err = binaryOp("=", operand, v); err != nil {
+				return Value{}, err
+			}
+		}
+		if b, ok := truthy(v); ok && b {
+			return env.eval(w.Then)
+		}
+	}
+	if c.Else != nil {
+		return env.eval(c.Else)
+	}
+	return nullValue(typeNull), nil
+}
+
 func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 	if aggregateFuncs[f.Name] {
+		if v, ok := env.aggs[f]; ok {
+			return v, nil
+		}
 		return Value{}, fmt.Errorf("aggregate %s is not allowed here", f.Name)
 	}
 	args := make([]Value, len(f.Args))
@@ -536,6 +614,58 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 			args[i] = t
 		}
 		return inferFuncType(x, args), nil
+	case *Case:
+		results := make([]Expr, 0, len(x.Whens)+1)
+		for _, w := range x.Whens {
+			results = append(results, w.Then)
+		}
+		if x.Else != nil {
+			results = append(results, x.Else)
+		}
+		out := typeNull
+		for _, r := range results {
+			t, err := inferType(r, cols, params)
+			if err != nil {
+				return ColType{}, err
+			}
+			out = commonType(out, t)
+		}
+		return out, nil
 	}
 	return ColType{}, fmt.Errorf("unsupported expression %T", e)
+}
+
+// commonType is the type that can hold values of both a and b (used for
+// the branches of CASE).
+func commonType(a, b ColType) ColType {
+	switch {
+	case a.Kind == KindNull:
+		return b
+	case b.Kind == KindNull || a == b:
+		return a
+	case (a.Kind.isNumeric() || a.Kind == KindBool) && (b.Kind.isNumeric() || b.Kind == KindBool):
+		if a.Kind.isInteger() && b.Kind.isInteger() {
+			if a.Kind > b.Kind {
+				return a
+			}
+			return b
+		}
+		t, err := arithmeticType("+", a, b)
+		if err != nil {
+			return typeString
+		}
+		if t.Kind == KindDecimal {
+			// Keep enough scale for both sides.
+			t.Scale = max(a.Scale, b.Scale)
+		}
+		return t
+	case a.Kind == KindTimestamp && b.Kind == KindTimestamp:
+		if unitsPerSecond[b.Unit] > unitsPerSecond[a.Unit] {
+			return b
+		}
+		return a
+	case a.Kind == b.Kind:
+		return a
+	}
+	return typeString
 }

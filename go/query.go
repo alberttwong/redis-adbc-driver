@@ -470,6 +470,9 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 	for _, o := range plan.order {
 		collectAggregates(o.expr, &aggs)
 	}
+	if plan.having != nil {
+		collectAggregates(plan.having, &aggs)
+	}
 	types := meta.types()
 	env := &evalEnv{types: types, params: params}
 
@@ -490,18 +493,26 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 	}
 	out := make([]outRow, 0, len(groups))
 	for _, g := range groups {
-		env.row = g.rep
-		genv := &groupEnv{evalEnv: env, aggs: g.results}
+		env.row, env.aggs = g.rep, g.results
+		if plan.having != nil {
+			keep, err := env.eval(plan.having)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			if b, ok := truthy(keep); !ok || !b {
+				continue
+			}
+		}
 		row := outRow{}
 		for _, it := range plan.items {
-			v, err := genv.eval(it.expr)
+			v, err := env.eval(it.expr)
 			if err != nil {
 				return nil, invalidArg(err)
 			}
 			row.vals = append(row.vals, v)
 		}
 		for _, o := range plan.order {
-			v, err := genv.eval(o.expr)
+			v, err := env.eval(o.expr)
 			if err != nil {
 				return nil, invalidArg(err)
 			}
@@ -565,34 +576,21 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 	}
 	// Outside aggregate calls, only GROUP BY columns may be referenced.
 	outside := map[string]bool{}
-	var collectOutside func(Expr)
-	collectOutside = func(x Expr) {
-		switch v := x.(type) {
-		case *Func:
-			if aggregateFuncs[v.Name] {
-				return
+	collectOutside := func(e Expr) {
+		walkOutsideAggregates(e, func(x Expr) {
+			if c, ok := x.(*ColumnRef); ok {
+				outside[c.Name] = true
 			}
-			for _, a := range v.Args {
-				collectOutside(a)
-			}
-		case *ColumnRef:
-			outside[v.Name] = true
-		case *Unary:
-			collectOutside(v.X)
-		case *Binary:
-			collectOutside(v.L)
-			collectOutside(v.R)
-		case *IsNull:
-			collectOutside(v.X)
-		case *Cast:
-			collectOutside(v.X)
-		}
+		})
 	}
 	for _, it := range plan.items {
 		collectOutside(it.expr)
 	}
 	for _, o := range plan.order {
 		collectOutside(o.expr)
+	}
+	if plan.having != nil {
+		collectOutside(plan.having)
 	}
 	for name := range outside {
 		if !groupNames[name] {
@@ -749,8 +747,8 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 	for _, o := range plan.order {
 		columnRefs(o.expr, req.need)
 	}
-	if len(plan.order) == 0 {
-		req.sortBy = nil
+	if plan.having != nil {
+		columnRefs(plan.having, req.need)
 	}
 	_, rows, err := e.scan(ctx, req, params)
 	if err != nil {

@@ -46,6 +46,19 @@ type Cast struct {
 	X Expr
 	T ColType
 }
+// Case is CASE [operand] WHEN … THEN … [ELSE …] END. With an operand, each
+// WHEN value is compared to it with =; without one, each WHEN is a condition.
+type Case struct {
+	Operand Expr
+	Whens   []WhenClause
+	Else    Expr
+}
+
+type WhenClause struct {
+	When Expr
+	Then Expr
+}
+
 type Func struct {
 	Name     string // upper-cased
 	Args     []Expr
@@ -61,6 +74,7 @@ func (*Binary) exprNode()    {}
 func (*IsNull) exprNode()    {}
 func (*Cast) exprNode()      {}
 func (*Func) exprNode()      {}
+func (*Case) exprNode()      {}
 
 type TableName struct {
 	Catalog string
@@ -97,6 +111,7 @@ type SelectStmt struct {
 	From    *TableName
 	Where   Expr
 	GroupBy []Expr
+	Having  Expr
 	OrderBy []OrderItem
 	Limit   *int64
 	Offset  *int64
@@ -121,6 +136,8 @@ type CreateTableStmt struct {
 	Table       TableName
 	IfNotExists bool
 	Columns     []ColumnDef
+	// AsSelect is set for CREATE TABLE … AS SELECT.
+	AsSelect *SelectStmt
 }
 
 type DropTableStmt struct {
@@ -499,6 +516,7 @@ var reservedAfterExpr = map[string]bool{
 	"OFFSET": true, "AND": true, "OR": true, "NOT": true, "AS": true, "IS": true,
 	"ASC": true, "DESC": true, "HAVING": true, "UNION": true, "NULLS": true,
 	"LIKE": true, "IN": true, "BETWEEN": true, "SET": true, "VALUES": true,
+	"WHEN": true, "THEN": true, "ELSE": true, "END": true,
 }
 
 func (p *parser) parseSelect() (Stmt, error) {
@@ -566,6 +584,13 @@ func (p *parser) parseSelect() (Stmt, error) {
 				break
 			}
 		}
+	}
+	if p.acceptKeyword("HAVING") {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		sel.Having = e
 	}
 	if p.acceptKeyword("ORDER", "BY") {
 		for {
@@ -713,6 +738,20 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return nil, err
 	}
 	st.Table = t
+	if p.acceptKeyword("AS") {
+		parens := p.acceptOp("(")
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if parens {
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+		st.AsSelect = sel.(*SelectStmt)
+		return st, nil
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -947,6 +986,45 @@ func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
 }
 
 // ---- expressions ----
+
+func (p *parser) parseCase() (Expr, error) {
+	c := &Case{}
+	if !p.isKeyword("WHEN") {
+		op, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		c.Operand = op
+	}
+	for p.acceptKeyword("WHEN") {
+		w, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("THEN"); err != nil {
+			return nil, err
+		}
+		t, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		c.Whens = append(c.Whens, WhenClause{When: w, Then: t})
+	}
+	if len(c.Whens) == 0 {
+		return nil, syntaxErr("CASE requires at least one WHEN")
+	}
+	if p.acceptKeyword("ELSE") {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		c.Else = e
+	}
+	if err := p.expectKeyword("END"); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
 
 func (p *parser) parseExpr() (Expr, error) { return p.parseOr() }
 
@@ -1237,6 +1315,9 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "FALSE":
 			p.pos++
 			return &Literal{V: boolValue(false)}, nil
+		case "CASE":
+			p.pos++
+			return p.parseCase()
 		case "CAST", "TRY_CAST":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2

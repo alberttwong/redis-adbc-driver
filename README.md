@@ -174,6 +174,23 @@ SELECT order_id, notes FROM sales WHERE notes IS NOT NULL ORDER BY order_id LIMI
 -- Full-row lookup by row id: a direct HMGET, the index is not used
 SELECT __rowid, order_id, country, notes FROM sales WHERE __rowid = 42;
 
+-- CASE expressions, also usable in GROUP BY (by alias or position)
+SELECT order_id, quantity,
+       CASE WHEN quantity >= 15 THEN 'bulk' WHEN quantity >= 5 THEN 'standard' ELSE 'small' END AS size
+FROM sales ORDER BY order_id LIMIT 5;
+SELECT CASE WHEN discount IS NULL THEN 'full price' ELSE 'discounted' END AS pricing, COUNT(*) AS orders
+FROM sales GROUP BY pricing ORDER BY pricing;
+
+-- HAVING filters groups; here the GROUPBY/REDUCE itself still runs in the index
+SELECT country, COUNT(*) AS orders, SUM(quantity) AS units
+FROM sales GROUP BY country HAVING SUM(quantity) > 17500 ORDER BY units DESC;
+
+-- CREATE TABLE AS SELECT: column names and types come from the query
+CREATE TABLE country_revenue AS
+SELECT country, COUNT(*) AS orders, SUM(quantity * unit_price) AS revenue
+FROM sales WHERE status = 'shipped' GROUP BY country;
+SELECT * FROM country_revenue ORDER BY revenue DESC LIMIT 3;
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -270,10 +287,13 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 ## Supported SQL
 
 - `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [NOINDEX], …)`,
+  `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
+  from the query; every indexable column is indexed),
   `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n` parameters
-- `SELECT … FROM t [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
-  with `COUNT/SUM/AVG/MIN/MAX`, arithmetic, `CAST`, `IS [NOT] NULL`,
+- `SELECT … FROM t [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
+  with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
+  `CAST`, `IS [NOT] NULL`,
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
 - `SELECT` without `FROM` for literal expressions
 - `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
@@ -318,6 +338,14 @@ an empty database: the suite leaves its test tables (`test_*`, `getobjects*`,
 
 ```bash
 REDIS_URI='rediss://default:<password>@<host>:<port>/0' uv run pytest -v tests/
+```
+
+SQL features beyond the validation suite (CASE, HAVING, CTAS, …) have Go
+integration tests with exact expected results. They need a running Redis and
+are skipped when `REDIS_URI` is unset (from `go`):
+
+```bash
+REDIS_URI=redis://localhost:6379/0 go test -run TestSQL ./...
 ```
 
 To test against a local 3-shard Redis Cluster (from `go`):
