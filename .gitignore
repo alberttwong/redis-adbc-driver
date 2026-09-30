@@ -1,0 +1,7 @@
+go/build/
+go/validation/.venv/
+go/validation/uv.lock
+__pycache__/
+*.pyc
+validation-report.xml
+.claude/settings.local.json

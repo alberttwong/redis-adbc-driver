@@ -1,0 +1,847 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//         http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package redis
+
+// Query execution for the hybrid index-row layout:
+//
+//   - Full-row lookup: WHERE __rowid = N bypasses the index and reads the row
+//     HASH directly.
+//   - Filter + fetch: FT.AGGREGATE evaluates the pushed-down WHERE clause,
+//     ORDER BY and LIMIT entirely from the index (SORTABLE fields) and returns
+//     only the matching keys (LOAD @__key); the rows are then read from their
+//     HASHes with pipelined HMGET.
+//   - Aggregation: GROUPBY/REDUCE run inside FT.AGGREGATE over the SORTABLE
+//     fields without opening the HASHes, when the result is exact (see
+//     OptionStringAggregatePushdown); otherwise the driver aggregates rows it
+//     fetched from the HASHes.
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"github.com/apache/arrow-adbc/go/adbc"
+)
+
+// exactDoubleLimit bounds integers whose double representation is exact.
+const exactDoubleLimit = 1 << 53
+
+// wherePlan is the part of a WHERE clause answered by the index plus the
+// residual predicate evaluated by the driver on fetched rows.
+type wherePlan struct {
+	query    string
+	residual Expr
+	// keys is set for a direct lookup (WHERE __rowid = N): the rows are read
+	// straight from their HASHes without consulting the index.
+	keys []string
+}
+
+func conjuncts(e Expr, out []Expr) []Expr {
+	if b, ok := e.(*Binary); ok && b.Op == "AND" {
+		out = conjuncts(b.L, out)
+		return conjuncts(b.R, out)
+	}
+	return append(out, e)
+}
+
+func isConstant(e Expr) bool {
+	constant := true
+	walkExpr(e, func(x Expr) {
+		switch f := x.(type) {
+		case *ColumnRef:
+			constant = false
+		case *Func:
+			if aggregateFuncs[f.Name] {
+				constant = false
+			}
+		}
+	})
+	return constant
+}
+
+var flipOp = map[string]string{"=": "=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+// escapeTag escapes a value for a DIALECT 2 TAG query.
+func escapeTag(s string) string {
+	if s == "" {
+		return `""`
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// simpleName reports whether an attribute name can be used in query strings
+// and expressions without escaping.
+func simpleName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r != '_' && !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// comparison splits `col op const` (in either order) into its parts.
+func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
+	b, ok := c.(*Binary)
+	if !ok || flipOp[b.Op] == "" {
+		return nil, "", nil, false
+	}
+	if col, ok := b.L.(*ColumnRef); ok && isConstant(b.R) {
+		return col, b.Op, b.R, true
+	}
+	if col, ok := b.R.(*ColumnRef); ok && isConstant(b.L) {
+		return col, flipOp[b.Op], b.L, true
+	}
+	return nil, "", nil, false
+}
+
+// planWhere pushes down every predicate the index can answer: ranges on
+// NUMERIC columns and equality on TAG (string) columns. Predicates the index
+// may answer inexactly (double rounding of large integers) are pushed down
+// inclusively and also kept in the residual.
+func planWhere(where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
+	wp := wherePlan{query: "*"}
+	if where == nil {
+		return wp, nil
+	}
+	env := &evalEnv{params: params}
+	parts := conjuncts(where, nil)
+	var residual []Expr
+	addResidual := func(e Expr) { residual = append(residual, e) }
+
+	// Full-row lookup by row id.
+	for i, c := range parts {
+		col, op, other, ok := comparison(c)
+		if !ok || op != "=" || col.Name != rowIDField {
+			continue
+		}
+		v, err := env.eval(other)
+		if err != nil {
+			return wp, invalidArg(err)
+		}
+		if v, err = Coerce(v, typeInt64); err != nil || v.Null {
+			continue
+		}
+		wp.keys = []string{meta.prefix() + strconv.FormatInt(v.I, 10)}
+		for j, rest := range parts {
+			if j != i {
+				addResidual(rest)
+			}
+		}
+		wp.residual = andAll(residual)
+		return wp, nil
+	}
+
+	var terms []string
+	for _, c := range parts {
+		colRef, op, other, ok := comparison(c)
+		if !ok {
+			addResidual(c)
+			continue
+		}
+		col, ok := meta.column(colRef.Name)
+		if !ok || !col.Indexed || !simpleName(col.Name) {
+			addResidual(c)
+			continue
+		}
+		cv, err := env.eval(other)
+		if err != nil {
+			return wp, invalidArg(err)
+		}
+		if cv.Null {
+			addResidual(c)
+			continue
+		}
+		ct := col.Type
+		field := "@" + col.Name
+		switch {
+		case ct.Kind.indexedAsNumeric():
+			v, err := Coerce(cv, ct)
+			if err != nil || (ct.Kind == KindBool && op != "=") {
+				addResidual(c)
+				continue
+			}
+			bound := encodeStored(v)
+			exact := true
+			switch ct.Kind {
+			case KindInt64, KindTime, KindTimestamp:
+				exact = v.I > -exactDoubleLimit && v.I < exactDoubleLimit
+			case KindDecimal:
+				exact = ct.Precision <= 15
+			}
+			lo, hi := "-inf", "+inf"
+			switch op {
+			case "=":
+				lo, hi = bound, bound
+			case "<":
+				hi = "(" + bound
+			case "<=":
+				hi = bound
+			case ">":
+				lo = "(" + bound
+			case ">=":
+				lo = bound
+			}
+			if !exact {
+				lo, hi = strings.TrimPrefix(lo, "("), strings.TrimPrefix(hi, "(")
+				addResidual(c)
+			}
+			terms = append(terms, fmt.Sprintf("%s:[%s %s]", field, lo, hi))
+		case ct.Kind == KindString && op == "=":
+			v, err := Coerce(cv, ct)
+			if err != nil {
+				addResidual(c)
+				continue
+			}
+			terms = append(terms, fmt.Sprintf("%s:{%s}", field, escapeTag(v.S)))
+			if strings.Contains(v.S, tagSeparator) {
+				addResidual(c)
+			}
+		default:
+			addResidual(c)
+		}
+	}
+	if len(terms) > 0 {
+		wp.query = strings.Join(terms, " ")
+	}
+	wp.residual = andAll(residual)
+	return wp, nil
+}
+
+func andAll(exprs []Expr) Expr {
+	var out Expr
+	for _, e := range exprs {
+		if out == nil {
+			out = e
+		} else {
+			out = &Binary{Op: "AND", L: out, R: e}
+		}
+	}
+	return out
+}
+
+// decodeRow converts a fetched HASH into values keyed by column name.
+func decodeRow(meta *tableMeta, row aggRow, only map[string]bool) (map[string]Value, error) {
+	out := make(map[string]Value, len(only)+1)
+	if raw, ok := row[rowIDField]; ok {
+		v, err := decodeStored(raw, typeInt64)
+		if err != nil {
+			return nil, err
+		}
+		out[rowIDField] = v
+	}
+	for _, c := range meta.Columns {
+		if only != nil && !only[c.Name] {
+			continue
+		}
+		raw, ok := row[c.Name]
+		if !ok {
+			out[c.Name] = nullValue(c.Type)
+			continue
+		}
+		v, err := decodeStored(raw, c.Type)
+		if err != nil {
+			return nil, errorf(adbc.StatusInternal, "column %q: %v", c.Name, err)
+		}
+		out[c.Name] = v
+	}
+	return out, nil
+}
+
+// scanRequest describes an index lookup followed by a row fetch.
+type scanRequest struct {
+	meta   *tableMeta
+	where  wherePlan
+	sortBy []sortKey
+	limit  *[2]int64
+	need   map[string]bool // columns to read from the row HASHes
+}
+
+// scan finds the matching keys through the index (or directly), fetches the
+// needed columns from the row HASHes, and applies the residual predicate.
+func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
+	meta := req.meta
+	keys := req.where.keys
+	if keys == nil {
+		ar := &aggRequest{
+			index:  meta.index(),
+			query:  req.where.query,
+			load:   []string{"__key"},
+			sortBy: req.sortBy,
+			limit:  req.limit,
+		}
+		raw, err := e.store.aggregate(ctx, ar)
+		if err != nil {
+			return nil, nil, err
+		}
+		keys = make([]string, 0, len(raw))
+		for _, r := range raw {
+			if k, ok := r["__key"]; ok {
+				keys = append(keys, k)
+			}
+		}
+	}
+	need := map[string]bool{}
+	for k := range req.need {
+		need[k] = true
+	}
+	if req.where.residual != nil {
+		columnRefs(req.where.residual, need)
+	}
+	var fields []string
+	for _, c := range meta.Columns {
+		if need[c.Name] {
+			fields = append(fields, c.Name)
+		}
+	}
+	fetched, err := e.store.fetchRows(ctx, keys, fields)
+	if err != nil {
+		return nil, nil, err
+	}
+	env := &evalEnv{types: meta.types(), params: params}
+	outKeys := make([]string, 0, len(keys))
+	rows := make([]map[string]Value, 0, len(keys))
+	for i, raw := range fetched {
+		if raw == nil {
+			continue
+		}
+		vals, err := decodeRow(meta, raw, need)
+		if err != nil {
+			return nil, nil, err
+		}
+		if req.where.residual != nil {
+			env.row = vals
+			ok, err := env.eval(req.where.residual)
+			if err != nil {
+				return nil, nil, invalidArg(err)
+			}
+			if b, valid := truthy(ok); !valid || !b {
+				continue
+			}
+		}
+		outKeys = append(outKeys, keys[i])
+		rows = append(rows, vals)
+	}
+	return outKeys, rows, nil
+}
+
+// ---- SELECT ----
+
+func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	if plan.meta == nil {
+		return e.selectWithoutTable(plan, params)
+	}
+	if plan.aggregate {
+		return e.selectAggregate(ctx, plan, params)
+	}
+	meta := plan.meta
+	wp, err := planWhere(plan.sel.Where, meta, params)
+	if err != nil {
+		return nil, err
+	}
+	req := scanRequest{meta: meta, where: wp, need: map[string]bool{}}
+	for _, it := range plan.items {
+		columnRefs(it.expr, req.need)
+	}
+
+	// ORDER BY on indexed columns sorts inside the index; anything else is
+	// sorted by the driver after fetching.
+	indexSort := wp.keys == nil
+	for _, o := range plan.order {
+		c, ok := o.expr.(*ColumnRef)
+		if !ok {
+			indexSort = false
+			break
+		}
+		col, ok := meta.column(c.Name)
+		if !ok || !col.Indexed {
+			indexSort = false
+			break
+		}
+		req.sortBy = append(req.sortBy, sortKey{field: c.Name, desc: o.desc})
+	}
+	if !indexSort {
+		req.sortBy = nil
+		for _, o := range plan.order {
+			columnRefs(o.expr, req.need)
+		}
+	}
+	if len(plan.order) == 0 && wp.keys == nil {
+		// Implicit insertion order.
+		req.sortBy = []sortKey{{field: rowIDField}}
+		indexSort = true
+	}
+	sel := plan.sel
+	pushLimit := wp.residual == nil && indexSort && wp.keys == nil && sel.Limit != nil
+	if pushLimit {
+		off := int64(0)
+		if sel.Offset != nil {
+			off = *sel.Offset
+		}
+		req.limit = &[2]int64{off, *sel.Limit}
+	}
+
+	_, rows, err := e.scan(ctx, req, params)
+	if err != nil {
+		return nil, err
+	}
+	env := &evalEnv{types: meta.types(), params: params}
+	if !indexSort && len(plan.order) > 0 {
+		keys := make([][]Value, len(rows))
+		for i, r := range rows {
+			env.row = r
+			for _, o := range plan.order {
+				k, err := env.eval(o.expr)
+				if err != nil {
+					return nil, invalidArg(err)
+				}
+				keys[i] = append(keys[i], k)
+			}
+		}
+		idx := make([]int, len(rows))
+		for i := range idx {
+			idx[i] = i
+		}
+		sort.SliceStable(idx, func(a, b int) bool { return lessKeys(keys[idx[a]], keys[idx[b]], plan.order) })
+		sorted := make([]map[string]Value, len(rows))
+		for i, j := range idx {
+			sorted[i] = rows[j]
+		}
+		rows = sorted
+	}
+	if !pushLimit {
+		rows = applyLimit(rows, sel.Offset, sel.Limit)
+	}
+	out := make([][]Value, 0, len(rows))
+	for _, r := range rows {
+		env.row = r
+		row := make([]Value, len(plan.items))
+		for i, it := range plan.items {
+			v, err := env.eval(it.expr)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			row[i] = v
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// ---- aggregates ----
+
+func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	meta := plan.meta
+	wp, err := planWhere(plan.sel.Where, meta, params)
+	if err != nil {
+		return nil, err
+	}
+	var aggs []*Func
+	for _, it := range plan.items {
+		collectAggregates(it.expr, &aggs)
+	}
+	for _, o := range plan.order {
+		collectAggregates(o.expr, &aggs)
+	}
+	types := meta.types()
+	env := &evalEnv{types: types, params: params}
+
+	groups, ok, err := e.indexAggregate(ctx, plan, wp, aggs)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		groups, err = e.driverAggregate(ctx, plan, wp, aggs, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	type outRow struct {
+		vals []Value
+		keys []Value
+	}
+	out := make([]outRow, 0, len(groups))
+	for _, g := range groups {
+		env.row = g.rep
+		genv := &groupEnv{evalEnv: env, aggs: g.results}
+		row := outRow{}
+		for _, it := range plan.items {
+			v, err := genv.eval(it.expr)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			row.vals = append(row.vals, v)
+		}
+		for _, o := range plan.order {
+			v, err := genv.eval(o.expr)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			row.keys = append(row.keys, v)
+		}
+		out = append(out, row)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return lessKeys(out[i].keys, out[j].keys, plan.order) })
+	out = applyLimit(out, plan.sel.Offset, plan.sel.Limit)
+	rows := make([][]Value, len(out))
+	for i, r := range out {
+		rows[i] = r.vals
+	}
+	return rows, nil
+}
+
+// aggGroup is one output group: representative column values (the GROUP BY
+// columns) and the reduced value of every aggregate call.
+type aggGroup struct {
+	rep     map[string]Value
+	results map[*Func]Value
+}
+
+// pushableKind reports whether RediSearch returns exact results for
+// aggregates over a column of this kind (values it formats with at most 12
+// significant digits).
+func pushableKind(k Kind, mode string) bool {
+	switch k {
+	case KindInt16, KindInt32, KindBool, KindDate:
+		return true
+	case KindString:
+		return false
+	}
+	return mode == PushdownAll && k.indexedAsNumeric()
+}
+
+// indexAggregate computes GROUP BY / aggregates with FT.AGGREGATE over the
+// SORTABLE index fields. ok is false when the query cannot be answered
+// exactly by the index; the caller then aggregates in the driver.
+func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wherePlan, aggs []*Func) ([]aggGroup, bool, error) {
+	meta := plan.meta
+	if e.pushdown == PushdownNone || wp.residual != nil || wp.keys != nil {
+		return nil, false, nil
+	}
+	groupCols := make([]columnMeta, 0, len(plan.sel.GroupBy))
+	groupNames := map[string]bool{}
+	for _, g := range plan.sel.GroupBy {
+		c, ok := g.(*ColumnRef)
+		if !ok {
+			return nil, false, nil
+		}
+		col, ok := meta.column(c.Name)
+		if !ok || !col.Indexed || !simpleName(col.Name) {
+			return nil, false, nil
+		}
+		if !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
+			return nil, false, nil
+		}
+		groupCols = append(groupCols, col)
+		groupNames[col.Name] = true
+	}
+	// Outside aggregate calls, only GROUP BY columns may be referenced.
+	outside := map[string]bool{}
+	var collectOutside func(Expr)
+	collectOutside = func(x Expr) {
+		switch v := x.(type) {
+		case *Func:
+			if aggregateFuncs[v.Name] {
+				return
+			}
+			for _, a := range v.Args {
+				collectOutside(a)
+			}
+		case *ColumnRef:
+			outside[v.Name] = true
+		case *Unary:
+			collectOutside(v.X)
+		case *Binary:
+			collectOutside(v.L)
+			collectOutside(v.R)
+		case *IsNull:
+			collectOutside(v.X)
+		case *Cast:
+			collectOutside(v.X)
+		}
+	}
+	for _, it := range plan.items {
+		collectOutside(it.expr)
+	}
+	for _, o := range plan.order {
+		collectOutside(o.expr)
+	}
+	for name := range outside {
+		if !groupNames[name] {
+			return nil, false, nil
+		}
+	}
+
+	// Build APPLY / GROUPBY / REDUCE steps.
+	var steps []any
+	nonNull := map[string]string{} // column -> alias of exists() flag
+	argCol := make([]columnMeta, len(aggs))
+	for i, f := range aggs {
+		if f.Star {
+			if f.Name != "COUNT" {
+				return nil, false, nil
+			}
+			continue
+		}
+		if f.Distinct || len(f.Args) != 1 {
+			return nil, false, nil
+		}
+		c, ok := f.Args[0].(*ColumnRef)
+		if !ok {
+			return nil, false, nil
+		}
+		col, ok := meta.column(c.Name)
+		if !ok || !col.Indexed || !simpleName(col.Name) || col.Name == rowIDField {
+			return nil, false, nil
+		}
+		if f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown) {
+			return nil, false, nil
+		}
+		argCol[i] = col
+		if _, ok := nonNull[col.Name]; !ok {
+			alias := fmt.Sprintf("__nn%d", len(nonNull))
+			nonNull[col.Name] = alias
+			steps = append(steps, "APPLY", fmt.Sprintf("exists(@%s)", col.Name), "AS", alias)
+		}
+	}
+	steps = append(steps, "GROUPBY", len(groupCols))
+	for _, c := range groupCols {
+		steps = append(steps, "@"+c.Name)
+	}
+	steps = append(steps, "REDUCE", "COUNT", 0, "AS", "__count")
+	for col, alias := range nonNull {
+		steps = append(steps, "REDUCE", "SUM", 1, "@"+alias, "AS", alias+"_n")
+		_ = col
+	}
+	for i, f := range aggs {
+		if f.Star || f.Name == "COUNT" {
+			continue
+		}
+		op := f.Name
+		if op == "AVG" {
+			op = "SUM"
+		}
+		steps = append(steps, "REDUCE", op, 1, "@"+argCol[i].Name, "AS", fmt.Sprintf("__a%d", i))
+	}
+	raw, err := e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: steps})
+	if err != nil {
+		return nil, false, err
+	}
+	if len(raw) == 0 && len(groupCols) == 0 {
+		raw = []aggRow{{"__count": "0"}}
+	}
+
+	groups := make([]aggGroup, 0, len(raw))
+	for _, r := range raw {
+		g := aggGroup{rep: map[string]Value{}, results: map[*Func]Value{}}
+		for _, c := range groupCols {
+			s, ok := r[c.Name]
+			if !ok {
+				g.rep[c.Name] = nullValue(c.Type)
+				continue
+			}
+			v, err := decodeStored(s, c.Type)
+			if err != nil {
+				return nil, false, nil
+			}
+			g.rep[c.Name] = v
+		}
+		count, err := strconv.ParseInt(r["__count"], 10, 64)
+		if err != nil {
+			return nil, false, nil
+		}
+		for i, f := range aggs {
+			if f.Star {
+				g.results[f] = intValue(typeInt64, count)
+				continue
+			}
+			nn, err := strconv.ParseFloat(r[nonNull[argCol[i].Name]+"_n"], 64)
+			if err != nil {
+				return nil, false, nil
+			}
+			if f.Name == "COUNT" {
+				g.results[f] = intValue(typeInt64, int64(nn))
+				continue
+			}
+			t, err := inferType(f, meta.types(), nil)
+			if err != nil {
+				return nil, false, invalidArg(err)
+			}
+			if nn == 0 {
+				g.results[f] = nullValue(t)
+				continue
+			}
+			s := r[fmt.Sprintf("__a%d", i)]
+			switch f.Name {
+			case "SUM":
+				if t.Kind == KindInt64 {
+					n, err := strconv.ParseInt(s, 10, 64)
+					if err != nil {
+						// Rounded by RediSearch: compute exactly in the driver.
+						return nil, false, nil
+					}
+					g.results[f] = intValue(typeInt64, n)
+				} else {
+					v, err := decodeStored(s, t)
+					if err != nil {
+						return nil, false, nil
+					}
+					g.results[f] = v
+				}
+			case "AVG":
+				sum, err := strconv.ParseFloat(s, 64)
+				if err != nil {
+					return nil, false, nil
+				}
+				g.results[f] = floatValue(typeFloat64, sum/nn)
+			default: // MIN, MAX
+				v, err := decodeStored(s, argCol[i].Type)
+				if err != nil {
+					return nil, false, nil
+				}
+				g.results[f] = v
+			}
+		}
+		groups = append(groups, g)
+	}
+	return groups, true, nil
+}
+
+// driverAggregate fetches the needed columns from the row HASHes and reduces
+// them in the driver.
+func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp wherePlan, aggs []*Func, params []Value) ([]aggGroup, error) {
+	meta := plan.meta
+	req := scanRequest{meta: meta, where: wp, need: map[string]bool{}}
+	for _, it := range plan.items {
+		columnRefs(it.expr, req.need)
+	}
+	for _, g := range plan.sel.GroupBy {
+		columnRefs(g, req.need)
+	}
+	for _, o := range plan.order {
+		columnRefs(o.expr, req.need)
+	}
+	if len(plan.order) == 0 {
+		req.sortBy = nil
+	}
+	_, rows, err := e.scan(ctx, req, params)
+	if err != nil {
+		return nil, err
+	}
+	types := meta.types()
+	env := &evalEnv{types: types, params: params}
+	type group struct {
+		rep  map[string]Value
+		accs []*accumulator
+	}
+	var order []string
+	groups := map[string]*group{}
+	newGroup := func(rep map[string]Value) *group {
+		g := &group{rep: rep}
+		for _, f := range aggs {
+			g.accs = append(g.accs, &accumulator{fn: f})
+		}
+		return g
+	}
+	if len(plan.sel.GroupBy) == 0 {
+		groups[""] = newGroup(map[string]Value{})
+		order = append(order, "")
+	}
+	for _, vals := range rows {
+		env.row = vals
+		var key strings.Builder
+		for _, gexpr := range plan.sel.GroupBy {
+			v, err := env.eval(gexpr)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			if v.Null {
+				key.WriteString("N\x00")
+			} else {
+				key.WriteString("V" + v.Text() + "\x00")
+			}
+		}
+		g, ok := groups[key.String()]
+		if !ok {
+			g = newGroup(vals)
+			groups[key.String()] = g
+			order = append(order, key.String())
+		}
+		for i, f := range aggs {
+			var v Value
+			if !f.Star {
+				if len(f.Args) != 1 {
+					return nil, errorf(adbc.StatusInvalidArgument, "%s expects one argument", f.Name)
+				}
+				v, err = env.eval(f.Args[0])
+				if err != nil {
+					return nil, invalidArg(err)
+				}
+			}
+			g.accs[i].add(v)
+		}
+	}
+	out := make([]aggGroup, 0, len(order))
+	for _, k := range order {
+		g := groups[k]
+		results := map[*Func]Value{}
+		for i, f := range aggs {
+			t, err := inferType(f, types, nil)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			v, err := g.accs[i].result(t)
+			if err != nil {
+				return nil, invalidArg(err)
+			}
+			results[f] = v
+		}
+		out = append(out, aggGroup{rep: g.rep, results: results})
+	}
+	return out, nil
+}
+
+// ---- UPDATE / DELETE ----
+
+// matchRows returns the keys and requested values of the rows matching a
+// WHERE clause.
+func (e *executor) matchRows(ctx context.Context, meta *tableMeta, where Expr, params []Value, need map[string]bool) ([]string, []map[string]Value, error) {
+	if where != nil {
+		if err := bindColumns(where, meta); err != nil {
+			return nil, nil, err
+		}
+	}
+	wp, err := planWhere(where, meta, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.scan(ctx, scanRequest{meta: meta, where: wp, need: need}, params)
+}
