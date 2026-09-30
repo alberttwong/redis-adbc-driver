@@ -16,10 +16,23 @@
 
 # ADBC Driver for Redis
 
-An [ADBC](https://arrow.apache.org/adbc/) driver for Redis 8.4+, built on
+An [ADBC](https://arrow.apache.org/adbc/) driver for Redis 8.x, built on
 [driverbase-go](https://github.com/adbc-drivers/driverbase-go) and validated
 with the [ADBC driver validation suite](https://github.com/adbc-drivers/validation).
 It supports SQL queries and Arrow bulk ingestion.
+
+## Tested with
+
+The full validation suite (322 passed, 0 failed) has been run against:
+
+| Server | Version | Connection |
+|-|-|-|
+| Redis Open Source (`redis:8.4` Docker image) | 8.4.4, Search 8.4.10 | `redis://` |
+| Redis Cloud | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`) |
+
+The remaining 12 skipped tests and 1 expected failure are features the
+driver doesn't offer: constraints, statistics, a second catalog, temporary
+tables, transactions, and parameter-type introspection.
 
 ## Server requirements
 
@@ -259,7 +272,7 @@ only) and no joins.
 
 | Option | Level | Meaning |
 |-|-|-|
-| `uri` | database | `redis://[user:pass@]host:port/db` |
+| `uri` | database | `redis://[user:pass@]host:port/db`, or `rediss://…` for TLS |
 | `username`, `password` | database | Credentials (override the URI) |
 | `adbc.redis.address`, `adbc.redis.db` | database | Used when no URI is given |
 | `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`) |
@@ -278,6 +291,15 @@ suite against the local Redis:
 ```bash
 cd go/validation
 REDIS_URI=redis://localhost:6379/0 uv run pytest -v tests/
+```
+
+The suite accepts any Redis 8.x server, so it can also target a remote or
+Redis Cloud database. Use `rediss://` if the database requires TLS, and use
+an empty database: the suite leaves its test tables (`test_*`, `getobjects*`,
+`statistics*`) behind.
+
+```bash
+REDIS_URI='rediss://default:<password>@<host>:<port>/0' uv run pytest -v tests/
 ```
 
 Using the driver from Python:
