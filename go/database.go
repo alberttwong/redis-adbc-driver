@@ -17,6 +17,7 @@ package redis
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -33,6 +34,7 @@ type databaseImpl struct {
 	db       int
 	schema   string
 	pushdown string
+	cluster  string
 }
 
 func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
@@ -55,15 +57,18 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 	// The driver parses RESP2 replies of FT.AGGREGATE / FT.CURSOR.
 	opts.Protocol = 2
 	opts.DisableIdentity = true
-	client := goredis.NewClient(opts)
-	if err := client.Ping(ctx).Err(); err != nil {
-		_ = client.Close()
-		return nil, errorf(adbc.StatusIO, "failed to connect to Redis: %v", err)
+	client, err := d.connect(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
 	st := &store{client: client}
-	if err := st.client.Do(ctx, "FT._LIST").Err(); err != nil {
+	if err := st.searchDo(ctx, "", "FT._LIST").Err(); err != nil {
 		_ = client.Close()
 		return nil, errorf(adbc.StatusNotImplemented, "the Redis server does not provide the search (RediSearch) module: %v", err)
+	}
+	if err := st.migrateLegacyMetadata(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
 	}
 	conn := &connectionImpl{
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
@@ -77,6 +82,52 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		WithTableTypeLister(conn).
 		WithDbObjectsEnumerator(conn).
 		Connection(), nil
+}
+
+// connect opens a single-endpoint or OSS Cluster API client, depending on
+// the cluster option and (for "auto") what the server reports.
+func (d *databaseImpl) connect(ctx context.Context, opts *goredis.Options) (goredis.UniversalClient, error) {
+	useCluster := d.cluster == "true"
+	if d.cluster != "true" {
+		single := goredis.NewClient(opts)
+		if err := single.Ping(ctx).Err(); err != nil {
+			_ = single.Close()
+			return nil, errorf(adbc.StatusIO, "failed to connect to Redis: %v", err)
+		}
+		if d.cluster == "false" {
+			return single, nil
+		}
+		// Proxied databases (Redis Cloud, Redis Software) report
+		// cluster_enabled:0 or reject the section; both mean single endpoint.
+		info, err := single.Info(ctx, "cluster").Result()
+		if err != nil || !strings.Contains(info, "cluster_enabled:1") {
+			return single, nil
+		}
+		_ = single.Close()
+		useCluster = true
+	}
+	if !useCluster {
+		return nil, errorf(adbc.StatusInternal, "unreachable")
+	}
+	if opts.DB != 0 {
+		return nil, errorf(adbc.StatusInvalidArgument, "Redis Cluster only supports database 0 (got %d)", opts.DB)
+	}
+	cluster := goredis.NewClusterClient(&goredis.ClusterOptions{
+		Addrs:           []string{opts.Addr},
+		Username:        opts.Username,
+		Password:        opts.Password,
+		TLSConfig:       opts.TLSConfig,
+		Protocol:        opts.Protocol,
+		DisableIdentity: opts.DisableIdentity,
+		DialTimeout:     opts.DialTimeout,
+		ReadTimeout:     opts.ReadTimeout,
+		WriteTimeout:    opts.WriteTimeout,
+	})
+	if err := cluster.Ping(ctx).Err(); err != nil {
+		_ = cluster.Close()
+		return nil, errorf(adbc.StatusIO, "failed to connect to Redis Cluster: %v", err)
+	}
+	return cluster, nil
 }
 
 func (d *databaseImpl) Close(ctx context.Context) error { return nil }
@@ -95,6 +146,8 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.schema, nil
 	case OptionStringAggregatePushdown:
 		return d.pushdown, nil
+	case OptionStringCluster:
+		return d.cluster, nil
 	}
 	return d.DatabaseImplBase.GetOption(ctx, key)
 }
@@ -125,6 +178,13 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 			return err
 		}
 		d.pushdown = value
+	case OptionStringCluster:
+		switch value {
+		case "auto", "true", "false":
+			d.cluster = value
+		default:
+			return errorf(adbc.StatusInvalidArgument, "invalid %s %q (want auto, true or false)", key, value)
+		}
 	default:
 		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}

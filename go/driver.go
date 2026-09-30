@@ -55,6 +55,13 @@ const (
 	//   - "none": always compute aggregates in the driver.
 	OptionStringAggregatePushdown = "adbc.redis.aggregate_pushdown"
 
+	// OptionStringCluster (database) selects the client: "auto" (default)
+	// uses the OSS Cluster API client when the server reports
+	// cluster_enabled:1 and a single-endpoint client otherwise (standalone
+	// Redis, or Redis Cloud / Redis Software through their proxy); "true"
+	// forces the cluster client; "false" forces the single-endpoint client.
+	OptionStringCluster = "adbc.redis.cluster"
+
 	PushdownExact = "exact"
 	PushdownAll   = "all"
 	PushdownNone  = "none"
@@ -98,6 +105,7 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 		address:          DefaultAddress,
 		schema:           defaultSchema,
 		pushdown:         PushdownExact,
+		cluster:          "auto",
 	}
 	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
