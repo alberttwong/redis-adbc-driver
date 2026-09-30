@@ -213,6 +213,24 @@ SELECT bucket, COUNT(*) AS orders
 FROM (SELECT CASE WHEN quantity >= 15 THEN 'bulk' ELSE 'regular' END AS bucket FROM sales) AS t
 GROUP BY bucket ORDER BY bucket;
 
+-- Joins. Each table's own filters run in its index; inner joins start from
+-- the table with the fewest matching rows, then fetch only the matching rows
+-- of the other (an index union on the join key)
+SELECT c.name, COUNT(*) AS orders, SUM(s.quantity) AS units
+FROM sales s JOIN customers c ON s.customer_id = c.customer_id
+WHERE c.country = 'JPN' AND s.status = 'shipped'
+GROUP BY c.name ORDER BY units DESC LIMIT 3;
+
+-- LEFT JOIN anti-join: customers who never bought 20 gizmos in one order
+SELECT c.name FROM customers c
+LEFT JOIN sales s ON s.customer_id = c.customer_id AND s.product = 'gizmo' AND s.quantity = 20
+WHERE s.order_id IS NULL ORDER BY c.name LIMIT 5;
+
+-- Comma joins with the condition in WHERE are hash joins, not cross products
+SELECT c.country, COUNT(DISTINCT c.customer_id) AS customers, SUM(s.quantity * s.unit_price) AS revenue
+FROM customers c, sales s WHERE s.customer_id = c.customer_id
+GROUP BY c.country ORDER BY revenue DESC LIMIT 3;
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -292,6 +310,7 @@ How SQL is executed:
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
 Pushed down into the index: numeric range/equality predicates on indexed
@@ -317,8 +336,11 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
   parameters, and `INSERT INTO t [(cols)] SELECT …`
-- `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM t | (SELECT …) [AS alias]
+- `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM item {, item |
+  [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item}
   [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
+  where an item is a table, a CTE, or `(SELECT …)`, each with an optional
+  alias (`t.col` qualifies a column),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
   `CAST`, `IS [NOT] NULL`, subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
@@ -326,8 +348,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
 - `SELECT` without `FROM` for literal expressions
 - `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
-- Not supported: joins (coming next), `WITH RECURSIVE`, `LATERAL`,
-  `ANY`/`ALL` comparisons
+- Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
+  comparisons, `UNION`/`INTERSECT`/`EXCEPT`, window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE]`

@@ -38,6 +38,8 @@ import (
 type relation struct {
 	name string // alias, table or CTE name
 	meta *tableMeta
+	// prefix is prepended to resolved column names ("alias." in joins).
+	prefix string
 }
 
 type scope struct {
@@ -127,15 +129,29 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 	top := len(e.scopes) - 1
 	for depth := 0; depth <= top; depth++ {
 		sc := e.scopes[top-depth]
+		var match columnMeta
+		var matchRel relation
+		found := 0
 		for _, rel := range sc.rels {
 			if c.Qualifier != "" && !strings.EqualFold(c.Qualifier, rel.name) &&
-				!strings.EqualFold(c.Qualifier, rel.meta.Name) {
+				!(rel.prefix == "" && strings.EqualFold(c.Qualifier, rel.meta.Name)) {
 				continue
 			}
 			col, ok := rel.meta.column(c.Name)
-			if !ok {
+			if !ok || (rel.prefix != "" && col.Name == rowIDField) {
 				continue
 			}
+			found++
+			if found == 1 {
+				match, matchRel = col, rel
+			}
+		}
+		if found > 1 {
+			return errorf(adbc.StatusInvalidArgument, "column reference %q is ambiguous; qualify it with a table alias", c.Name)
+		}
+		if found == 1 {
+			col := match
+			col.Name = matchRel.prefix + col.Name
 			c.Name = col.Name
 			c.Outer = depth
 			c.OuterType = col.Type
@@ -262,26 +278,31 @@ func (e *executor) lookupCTE(name string) *CTE {
 	return nil
 }
 
-// fromRelation resolves the FROM clause of a SELECT to a relation.
+// fromRelation resolves the FROM clause of a SELECT (without joins) to a
+// relation.
 func (e *executor) fromRelation(ctx context.Context, sel *SelectStmt) (*tableMeta, string, error) {
+	return e.resolveFromItem(ctx, sel.From, sel.FromSelect, sel.FromAlias)
+}
+
+// resolveFromItem resolves one FROM item: a table, a CTE, or a derived table.
+func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *SelectStmt, alias string) (*tableMeta, string, error) {
 	switch {
-	case sel.FromSelect != nil:
-		if m, ok := e.cache.derived[sel.FromSelect]; ok {
-			return m, sel.FromAlias, nil
+	case sub != nil:
+		if m, ok := e.cache.derived[sub]; ok {
+			return m, alias, nil
 		}
-		m, err := e.materialize(ctx, sel.FromSelect, sel.FromAlias, sel.FromSelect, nil)
+		m, err := e.materialize(ctx, sub, alias, sub, nil)
 		if err != nil {
 			return nil, "", err
 		}
-		e.cache.derived[sel.FromSelect] = m
-		return m, sel.FromAlias, nil
-	case sel.From != nil:
-		alias := sel.FromAlias
+		e.cache.derived[sub] = m
+		return m, alias, nil
+	case table != nil:
 		if alias == "" {
-			alias = sel.From.Name
+			alias = table.Name
 		}
-		if sel.From.Schema == "" && sel.From.Catalog == "" {
-			if def := e.lookupCTE(sel.From.Name); def != nil {
+		if table.Schema == "" && table.Catalog == "" {
+			if def := e.lookupCTE(table.Name); def != nil {
 				if m, ok := e.cache.ctes[def]; ok {
 					return m, alias, nil
 				}
@@ -293,7 +314,7 @@ func (e *executor) fromRelation(ctx context.Context, sel *SelectStmt) (*tableMet
 				return m, alias, nil
 			}
 		}
-		meta, err := e.loadTable(ctx, *sel.From)
+		meta, err := e.loadTable(ctx, *table)
 		return meta, alias, err
 	}
 	return nil, "", nil
