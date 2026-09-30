@@ -305,7 +305,11 @@ Stop Redis with `docker compose down`.
   (column types as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
   `adbc:{meta}:view:<schema>:<view>` (the SELECT text and its columns) and
-  `adbc:{meta}:views:<schema>`. Tables and views share one namespace. Metadata written by
+  `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
+  Each table's metadata records its row key prefix and index name, and
+  `adbc:{meta}:prefixes` / `adbc:{meta}:indexes` reserve them, so a renamed
+  table's rows can never be shared with a new table of the old name.
+  `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
 
@@ -319,6 +323,7 @@ How SQL is executed:
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
 | Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
@@ -346,6 +351,19 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`,
   `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS SELECT …`,
   `DROP VIEW [IF EXISTS] v`
+- `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
+  `RENAME [COLUMN] a TO b`, `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOINDEX]`,
+  `DROP [COLUMN] [IF EXISTS] c`. All of them only change metadata, so they
+  take the same time at any table size:
+  - `RENAME TO` keeps the table's row keys and index (fixed when the table
+    was created), so no row is touched.
+  - `RENAME COLUMN` keeps the column's HASH field; only its SQL name changes.
+  - `ADD COLUMN` adds the column to the index with `FT.ALTER`; existing rows
+    read it as NULL. `NOT NULL` and `DEFAULT` are not supported here.
+  - `DROP COLUMN` hides the column immediately and removes its field from
+    existing rows in the background (resumed by the next connection if the
+    process exits first). A dropped column's values never reappear, even if
+    a column with the same name is added later.
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
   parameters, and `INSERT INTO t [(cols)] SELECT …`
 - `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM item {, item |

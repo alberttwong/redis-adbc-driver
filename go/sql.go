@@ -198,7 +198,33 @@ type ColumnDef struct {
 	// NoIndex keeps the column out of the RediSearch index (it is still
 	// stored in the row HASH).
 	NoIndex bool
+	// HasDefault is set when a DEFAULT clause was given (defaults are not
+	// applied; ADD COLUMN rejects them).
+	HasDefault bool
 }
+
+type AlterAction int
+
+const (
+	AlterRenameTable AlterAction = iota + 1
+	AlterRenameColumn
+	AlterAddColumn
+	AlterDropColumn
+)
+
+type AlterTableStmt struct {
+	Table             TableName
+	IfExists          bool
+	Action            AlterAction
+	NewTable          TableName // RENAME TO
+	Column            string    // RENAME COLUMN (old) / DROP COLUMN
+	NewColumn         string    // RENAME COLUMN (new)
+	Def               ColumnDef // ADD COLUMN
+	IfColumnExists    bool
+	IfColumnNotExists bool
+}
+
+func (*AlterTableStmt) stmtNode() {}
 
 type CreateTableStmt struct {
 	Table       TableName
@@ -593,6 +619,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseUpdate()
 	case p.isKeyword("DELETE"):
 		return p.parseDelete()
+	case p.isKeyword("ALTER"):
+		return p.parseAlter()
 	}
 	return nil, &sqlError{msg: fmt.Sprintf("unsupported statement starting with %q", p.peek().text)}
 }
@@ -1034,39 +1062,10 @@ func (p *parser) parseCreate() (Stmt, error) {
 				return nil, err
 			}
 		} else {
-			name, err := p.parseIdent()
+			col, err := p.parseColumnDef()
 			if err != nil {
 				return nil, err
 			}
-			spec, err := p.parseTypeSpec()
-			if err != nil {
-				return nil, err
-			}
-			ct, err := colTypeFromSQL(spec)
-			if err != nil {
-				return nil, &sqlError{msg: err.Error()}
-			}
-			col := ColumnDef{Name: name, Type: ct}
-			// Column constraints.
-			for {
-				switch {
-				case p.acceptKeyword("NOT", "NULL"):
-					col.NotNull = true
-				case p.acceptKeyword("NULL"):
-				case p.acceptKeyword("PRIMARY", "KEY"):
-				case p.acceptKeyword("UNIQUE"):
-				case p.acceptKeyword("NOINDEX"):
-					col.NoIndex = true
-				case p.acceptKeyword("INDEX"):
-				case p.acceptKeyword("DEFAULT"):
-					if _, err := p.parseExpr(); err != nil {
-						return nil, err
-					}
-				default:
-					goto done
-				}
-			}
-		done:
 			st.Columns = append(st.Columns, col)
 		}
 		if !p.acceptOp(",") {
@@ -1075,6 +1074,95 @@ func (p *parser) parseCreate() (Stmt, error) {
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
+	}
+	return st, nil
+}
+
+// parseColumnDef parses `name TYPE [constraints]`.
+func (p *parser) parseColumnDef() (ColumnDef, error) {
+	name, err := p.parseIdent()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	spec, err := p.parseTypeSpec()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	ct, err := colTypeFromSQL(spec)
+	if err != nil {
+		return ColumnDef{}, &sqlError{msg: err.Error()}
+	}
+	col := ColumnDef{Name: name, Type: ct}
+	for {
+		switch {
+		case p.acceptKeyword("NOT", "NULL"):
+			col.NotNull = true
+		case p.acceptKeyword("NULL"):
+		case p.acceptKeyword("PRIMARY", "KEY"):
+		case p.acceptKeyword("UNIQUE"):
+		case p.acceptKeyword("NOINDEX"):
+			col.NoIndex = true
+		case p.acceptKeyword("INDEX"):
+		case p.acceptKeyword("DEFAULT"):
+			if _, err := p.parseExpr(); err != nil {
+				return ColumnDef{}, err
+			}
+			col.HasDefault = true
+		default:
+			return col, nil
+		}
+	}
+}
+
+// parseAlter parses ALTER TABLE [IF EXISTS] t followed by one of
+// RENAME TO u | RENAME [COLUMN] a TO b | ADD [COLUMN] [IF NOT EXISTS] def |
+// DROP [COLUMN] [IF EXISTS] c.
+func (p *parser) parseAlter() (Stmt, error) {
+	if err := p.expectKeyword("ALTER", "TABLE"); err != nil {
+		return nil, err
+	}
+	st := &AlterTableStmt{}
+	st.IfExists = p.acceptKeyword("IF", "EXISTS")
+	t, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = t
+	switch {
+	case p.acceptKeyword("RENAME", "TO"):
+		nt, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		st.Action, st.NewTable = AlterRenameTable, nt
+	case p.acceptKeyword("RENAME"):
+		p.acceptKeyword("COLUMN")
+		if st.Column, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("TO"); err != nil {
+			return nil, err
+		}
+		if st.NewColumn, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		st.Action = AlterRenameColumn
+	case p.acceptKeyword("ADD"):
+		p.acceptKeyword("COLUMN")
+		st.IfColumnNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
+		if st.Def, err = p.parseColumnDef(); err != nil {
+			return nil, err
+		}
+		st.Action = AlterAddColumn
+	case p.acceptKeyword("DROP"):
+		p.acceptKeyword("COLUMN")
+		st.IfColumnExists = p.acceptKeyword("IF", "EXISTS")
+		if st.Column, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		st.Action = AlterDropColumn
+	default:
+		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN)", p.peek().text)}
 	}
 	return st, nil
 }
