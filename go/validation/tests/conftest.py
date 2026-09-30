@@ -58,12 +58,13 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def secondary_schema() -> None:
+def secondary_schema(pytestconfig) -> None:
     """Create the secondary schema (key namespace) used by the suite."""
-    uri = os.environ.get("REDIS_URI")
+    quirks = redis.get_quirks(pytestconfig.getoption("vendor_version"))
+    uri = quirks.setup.database["uri"]
+    uri = os.environ.get(uri.env) if isinstance(uri, adbc_drivers_validation.model.FromEnv) else uri
     if uri is None:
         return
-    quirks = redis.get_quirks("redis")
     with adbc_driver_manager.dbapi.connect(
         driver=_driver_path(), db_kwargs={"uri": uri}, autocommit=True
     ) as conn:
