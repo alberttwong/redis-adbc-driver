@@ -30,6 +30,15 @@ type executor struct {
 	store    *store
 	schema   string // current schema
 	pushdown string // aggregate pushdown mode
+
+	// Per-statement state (see bind.go).
+	cache      *execCache
+	params     []Value
+	paramTypes []ColType
+	outer      *evalEnv // row of the enclosing query (correlated subqueries)
+	scopes     []*scope
+	pendingSq  *Subquery
+	ctes       []map[string]*CTE
 }
 
 // execResult is the outcome of one statement.
@@ -67,33 +76,9 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 	return e.store.getTable(ctx, schema, name)
 }
 
-// bindColumns rewrites column references to their canonical names.
-func bindColumns(expr Expr, meta *tableMeta) error {
-	var err error
-	walkExpr(expr, func(x Expr) {
-		c, ok := x.(*ColumnRef)
-		if !ok || err != nil {
-			return
-		}
-		if meta == nil {
-			err = errorf(adbc.StatusInvalidArgument, "column %q does not exist", c.Name)
-			return
-		}
-		if strings.EqualFold(c.Name, rowIDField) {
-			c.Name = rowIDField
-			return
-		}
-		i, ok := meta.resolve(c.Name)
-		if !ok {
-			err = errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", c.Name, meta.Name)
-			return
-		}
-		c.Name = meta.Columns[i].Name
-	})
-	return err
-}
-
 func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (execResult, error) {
+	e.cache = newExecCache()
+	e.params, e.paramTypes = params, paramTypes
 	switch st := ps.Stmt.(type) {
 	case *SelectStmt:
 		plan, err := e.planSelect(ctx, st, paramTypes)
@@ -282,7 +267,10 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 			targets = append(targets, i)
 		}
 	}
-	env := &evalEnv{params: params}
+	if st.Select != nil {
+		return e.insertSelect(ctx, st, meta, targets)
+	}
+	env := e.newEnv(ctx, nil, params)
 	rows := make([][]Value, 0, len(st.Rows))
 	for _, exprs := range st.Rows {
 		if len(exprs) != len(targets) {
@@ -293,7 +281,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 			row[i] = nullValue(c.Type)
 		}
 		for j, expr := range exprs {
-			if err := bindColumns(expr, nil); err != nil {
+			if _, err := e.bindIn(ctx, expr, nil, ""); err != nil {
 				return 0, err
 			}
 			v, err := env.eval(expr)
@@ -308,6 +296,38 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 			row[targets[j]] = cv
 		}
 		rows = append(rows, row)
+	}
+	return e.store.insertRows(ctx, meta, rows)
+}
+
+// insertSelect implements INSERT INTO … SELECT.
+func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *tableMeta, targets []int) (int64, error) {
+	plan, err := e.planSelect(ctx, st.Select, e.paramTypes)
+	if err != nil {
+		return 0, err
+	}
+	if len(plan.items) != len(targets) {
+		return 0, errorf(adbc.StatusInvalidArgument, "INSERT has %d target columns but the query returns %d", len(targets), len(plan.items))
+	}
+	results, err := e.runSelect(ctx, plan, e.params)
+	if err != nil {
+		return 0, err
+	}
+	rows := make([][]Value, len(results))
+	for r, res := range results {
+		row := make([]Value, len(meta.Columns))
+		for i, c := range meta.Columns {
+			row[i] = nullValue(c.Type)
+		}
+		for j, v := range res {
+			col := meta.Columns[targets[j]]
+			cv, err := Coerce(v, col.Type)
+			if err != nil {
+				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
+			}
+			row[targets[j]] = cv
+		}
+		rows[r] = row
 	}
 	return e.store.insertRows(ctx, meta, rows)
 }
@@ -333,6 +353,8 @@ type selectPlan struct {
 	order     []planOrder
 	// having is the HAVING predicate with output aliases resolved.
 	having Expr
+	// extraNeed are columns read only by correlated subqueries.
+	extraNeed map[string]bool
 }
 
 func (p *selectPlan) columns() []resultColumn {
@@ -344,16 +366,39 @@ func (p *selectPlan) columns() []resultColumn {
 }
 
 func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes []ColType) (*selectPlan, error) {
+	e.ensureCache()
+	if paramTypes != nil {
+		e.paramTypes = paramTypes
+	}
 	plan := &selectPlan{sel: sel}
-	var types map[string]ColType
-	if sel.From != nil {
-		meta, err := e.loadTable(ctx, *sel.From)
-		if err != nil {
-			return nil, err
+	if len(sel.With) > 0 {
+		defs := map[string]*CTE{}
+		for i := range sel.With {
+			key := strings.ToLower(sel.With[i].Name)
+			if _, dup := defs[key]; dup {
+				return nil, errorf(adbc.StatusInvalidArgument, "WITH query name %q specified more than once", sel.With[i].Name)
+			}
+			defs[key] = &sel.With[i]
 		}
+		e.ctes = append(e.ctes, defs)
+		defer func() { e.ctes = e.ctes[:len(e.ctes)-1] }()
+	}
+	var types map[string]ColType
+	meta, relName, err := e.fromRelation(ctx, sel)
+	if err != nil {
+		return nil, err
+	}
+	var rels []relation
+	if meta != nil {
 		plan.meta = meta
 		types = meta.types()
+		rels = []relation{{name: relName, meta: meta}}
 	}
+	sc := e.pushScope(rels)
+	defer func() {
+		plan.extraNeed = sc.needs
+		e.popScope()
+	}()
 	itemStart := make([]int, len(sel.Items))
 	for i, it := range sel.Items {
 		itemStart[i] = len(plan.items)
@@ -366,10 +411,10 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			}
 			continue
 		}
-		if err := bindColumns(it.Expr, plan.meta); err != nil {
+		if err := e.bind(ctx, it.Expr); err != nil {
 			return nil, err
 		}
-		t, err := inferType(it.Expr, types, paramTypes)
+		t, err := inferType(it.Expr, types, e.paramTypes)
 		if err != nil {
 			return nil, invalidArg(err)
 		}
@@ -405,7 +450,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			} else {
 				g = replaceAliases(g, aliases, plan.meta)
 			}
-			if err := bindColumns(g, plan.meta); err != nil {
+			if err := e.bind(ctx, g); err != nil {
 				return nil, err
 			}
 			if isAggregate(g) {
@@ -423,7 +468,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			}
 		}
 		having := replaceAliases(sel.Having, aliases, plan.meta)
-		if err := bindColumns(having, plan.meta); err != nil {
+		if err := e.bind(ctx, having); err != nil {
 			return nil, err
 		}
 		plan.having = having
@@ -432,7 +477,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if isAggregate(sel.Where) {
 			return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHERE")
 		}
-		if err := bindColumns(sel.Where, plan.meta); err != nil {
+		if err := e.bind(ctx, sel.Where); err != nil {
 			return nil, err
 		}
 	}
@@ -461,7 +506,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 				continue
 			}
 		}
-		if err := bindColumns(expr, plan.meta); err != nil {
+		if err := e.bind(ctx, expr); err != nil {
 			return nil, err
 		}
 		plan.order = append(plan.order, planOrder{expr: expr, desc: o.Desc})
@@ -507,11 +552,11 @@ func lessKeys(a, b []Value, order []planOrder) bool {
 	return false
 }
 
-func (e *executor) selectWithoutTable(plan *selectPlan, params []Value) ([][]Value, error) {
+func (e *executor) selectWithoutTable(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
 	if plan.aggregate {
 		return nil, errorf(adbc.StatusNotImplemented, "aggregates require a FROM clause")
 	}
-	env := &evalEnv{params: params}
+	env := e.newEnv(ctx, nil, params)
 	if plan.sel.Where != nil {
 		ok, err := env.eval(plan.sel.Where)
 		if err != nil {
@@ -652,16 +697,20 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 			return 0, errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", s.Column, meta.Name)
 		}
 		targets[i] = idx
-		if err := bindColumns(s.Expr, meta); err != nil {
+		needs, err := e.bindIn(ctx, s.Expr, meta, meta.Name)
+		if err != nil {
 			return 0, err
 		}
 		columnRefs(s.Expr, need)
+		for k := range needs {
+			need[k] = true
+		}
 	}
 	keys, rows, err := e.matchRows(ctx, meta, st.Where, params, need)
 	if err != nil {
 		return 0, err
 	}
-	env := &evalEnv{types: meta.types(), params: params}
+	env := e.newEnv(ctx, meta.types(), params)
 	for start := 0; start < len(keys); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(keys))
 		pipe := e.store.client.Pipeline()

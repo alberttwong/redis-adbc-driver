@@ -286,3 +286,124 @@ func TestSQLCreateTableAs(t *testing.T) {
 	h.expectError(`CREATE TABLE it_ctas_copy AS SELECT id FROM it_orders`, "already exists")
 }
 
+func TestSQLSubqueries(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+
+	// Uncorrelated scalar subqueries (run once; usable as a pushed-down constant).
+	h.expectRows(`SELECT id FROM it_orders WHERE amount > (SELECT AVG(amount) FROM it_orders) ORDER BY id`, "2", "4")
+	h.expectRows(`SELECT (SELECT MAX(qty) FROM it_orders) AS m`, "10")
+	h.expectRows(`SELECT (SELECT id FROM it_orders WHERE id = 99)`, "NULL")
+	h.expectError(`SELECT (SELECT id FROM it_orders)`, "returned 6 rows")
+	h.expectError(`SELECT id FROM it_orders WHERE id IN (SELECT id, qty FROM it_orders)`, "exactly one column")
+
+	// IN / NOT IN with subqueries, including SQL NULL semantics.
+	h.expectRows(`SELECT name FROM it_customers WHERE id IN (SELECT customer_id FROM it_orders WHERE status = 'shipped') ORDER BY name`,
+		"Ada", "Bo")
+	h.expectRows(`SELECT name FROM it_customers WHERE id NOT IN (SELECT customer_id FROM it_orders) ORDER BY name`, "Di")
+	// The subquery returns {USA, NULL}: NOT IN is never true.
+	h.expectRows(`SELECT name FROM it_customers WHERE country NOT IN (SELECT country FROM it_customers WHERE id > 2)`)
+	h.expectRows(`SELECT id FROM it_orders WHERE customer_id IN (SELECT id FROM it_customers WHERE id > 100)`)
+
+	// IN lists on indexed columns (index union queries).
+	h.expectRows(`SELECT id FROM it_orders WHERE status IN ('pending', 'returned') ORDER BY id`, "2", "5")
+	h.expectRows(`SELECT id FROM it_orders WHERE customer_id IN (1, 3) ORDER BY id`, "1", "2", "5")
+	h.expectRows(`SELECT id FROM it_orders WHERE customer_id = 2 OR customer_id = 9 ORDER BY id`, "3", "4", "6")
+
+	// Correlated EXISTS / NOT EXISTS.
+	h.expectRows(`SELECT name FROM it_customers c
+		WHERE EXISTS (SELECT 1 FROM it_orders o WHERE o.customer_id = c.id AND o.status = 'pending')`, "Ada")
+	h.expectRows(`SELECT name FROM it_customers c
+		WHERE NOT EXISTS (SELECT 1 FROM it_orders o WHERE o.customer_id = c.id) ORDER BY name`, "Di")
+
+	// Correlated scalar subqueries in the SELECT list; the outer query must
+	// fetch c.id even though it doesn't select it.
+	h.expectRows(`SELECT c.name,
+			(SELECT COUNT(*) FROM it_orders o WHERE o.customer_id = c.id) AS n,
+			(SELECT SUM(o.amount) FROM it_orders o WHERE o.customer_id = c.id) AS total
+		FROM it_customers c ORDER BY c.id`,
+		"Ada|2|110.49", "Bo|2|255.00", "Cy|1|NULL", "Di|0|NULL")
+	// Same table inside and out, told apart by aliases.
+	h.expectRows(`SELECT id FROM it_orders o1
+		WHERE amount > (SELECT AVG(amount) FROM it_orders o2 WHERE o2.customer_id = o1.customer_id) ORDER BY id`,
+		"2", "4")
+	// Two levels of nesting, with the innermost referring to the outermost.
+	h.expectRows(`SELECT name FROM it_customers c
+		WHERE EXISTS (SELECT 1 FROM it_orders o WHERE o.customer_id = c.id
+			AND o.qty > (SELECT MIN(o2.qty) FROM it_orders o2 WHERE o2.customer_id = c.id))
+		ORDER BY name`,
+		"Ada", "Bo")
+	h.expectError(`SELECT id FROM it_orders WHERE nope.id = 1`, "does not exist")
+}
+
+func TestSQLDerivedTablesAndCTEs(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+
+	// Derived tables.
+	h.expectRows(`SELECT tier, COUNT(*) FROM (
+			SELECT customer_id, CASE WHEN SUM(qty) > 5 THEN 'big' ELSE 'small' END AS tier
+			FROM it_orders GROUP BY customer_id) AS t
+		GROUP BY tier ORDER BY tier`,
+		"big|1", "small|3")
+	h.expectRows(`SELECT t.n FROM (SELECT COUNT(*) AS n FROM it_orders) t`, "6")
+	// A SELECT alias isn't visible in the same query's WHERE (standard SQL).
+	h.expectError(`SELECT id, qty * 2 AS dbl FROM it_orders WHERE dbl > 7`, "does not exist")
+	h.expectRows(`SELECT id, dbl FROM (SELECT id, qty * 2 AS dbl FROM it_orders) q WHERE dbl > 7 ORDER BY dbl DESC`, "4|20", "6|8")
+	h.expectError(`SELECT * FROM (SELECT id, id FROM it_orders) x`, "more than once")
+
+	// CTEs: filtering, chaining, column lists, reuse, use inside subqueries.
+	h.expectRows(`WITH totals AS (SELECT customer_id, SUM(amount) AS total FROM it_orders GROUP BY customer_id)
+		SELECT customer_id, total FROM totals WHERE total > 100 ORDER BY total DESC`,
+		"2|255.00", "1|110.49")
+	h.expectRows(`WITH shipped AS (SELECT * FROM it_orders WHERE status = 'shipped'),
+			big AS (SELECT id FROM shipped WHERE qty >= 4)
+		SELECT id FROM big ORDER BY id`,
+		"4", "6")
+	h.expectRows(`WITH x(a, b) AS (SELECT id, qty FROM it_orders WHERE id <= 2) SELECT a + b FROM x ORDER BY 1`, "2", "5")
+	h.expectRows(`WITH vip AS (SELECT customer_id FROM it_orders GROUP BY customer_id HAVING SUM(qty) > 5)
+		SELECT name FROM it_customers WHERE id IN (SELECT customer_id FROM vip)`, "Bo")
+	h.expectRows(`WITH s AS (SELECT qty FROM it_orders) SELECT (SELECT MAX(qty) FROM s) - (SELECT MIN(qty) FROM s)`, "9")
+	h.expectRows(`WITH c AS (SELECT id, name FROM it_customers)
+		SELECT c.name, (SELECT COUNT(*) FROM it_orders o WHERE o.customer_id = c.id) FROM c ORDER BY c.id`,
+		"Ada|2", "Bo|2", "Cy|1", "Di|0")
+	h.expectError(`WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r`, "not supported")
+	h.expectError(`WITH r AS (SELECT * FROM r) SELECT * FROM r`, "recursive")
+	h.expectError(`WITH x(a) AS (SELECT id, qty FROM it_orders) SELECT * FROM x`, "column names")
+
+	// CTAS from a CTE.
+	h.exec("DROP TABLE IF EXISTS it_ctas_cte")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_ctas_cte") })
+	if n := h.exec(`CREATE TABLE it_ctas_cte AS WITH t AS (SELECT customer_id, COUNT(*) AS n FROM it_orders GROUP BY customer_id)
+		SELECT * FROM t WHERE n > 1`); n != 2 {
+		t.Errorf("CTAS from CTE inserted %d rows, want 2", n)
+	}
+	h.expectRows(`SELECT customer_id, n FROM it_ctas_cte ORDER BY customer_id`, "1|2", "2|2")
+}
+
+func TestSQLSubqueryDML(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP TABLE IF EXISTS it_archive")
+	h.exec("CREATE TABLE it_archive (id INTEGER, amount NUMERIC(10,2))")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_archive") })
+
+	// INSERT … SELECT, with and without a column list.
+	if n := h.exec(`INSERT INTO it_archive SELECT id, amount FROM it_orders WHERE status = 'shipped'`); n != 4 {
+		t.Errorf("INSERT SELECT inserted %d rows, want 4", n)
+	}
+	h.exec(`INSERT INTO it_archive (id) SELECT customer_id FROM it_orders WHERE id = 5`)
+	h.expectRows(`SELECT id, amount FROM it_archive ORDER BY id, amount`,
+		"1|10.50", "3|5.00", "3|NULL", "4|250.00", "6|42.00") // NULLs sort last
+
+	// UPDATE / DELETE filtered by subqueries, and a correlated SET value.
+	if n := h.exec(`UPDATE it_orders SET status = 'vip' WHERE customer_id IN (SELECT id FROM it_customers WHERE country = 'GBR')`); n != 2 {
+		t.Errorf("UPDATE matched %d rows, want 2", n)
+	}
+	if n := h.exec(`DELETE FROM it_orders WHERE NOT EXISTS (SELECT 1 FROM it_customers c WHERE c.id = it_orders.customer_id)`); n != 1 {
+		t.Errorf("DELETE matched %d rows, want 1", n)
+	}
+	h.exec(`UPDATE it_customers SET country = (SELECT MAX(o.status) FROM it_orders o WHERE o.customer_id = it_customers.id) WHERE id = 3`)
+	h.expectRows(`SELECT id, status FROM it_orders ORDER BY id`, "1|vip", "2|vip", "3|shipped", "4|shipped", "5|returned")
+	h.expectRows(`SELECT country FROM it_customers WHERE id = 3`, "returned")
+}

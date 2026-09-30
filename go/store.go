@@ -124,6 +124,11 @@ type tableMeta struct {
 	Schema  string       `json:"schema"`
 	Name    string       `json:"name"`
 	Columns []columnMeta `json:"columns"`
+
+	// In-memory relations (CTEs, derived tables) hold their rows here and
+	// have no index or HASHes.
+	isMem bool
+	mem   []map[string]Value
 }
 
 // resolve finds a column by name: exact match first, then case-insensitive.
@@ -142,7 +147,7 @@ func (t *tableMeta) resolve(name string) (int, bool) {
 }
 
 func (t *tableMeta) column(name string) (columnMeta, bool) {
-	if name == rowIDField {
+	if !t.isMem && strings.EqualFold(name, rowIDField) {
 		return columnMeta{Name: rowIDField, Type: typeInt64, Indexed: true}, true
 	}
 	if i, ok := t.resolve(name); ok {
@@ -177,9 +182,11 @@ func tableKeySuffix(schema, table string) string {
 	return escapeKeyPart(schema) + ":" + escapeKeyPart(table)
 }
 
-func metaKey(schema, table string) string { return metaPrefix + "table:" + tableKeySuffix(schema, table) }
-func seqKey(schema, table string) string  { return metaPrefix + "seq:" + tableKeySuffix(schema, table) }
-func tablesKey(schema string) string      { return metaPrefix + "tables:" + escapeKeyPart(schema) }
+func metaKey(schema, table string) string {
+	return metaPrefix + "table:" + tableKeySuffix(schema, table)
+}
+func seqKey(schema, table string) string    { return metaPrefix + "seq:" + tableKeySuffix(schema, table) }
+func tablesKey(schema string) string        { return metaPrefix + "tables:" + escapeKeyPart(schema) }
 func rowPrefix(schema, table string) string { return tableKeySuffix(schema, table) + ":" }
 func indexName(schema, table string) string { return "idx:" + tableKeySuffix(schema, table) }
 
