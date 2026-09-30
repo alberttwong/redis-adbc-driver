@@ -84,6 +84,17 @@ type columnMeta struct {
 	Nullable bool    `json:"nullable"`
 	// Indexed columns are part of the RediSearch index.
 	Indexed bool `json:"indexed"`
+	// Field is the HASH field / index attribute when it differs from Name
+	// (join views name columns alias.column).
+	Field string `json:"-"`
+}
+
+// field returns the HASH field and index attribute name of the column.
+func (c columnMeta) field() string {
+	if c.Field != "" {
+		return c.Field
+	}
+	return c.Name
 }
 
 // indexable reports whether a column type can be part of the index.
@@ -129,6 +140,9 @@ type tableMeta struct {
 	// have no index or HASHes.
 	isMem bool
 	mem   []map[string]Value
+	// join is set for the relation produced by a FROM clause with joins; its
+	// rows are computed when the query is scanned.
+	join *joinPlan
 }
 
 // resolve finds a column by name: exact match first, then case-insensitive.

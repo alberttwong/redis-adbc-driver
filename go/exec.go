@@ -384,21 +384,36 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		defer func() { e.ctes = e.ctes[:len(e.ctes)-1] }()
 	}
 	var types map[string]ColType
-	meta, relName, err := e.fromRelation(ctx, sel)
-	if err != nil {
-		return nil, err
-	}
 	var rels []relation
-	if meta != nil {
-		plan.meta = meta
-		types = meta.types()
-		rels = []relation{{name: relName, meta: meta}}
+	var jp *joinPlan
+	if len(sel.Joins) > 0 {
+		joined, jrels, plan2, err := e.planJoin(ctx, sel)
+		if err != nil {
+			return nil, err
+		}
+		plan.meta, rels, jp = joined, jrels, plan2
+		types = joined.types()
+	} else {
+		meta, relName, err := e.fromRelation(ctx, sel)
+		if err != nil {
+			return nil, err
+		}
+		if meta != nil {
+			plan.meta = meta
+			types = meta.types()
+			rels = []relation{{name: relName, meta: meta}}
+		}
 	}
 	sc := e.pushScope(rels)
 	defer func() {
 		plan.extraNeed = sc.needs
 		e.popScope()
 	}()
+	if jp != nil {
+		if err := e.bindJoin(ctx, sel, jp); err != nil {
+			return nil, err
+		}
+	}
 	itemStart := make([]int, len(sel.Items))
 	for i, it := range sel.Items {
 		itemStart[i] = len(plan.items)
@@ -407,7 +422,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 				return nil, errorf(adbc.StatusInvalidArgument, "SELECT * requires a FROM clause")
 			}
 			for _, c := range plan.meta.Columns {
-				plan.items = append(plan.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.Name, typ: c.Type})
+				plan.items = append(plan.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.field(), typ: c.Type})
 			}
 			continue
 		}
@@ -421,7 +436,18 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		name := it.Alias
 		if name == "" {
 			if c, ok := it.Expr.(*ColumnRef); ok {
+				// Output the column's own name, not alias.column.
 				name = c.Name
+				switch {
+				case c.Outer > 0:
+					if i := strings.LastIndex(name, "."); i >= 0 {
+						name = name[i+1:]
+					}
+				case plan.meta != nil:
+					if col, ok := plan.meta.column(c.Name); ok {
+						name = col.field()
+					}
+				}
 			} else {
 				name = it.Text
 			}
@@ -480,6 +506,9 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if err := e.bind(ctx, sel.Where); err != nil {
 			return nil, err
 		}
+	}
+	if jp != nil {
+		jp.planPushdown(sel.Where)
 	}
 	for _, o := range sel.OrderBy {
 		expr := o.Expr

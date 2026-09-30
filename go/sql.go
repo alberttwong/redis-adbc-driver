@@ -154,9 +154,22 @@ type CTE struct {
 	Select  *SelectStmt
 }
 
+// JoinClause is one `[kind] JOIN item [ON … | USING (…)]` (or `, item`) of
+// a FROM clause. Kind is INNER, LEFT, RIGHT, FULL or CROSS.
+type JoinClause struct {
+	Kind   string
+	Table  *TableName
+	Select *SelectStmt
+	Alias  string
+	On     Expr
+	Using  []string
+}
+
 type SelectStmt struct {
 	With  []CTE
 	Items []SelectItem
+	// Joins are the FROM items after the first.
+	Joins []JoinClause
 	// FROM is a table (From) or a derived table (FromSelect); FromAlias is
 	// the optional alias.
 	From       *TableName
@@ -572,10 +585,44 @@ var reservedAfterExpr = map[string]bool{
 	"ASC": true, "DESC": true, "HAVING": true, "UNION": true, "NULLS": true,
 	"LIKE": true, "IN": true, "BETWEEN": true, "SET": true, "VALUES": true,
 	"WHEN": true, "THEN": true, "ELSE": true, "END": true,
+	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
+	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
 }
 
 // isQueryStart reports whether the next token begins a (sub)query.
 func (p *parser) isQueryStart() bool { return p.isKeyword("SELECT") || p.isKeyword("WITH") }
+
+// parseFromItem parses `table [[AS] alias]` or `(SELECT …) [AS] alias`.
+func (p *parser) parseFromItem() (*TableName, *SelectStmt, string, error) {
+	var table *TableName
+	var sub *SelectStmt
+	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH")) {
+		p.pos++
+		s, err := p.parseSubquery()
+		if err != nil {
+			return nil, nil, "", err
+		}
+		sub = s
+	} else {
+		t, err := p.parseTableName()
+		if err != nil {
+			return nil, nil, "", err
+		}
+		table = &t
+	}
+	alias := ""
+	if p.acceptKeyword("AS") {
+		a, err := p.parseIdent()
+		if err != nil {
+			return nil, nil, "", err
+		}
+		alias = a
+	} else if t := p.peek(); t.kind == tokQuotedIdent || (t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)]) {
+		p.pos++
+		alias = t.text
+	}
+	return table, sub, alias, nil
+}
 
 // parseSubquery parses `SELECT … )` after an opening parenthesis.
 func (p *parser) parseSubquery() (*SelectStmt, error) {
@@ -665,30 +712,64 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 	}
 	if p.acceptKeyword("FROM") {
-		if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH")) {
-			p.pos++
-			sub, err := p.parseSubquery()
-			if err != nil {
-				return nil, err
-			}
-			sel.FromSelect = sub
-		} else {
-			t, err := p.parseTableName()
-			if err != nil {
-				return nil, err
-			}
-			sel.From = &t
+		table, sub, alias, err := p.parseFromItem()
+		if err != nil {
+			return nil, err
 		}
-		// Optional alias.
-		if p.acceptKeyword("AS") {
-			alias, err := p.parseIdent()
-			if err != nil {
+		sel.From, sel.FromSelect, sel.FromAlias = table, sub, alias
+		for {
+			kind := ""
+			switch {
+			case p.acceptOp(","):
+				kind = "CROSS"
+			case p.acceptKeyword("CROSS", "JOIN"):
+				kind = "CROSS"
+			case p.acceptKeyword("INNER", "JOIN"), p.acceptKeyword("JOIN"):
+				kind = "INNER"
+			case p.acceptKeyword("LEFT", "OUTER", "JOIN"), p.acceptKeyword("LEFT", "JOIN"):
+				kind = "LEFT"
+			case p.acceptKeyword("RIGHT", "OUTER", "JOIN"), p.acceptKeyword("RIGHT", "JOIN"):
+				kind = "RIGHT"
+			case p.acceptKeyword("FULL", "OUTER", "JOIN"), p.acceptKeyword("FULL", "JOIN"):
+				kind = "FULL"
+			case p.isKeyword("NATURAL"):
+				return nil, &sqlError{msg: "NATURAL JOIN is not supported; use USING or ON"}
+			}
+			if kind == "" {
+				break
+			}
+			jc := JoinClause{Kind: kind}
+			if jc.Table, jc.Select, jc.Alias, err = p.parseFromItem(); err != nil {
 				return nil, err
 			}
-			sel.FromAlias = alias
-		} else if t := p.peek(); t.kind == tokQuotedIdent || (t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)]) {
-			p.pos++
-			sel.FromAlias = t.text
+			if kind != "CROSS" {
+				switch {
+				case p.acceptKeyword("ON"):
+					if jc.On, err = p.parseExpr(); err != nil {
+						return nil, err
+					}
+				case p.acceptKeyword("USING"):
+					if err := p.expectOp("("); err != nil {
+						return nil, err
+					}
+					for {
+						c, err := p.parseIdent()
+						if err != nil {
+							return nil, err
+						}
+						jc.Using = append(jc.Using, c)
+						if !p.acceptOp(",") {
+							break
+						}
+					}
+					if err := p.expectOp(")"); err != nil {
+						return nil, err
+					}
+				default:
+					return nil, syntaxErr("%s JOIN requires ON or USING", kind)
+				}
+			}
+			sel.Joins = append(sel.Joins, jc)
 		}
 	}
 	if p.acceptKeyword("WHERE") {

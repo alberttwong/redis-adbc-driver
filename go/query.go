@@ -190,7 +190,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			continue
 		}
 		col, ok := meta.column(colRef.Name)
-		if !ok || !col.Indexed || !simpleName(col.Name) {
+		if !ok || !col.Indexed || !simpleName(col.field()) {
 			addResidual(c)
 			continue
 		}
@@ -203,7 +203,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			continue
 		}
 		ct := col.Type
-		field := "@" + col.Name
+		field := "@" + col.field()
 		switch {
 		case ct.Kind.indexedAsNumeric():
 			v, err := Coerce(cv, ct)
@@ -284,7 +284,7 @@ func decodeRow(meta *tableMeta, row aggRow, only map[string]bool) (map[string]Va
 		if only != nil && !only[c.Name] {
 			continue
 		}
-		raw, ok := row[c.Name]
+		raw, ok := row[c.field()]
 		if !ok {
 			out[c.Name] = nullValue(c.Type)
 			continue
@@ -344,7 +344,7 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 	var fields []string
 	for _, c := range meta.Columns {
 		if need[c.Name] {
-			fields = append(fields, c.Name)
+			fields = append(fields, c.field())
 		}
 	}
 	fetched, err := e.store.fetchRows(ctx, keys, fields)
@@ -380,12 +380,27 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 
 // scanMem filters an in-memory relation.
 func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
+	source := req.meta.mem
+	if req.meta.join != nil {
+		need := maps.Clone(req.need)
+		if need == nil {
+			need = map[string]bool{}
+		}
+		if req.where.residual != nil {
+			columnRefs(req.where.residual, need)
+		}
+		joined, err := e.runJoin(ctx, req.meta.join, need, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		source = joined
+	}
 	if req.where.residual == nil {
-		return nil, req.meta.mem, nil
+		return nil, source, nil
 	}
 	env := e.newEnv(ctx, req.meta.types(), params)
 	var rows []map[string]Value
-	for _, r := range req.meta.mem {
+	for _, r := range source {
 		env.row = r
 		ok, err := env.eval(req.where.residual)
 		if err != nil {
@@ -434,7 +449,7 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 			indexSort = false
 			break
 		}
-		req.sortBy = append(req.sortBy, sortKey{field: c.Name, desc: o.desc})
+		req.sortBy = append(req.sortBy, sortKey{field: col.field(), desc: o.desc})
 	}
 	if !indexSort {
 		req.sortBy = nil
@@ -966,9 +981,16 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 		return "", false, nil
 	}
 	cm, ok := meta.column(col.Name)
-	if !ok || !cm.Indexed || !simpleName(cm.Name) {
+	if !ok || !cm.Indexed || !simpleName(cm.field()) {
 		return "", false, nil
 	}
+	q, ok := unionQuery(cm, values)
+	return q, ok, nil
+}
+
+// unionQuery builds an index query matching rows whose column equals any of
+// values: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`.
+func unionQuery(cm columnMeta, values []Value) (string, bool) {
 	var parts []string
 	for _, v := range values {
 		if v.Null {
@@ -980,22 +1002,22 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 		}
 		if cm.Type.Kind == KindString {
 			if strings.Contains(cv.S, tagSeparator) {
-				return "", false, nil
+				return "", false
 			}
 			parts = append(parts, escapeTag(cv.S))
 		} else if cm.Type.Kind.indexedAsNumeric() {
 			b := encodeStored(cv)
-			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.Name, b, b))
+			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.field(), b, b))
 		} else {
-			return "", false, nil
+			return "", false
 		}
 	}
 	if len(parts) == 0 {
 		// Nothing can match; __rowid is never negative.
-		return "@" + rowIDField + ":[-1 -1]", true, nil
+		return "@" + rowIDField + ":[-1 -1]", true
 	}
 	if cm.Type.Kind == KindString {
-		return fmt.Sprintf("@%s:{%s}", cm.Name, strings.Join(parts, " | ")), true, nil
+		return fmt.Sprintf("@%s:{%s}", cm.field(), strings.Join(parts, " | ")), true
 	}
-	return "(" + strings.Join(parts, " | ") + ")", true, nil
+	return "(" + strings.Join(parts, " | ") + ")", true
 }

@@ -407,3 +407,75 @@ func TestSQLSubqueryDML(t *testing.T) {
 	h.expectRows(`SELECT id, status FROM it_orders ORDER BY id`, "1|vip", "2|vip", "3|shipped", "4|shipped", "5|returned")
 	h.expectRows(`SELECT country FROM it_customers WHERE id = 3`, "returned")
 }
+
+func TestSQLJoins(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP TABLE IF EXISTS it_regions")
+	h.exec("CREATE TABLE it_regions (country VARCHAR, region VARCHAR)")
+	h.exec("INSERT INTO it_regions VALUES ('GBR', 'Europe'), ('USA', 'Americas')")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_regions") })
+
+	// INNER JOIN, explicit and as a comma join with the condition in WHERE.
+	h.expectRows(`SELECT o.id, c.name FROM it_orders o JOIN it_customers c ON o.customer_id = c.id ORDER BY o.id`,
+		"1|Ada", "2|Ada", "3|Bo", "4|Bo", "5|Cy")
+	h.expectRows(`SELECT o.id, c.name FROM it_orders o, it_customers c
+		WHERE o.customer_id = c.id AND c.country = 'USA' ORDER BY o.id`,
+		"3|Bo", "4|Bo", "5|Cy")
+	h.expectRows(`SELECT c.name, r.region FROM it_customers c JOIN it_regions r USING (country) ORDER BY c.name`,
+		"Ada|Europe", "Bo|Americas", "Cy|Americas")
+
+	// LEFT JOIN: unmatched rows, the anti-join idiom, and ON vs WHERE filters.
+	h.expectRows(`SELECT c.name, o.id FROM it_customers c LEFT JOIN it_orders o ON o.customer_id = c.id ORDER BY c.id, o.id`,
+		"Ada|1", "Ada|2", "Bo|3", "Bo|4", "Cy|5", "Di|NULL")
+	h.expectRows(`SELECT c.name FROM it_customers c LEFT JOIN it_orders o ON o.customer_id = c.id WHERE o.id IS NULL`,
+		"Di")
+	h.expectRows(`SELECT c.name, o.id FROM it_customers c
+		LEFT JOIN it_orders o ON o.customer_id = c.id AND o.status = 'pending' ORDER BY c.id`,
+		"Ada|2", "Bo|NULL", "Cy|NULL", "Di|NULL")
+	h.expectRows(`SELECT c.name, o.id FROM it_customers c
+		LEFT JOIN it_orders o ON o.customer_id = c.id WHERE o.status = 'pending'`,
+		"Ada|2")
+
+	// RIGHT and FULL JOIN.
+	h.expectRows(`SELECT c.name, o.id FROM it_customers c RIGHT JOIN it_orders o ON o.customer_id = c.id ORDER BY o.id`,
+		"Ada|1", "Ada|2", "Bo|3", "Bo|4", "Cy|5", "NULL|6")
+	h.expectRows(`SELECT c.name, o.id FROM it_customers c FULL JOIN it_orders o ON o.customer_id = c.id ORDER BY o.id, c.name`,
+		"Ada|1", "Ada|2", "Bo|3", "Bo|4", "Cy|5", "NULL|6", "Di|NULL")
+	h.expectRows(`SELECT COUNT(*) FROM it_customers CROSS JOIN it_regions`, "8")
+
+	// Three tables, grouped; HAVING over a join; a self join.
+	h.expectRows(`SELECT c.name, r.region, SUM(o.qty) FROM it_orders o
+		JOIN it_customers c ON o.customer_id = c.id
+		JOIN it_regions r ON r.country = c.country
+		GROUP BY c.name, r.region ORDER BY c.name`,
+		"Ada|Europe|4", "Bo|Americas|12", "Cy|Americas|1")
+	h.expectRows(`SELECT c.country, COUNT(*) AS n FROM it_orders o JOIN it_customers c ON o.customer_id = c.id
+		GROUP BY c.country HAVING COUNT(*) > 1 ORDER BY c.country`,
+		"GBR|2", "USA|3")
+	h.expectRows(`SELECT a.id, b.id FROM it_orders a JOIN it_orders b ON a.customer_id = b.customer_id AND a.id < b.id ORDER BY a.id`,
+		"1|2", "3|4")
+
+	// Joining a CTE, SELECT * naming, and a correlated subquery over a join.
+	h.expectRows(`WITH t AS (SELECT customer_id, SUM(qty) AS units FROM it_orders GROUP BY customer_id)
+		SELECT c.name, t.units FROM t JOIN it_customers c ON c.id = t.customer_id ORDER BY t.units DESC`,
+		"Bo|12", "Ada|4", "Cy|1")
+	schema := h.expectRows(`SELECT * FROM it_customers c JOIN it_regions r USING (country) WHERE c.id = 1`,
+		"1|Ada|GBR|GBR|Europe")
+	var names []string
+	for _, f := range schema.Fields() {
+		names = append(names, f.Name)
+	}
+	if got := strings.Join(names, ","); got != "id,name,country,country,region" {
+		t.Errorf("SELECT * column names = %s", got)
+	}
+	h.expectRows(`SELECT c.name FROM it_customers c JOIN it_regions r ON r.country = c.country
+		WHERE EXISTS (SELECT 1 FROM it_orders o WHERE o.customer_id = c.id AND o.qty > 5)`,
+		"Bo")
+
+	// Errors.
+	h.expectError(`SELECT id FROM it_orders o JOIN it_customers c ON o.customer_id = c.id`, "ambiguous")
+	h.expectError(`SELECT 1 FROM it_orders JOIN it_orders ON 1 = 1`, "more than once")
+	h.expectError(`SELECT 1 FROM it_orders o JOIN it_customers c`, "requires ON or USING")
+	h.expectError(`SELECT 1 FROM it_orders o JOIN (SELECT id FROM it_customers) ON 1 = 1`, "must have an alias")
+}
