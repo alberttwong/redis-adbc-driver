@@ -17,6 +17,7 @@ package redis
 import (
 	"context"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -114,7 +115,7 @@ func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, schema string) 
 // ---- metadata ----
 
 func (c *connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
-	return []string{"TABLE"}, nil
+	return []string{"TABLE", "VIEW"}, nil
 }
 
 func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
@@ -127,7 +128,11 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	}
 	meta, err := c.store.getTable(ctx, schema, tableName)
 	if err != nil {
-		return nil, err
+		v, verr := c.store.getView(ctx, schema, tableName)
+		if verr != nil {
+			return nil, err
+		}
+		meta = &tableMeta{Schema: schema, Name: tableName, Columns: v.Columns}
 	}
 	fields := make([]arrow.Field, len(meta.Columns))
 	for i, col := range meta.Columns {
@@ -189,18 +194,44 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 	if catalog != catalogName {
 		return nil, nil
 	}
-	names, err := c.store.listTables(ctx, schema)
+	tables, err := c.store.listTables(ctx, schema)
 	if err != nil {
 		return nil, err
 	}
+	views, err := c.store.listViews(ctx, schema)
+	if err != nil {
+		return nil, err
+	}
+	type entry struct{ name, kind string }
+	var entries []entry
+	for _, n := range tables {
+		entries = append(entries, entry{n, "TABLE"})
+	}
+	for _, n := range views {
+		entries = append(entries, entry{n, "VIEW"})
+	}
+	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.name, b.name) })
+
 	out := []driverbase.TableInfo{}
-	for _, name := range names {
-		if !matchPattern(name, tableFilter) {
+	for _, ent := range entries {
+		if !matchPattern(ent.name, tableFilter) {
 			continue
 		}
-		info := driverbase.TableInfo{TableName: name, TableType: "TABLE"}
+		info := driverbase.TableInfo{TableName: ent.name, TableType: ent.kind}
 		if includeColumns {
-			meta, err := c.store.getTable(ctx, schema, name)
+			var cols []columnMeta
+			var err error
+			if ent.kind == "VIEW" {
+				var v *viewMeta
+				if v, err = c.store.getView(ctx, schema, ent.name); err == nil {
+					cols = v.Columns
+				}
+			} else {
+				var meta *tableMeta
+				if meta, err = c.store.getTable(ctx, schema, ent.name); err == nil {
+					cols = meta.Columns
+				}
+			}
 			if err != nil {
 				var ae adbc.Error
 				if asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
@@ -209,7 +240,7 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 				return nil, err
 			}
 			info.TableColumns = []driverbase.ColumnInfo{}
-			for i, col := range meta.Columns {
+			for i, col := range cols {
 				if !matchPattern(col.Name, columnFilter) {
 					continue
 				}

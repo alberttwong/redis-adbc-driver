@@ -479,3 +479,73 @@ func TestSQLJoins(t *testing.T) {
 	h.expectError(`SELECT 1 FROM it_orders o JOIN it_customers c`, "requires ON or USING")
 	h.expectError(`SELECT 1 FROM it_orders o JOIN (SELECT id FROM it_customers) ON 1 = 1`, "must have an alias")
 }
+
+func TestSQLViews(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	views := []string{"v_big", "v_shipped", "v_totals", "v_cust", "secondary.v_o2", "v_tmp"}
+	drop := func() {
+		for _, v := range views {
+			h.exec("DROP VIEW IF EXISTS " + v)
+		}
+		h.exec("DROP TABLE IF EXISTS it_view_base")
+	}
+	drop()
+	t.Cleanup(drop)
+
+	// A simple (lazy) view; outer filters combine with the view's own WHERE.
+	h.exec(`CREATE VIEW v_shipped AS SELECT id, customer_id, amount, qty FROM it_orders WHERE status = 'shipped'`)
+	h.expectRows(`SELECT id FROM v_shipped WHERE qty >= 4 ORDER BY id`, "4", "6")
+	h.expectRows(`SELECT COUNT(*) FROM v_shipped`, "4")
+	// Column list renames the output; expressions are fine too.
+	h.exec(`CREATE VIEW v_totals (oid, total) AS SELECT id, amount * qty FROM it_orders`)
+	h.expectRows(`SELECT oid, total FROM v_totals WHERE total > 250 ORDER BY oid`, "2|299.97", "4|2500.00")
+	// A grouped (computed) view.
+	h.exec(`CREATE VIEW v_cust AS SELECT customer_id, COUNT(*) AS n, SUM(qty) AS units FROM it_orders GROUP BY customer_id`)
+	h.expectRows(`SELECT customer_id FROM v_cust WHERE units > 3 ORDER BY customer_id`, "1", "2", "9")
+
+	// Views in joins, in subqueries, and views of views.
+	h.expectRows(`SELECT c.name, v.units FROM it_customers c JOIN v_cust v ON v.customer_id = c.id ORDER BY c.id`,
+		"Ada|4", "Bo|12", "Cy|1")
+	h.expectRows(`SELECT c.name, s.id FROM v_shipped s JOIN it_customers c ON c.id = s.customer_id ORDER BY s.id`,
+		"Ada|1", "Bo|3", "Bo|4")
+	h.expectRows(`SELECT name FROM it_customers WHERE id IN (SELECT customer_id FROM v_shipped) ORDER BY name`, "Ada", "Bo")
+	h.exec(`CREATE VIEW v_big AS SELECT id FROM v_shipped WHERE amount > 20`)
+	h.expectRows(`SELECT id FROM v_big ORDER BY id`, "4", "6")
+
+	// OR REPLACE, IF NOT EXISTS, and name clashes.
+	h.exec(`CREATE OR REPLACE VIEW v_big AS SELECT id FROM v_shipped WHERE amount > 100`)
+	h.expectRows(`SELECT id FROM v_big`, "4")
+	h.exec(`CREATE VIEW IF NOT EXISTS v_big AS SELECT 1 AS id`)
+	h.expectRows(`SELECT id FROM v_big`, "4")
+	h.expectError(`CREATE VIEW v_big AS SELECT 1 AS id`, "already exists")
+	h.expectError(`CREATE TABLE v_big (a INT)`, "already exists as a view")
+	h.expectError(`CREATE VIEW it_orders AS SELECT 1 AS a`, "already exists as a table")
+	h.expectError(`CREATE VIEW v_dup AS SELECT id, id FROM it_orders`, "more than once")
+	h.expectError(`CREATE VIEW v_bad AS SELECT nope FROM it_orders`, "does not exist")
+
+	// Views live in a schema; unqualified names inside resolve there.
+	h.exec("CREATE SCHEMA IF NOT EXISTS secondary")
+	h.expectError(`CREATE VIEW secondary.v_o AS SELECT id FROM it_orders`, "does not exist")
+	h.exec(`CREATE VIEW secondary.v_o2 AS SELECT id FROM public.it_orders`)
+	h.expectRows(`SELECT COUNT(*) FROM secondary.v_o2`, "6")
+
+	// Schema reporting.
+	schema, err := h.conn.GetTableSchema(h.ctx, nil, nil, "v_totals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := schema.String(); !strings.Contains(got, "oid: type=int32") || !strings.Contains(got, "total: type=decimal") {
+		t.Errorf("view schema = %s", got)
+	}
+
+	// A view whose base table is dropped reports why it broke.
+	h.exec(`CREATE TABLE it_view_base (a INT)`)
+	h.exec(`CREATE VIEW v_tmp AS SELECT a FROM it_view_base`)
+	h.exec(`DROP TABLE it_view_base`)
+	h.expectError(`SELECT * FROM v_tmp`, "no longer valid")
+
+	h.exec(`DROP VIEW v_tmp`)
+	h.expectError(`SELECT * FROM v_tmp`, "does not exist")
+	h.exec(`DROP VIEW IF EXISTS v_tmp`)
+}
