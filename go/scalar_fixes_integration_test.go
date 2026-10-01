@@ -15,7 +15,8 @@
 package redis
 
 // Integration tests for TRY_CAST / SAFE_CAST / CAST … DEFAULT … ON
-// CONVERSION ERROR, the % operator (which is MOD) and EXP underflow.
+// CONVERSION ERROR, the % operator (which is MOD), EXP underflow, and
+// DATEADD / DATEDIFF with bare date parts.
 
 import (
 	"testing"
@@ -210,4 +211,152 @@ func TestScalarFixesExpUnderflow(t *testing.T) {
 		h.expectError(sql, "EXP: value out of range: underflow")
 	}
 	h.expectError(`SELECT EXP(1000)`, "EXP: value out of range: overflow")
+}
+
+// DATEADD / DATEDIFF (Snowflake, Redshift, SQL Server, and dbt's
+// cross-database macros), with the part as a bare keyword or a string, and
+// their aliases.
+func TestScalarFixesDateAddDiff(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() { h.exec("DROP TABLE IF EXISTS it_sf_dates") }
+	drop()
+	t.Cleanup(drop)
+	// Columns named day and d, like date parts.
+	h.exec(`CREATE TABLE it_sf_dates (id INTEGER, d DATE, ts TIMESTAMP(6), tz TIMESTAMP(3), t TIME(6), day INTEGER)`)
+	h.exec(`INSERT INTO it_sf_dates VALUES
+		(1, DATE '2024-01-31', TIMESTAMP '2024-01-31 23:30:00.5', TIMESTAMP '2024-02-29 12:00:00.250', TIME '23:30:00', 2),
+		(2, DATE '2023-12-31', TIMESTAMP '2023-12-31 00:00:00', TIMESTAMP '2023-03-31 00:00:00', TIME '00:15:00', -3),
+		(3, NULL, NULL, NULL, NULL, NULL)`)
+
+	// The examples from the issue.
+	schema := h.expectRows(`SELECT DATEADD(day, 1, DATE '2024-01-01'), DATEDIFF(day, DATE '2024-01-01', DATE '2024-01-31'),
+			DATE_ADD('day', 1, DATE '2024-01-01')`,
+		"2024-01-02|30|2024-01-02")
+	expectTypes(t, schema, sfDate, sfInt64, sfDate)
+
+	// A date stays a date for parts of a day or longer; months clamp to the
+	// end of the month.
+	schema = h.expectRows(`SELECT DATEADD(year, 1, d), DATEADD(quarter, 1, d), DATEADD(month, 1, d),
+			DATEADD(week, 1, d), DATEADD(day, -1, d), DATEADD(month, -10, d), DATEADD('Year', -1, DATE '2024-02-29')
+		FROM it_sf_dates ORDER BY id`,
+		"2025-01-31|2024-04-30|2024-02-29|2024-02-07|2024-01-30|2023-03-31|2023-02-28",
+		"2024-12-31|2024-03-31|2024-01-31|2024-01-07|2023-12-30|2023-02-28|2023-02-28",
+		"NULL|NULL|NULL|NULL|NULL|NULL|2023-02-28")
+	expectTypes(t, schema, sfDate, sfDate, sfDate, sfDate, sfDate, sfDate, sfDate)
+
+	// A smaller part makes a date a timestamp.
+	schema = h.expectRows(`SELECT DATEADD(hour, 25, d), DATEADD(minute, -1, d), DATEADD(second, 90, d),
+			DATEADD(millisecond, 1500, d), DATEADD(microsecond, 1, d)
+		FROM it_sf_dates WHERE id = 1`,
+		"2024-02-01T01:00:00|2024-01-30T23:59:00|2024-01-31T00:01:30|2024-01-31T00:00:01.5|2024-01-31T00:00:00.000001")
+	expectTypes(t, schema, sfTS, sfTS, sfTS, sfTS, sfTS)
+
+	// Timestamps keep their type (unit and time zone).
+	schema = h.expectRows(`SELECT CAST(DATEADD(month, 1, ts) AS VARCHAR), CAST(DATEADD(hour, 1, ts) AS VARCHAR),
+			CAST(DATEADD(microsecond, -500000, ts) AS VARCHAR), CAST(DATEADD(year, -1, tz) AS VARCHAR),
+			DATEADD(day, 1, ts), DATEADD(quarter, 1, tz),
+			DATEADD(day, 1, TIMESTAMP WITH TIME ZONE '2024-01-01 00:00:00+00')
+		FROM it_sf_dates WHERE id = 1`,
+		"2024-02-29 23:30:00.500000|2024-02-01 00:30:00.500000|2024-01-31 23:30:00.000000|2023-02-28 12:00:00.250|"+
+			"2024-02-01T23:30:00.5|2024-05-29T12:00:00.25|2024-01-02T00:00:00Z")
+	expectTypes(t, schema, sfString, sfString, sfString, sfString, sfTS, sfTSms, sfTSTZ)
+
+	// Times wrap around midnight; date parts are not valid for them.
+	schema = h.expectRows(`SELECT CAST(DATEADD(hour, 25, t) AS VARCHAR), CAST(DATEADD(minute, -30, t) AS VARCHAR), DATEADD(second, 1, t)
+		FROM it_sf_dates ORDER BY id`,
+		"00:30:00.000000|23:00:00.000000|23:30:01.000000", "01:15:00.000000|23:45:00.000000|00:15:01.000000", "NULL|NULL|NULL")
+	expectTypes(t, schema, sfString, sfString, sfTime)
+	h.expectError(`SELECT DATEADD(day, 1, t) FROM it_sf_dates`, "date part day is not valid for TIME values")
+
+	// Text is read as a timestamp.
+	schema = h.expectRows(`SELECT CAST(DATEADD(day, 1, '2024-01-01') AS VARCHAR), DATEADD(hour, 1, '2024-01-01 10:00:00')`,
+		"2024-01-02 00:00:00.000000|2024-01-01T11:00:00")
+	expectTypes(t, schema, sfString, sfTS)
+
+	// Abbreviations, bare or quoted, in any case.
+	h.expectRows(`SELECT DATEADD(yy, 1, d), DATEADD(YYYY, 1, d), DATEADD(qq, 1, d), DATEADD(q, 1, d), DATEADD(mm, 1, d),
+			DATEADD(mon, 1, d), DATEADD(wk, 1, d), DATEADD(ww, 1, d), DATEADD(dd, 1, d), DATEADD(d, 1, d),
+			DATEADD('DAYS', 1, d), DATEADD('yr', 1, d)
+		FROM it_sf_dates WHERE id = 1`,
+		"2025-01-31|2025-01-31|2024-04-30|2024-04-30|2024-02-29|2024-02-29|2024-02-07|2024-02-07|2024-02-01|2024-02-01|2024-02-01|2025-01-31")
+	h.expectRows(`SELECT CAST(DATEADD(hh, 1, ts) AS VARCHAR), CAST(DATEADD(mi, 1, ts) AS VARCHAR), CAST(DATEADD(n, 1, ts) AS VARCHAR),
+			CAST(DATEADD(m, 1, ts) AS VARCHAR), CAST(DATEADD(ss, 1, ts) AS VARCHAR), CAST(DATEADD(s, 1, ts) AS VARCHAR),
+			CAST(DATEADD(ms, 1, ts) AS VARCHAR), CAST(DATEADD(us, 1, ts) AS VARCHAR), CAST(DATEADD(mcs, 1, ts) AS VARCHAR)
+		FROM it_sf_dates WHERE id = 1`,
+		"2024-02-01 00:30:00.500000|2024-01-31 23:31:00.500000|2024-01-31 23:31:00.500000|2024-01-31 23:31:00.500000|"+
+			"2024-01-31 23:30:01.500000|2024-01-31 23:30:01.500000|2024-01-31 23:30:00.501000|2024-01-31 23:30:00.500001|"+
+			"2024-01-31 23:30:00.500001")
+
+	// Columns named like date parts are still columns everywhere else,
+	// including as DATEADD's count and in DATE_ADD(x, INTERVAL …).
+	h.expectRows(`SELECT day, DATEADD(day, day, d), DATEDIFF(day, d, DATEADD(day, day, d)), d + day, DATE_PART('day', d)
+		FROM it_sf_dates WHERE day > 0`,
+		"2|2024-02-02|2|2024-02-02|31")
+	h.expectRows(`SELECT id FROM it_sf_dates WHERE DATEADD(day, day, d) < d`, "2")
+	h.expectRows(`SELECT DATE_ADD(d, INTERVAL day DAY), DATE_SUB(d, INTERVAL 1 MONTH) FROM it_sf_dates ORDER BY id`,
+		"2024-02-02|2023-12-31", "2023-12-28|2023-11-30", "NULL|NULL")
+	h.expectRows(`WITH x AS (SELECT DATE '2024-01-31' AS day, 5 AS mm)
+		SELECT DATE_ADD(day, INTERVAL 1 MONTH), DATE_SUB(day, INTERVAL mm DAY), DATEADD(mm, mm, day) FROM x`,
+		"2024-02-29|2024-01-26|2024-06-30")
+	h.expectRows(`SELECT "day" FROM it_sf_dates ORDER BY "day"`, "-3", "2", "NULL")
+
+	// DATEDIFF counts boundaries crossed, exactly like DATE_DIFF.
+	schema = h.expectRows(`SELECT DATEDIFF(month, DATE '2024-01-31', DATE '2024-02-01'), DATEDIFF(yy, DATE '2023-12-31', DATE '2024-01-01'),
+			DATEDIFF(hh, TIMESTAMP '2024-01-01 01:59:00', TIMESTAMP '2024-01-01 02:01:00'), DATEDIFF(wk, DATE '2024-02-25', DATE '2024-02-26'),
+			DATEDIFF(qq, DATE '2024-03-31', DATE '2024-04-01'), DATEDIFF(mi, TIMESTAMP '2024-01-01 00:00:59', TIMESTAMP '2024-01-01 00:01:00'),
+			DATEDIFF(ss, TIMESTAMP '2024-01-01 00:00:00.9', TIMESTAMP '2024-01-01 00:00:01.1'),
+			DATEDIFF(ms, TIMESTAMP '2024-01-01 00:00:00.0009', TIMESTAMP '2024-01-01 00:00:00.0011'),
+			DATEDIFF(us, TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-01 00:00:01'),
+			DATEDIFF(day, DATE '2024-03-01', DATE '2024-02-01'), DATEDIFF('Day', DATE '2024-02-01', TIMESTAMP '2024-02-02 23:59:59')`,
+		"1|1|1|1|1|1|1|1|1000000|-29|1")
+	expectTypes(t, schema, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64, sfInt64)
+	for _, p := range [][2]string{{"year", "year"}, {"quarter", "quarter"}, {"month", "month"}, {"week", "week"},
+		{"day", "day"}, {"hour", "hour"}, {"minute", "minute"}, {"second", "second"}, {"ms", "milliseconds"},
+		{"us", "microseconds"}} {
+		h.expectRows(`SELECT COUNT(*) FROM it_sf_dates a, it_sf_dates b
+			WHERE DATEDIFF(`+p[0]+`, a.ts, b.tz) = DATE_DIFF('`+p[1]+`', a.ts, b.tz)
+			AND DATEDIFF(`+p[0]+`, a.d, b.ts) = DATE_DIFF('`+p[1]+`', a.d, b.ts)`, "4")
+	}
+
+	// TIMESTAMPADD and TIMESTAMPDIFF are Snowflake's aliases; DATE_ADD also
+	// takes the part first (Trino, Databricks).
+	schema = h.expectRows(`SELECT TIMESTAMPADD(day, 1, d), TIMESTAMPDIFF(month, d, DATE '2024-03-01'), DATE_ADD(week, 2, d),
+			DATE_ADD('hour', 1, d)
+		FROM it_sf_dates WHERE id = 1`,
+		"2024-02-01|2|2024-02-14|2024-01-31T01:00:00")
+	expectTypes(t, schema, sfDate, sfInt64, sfDate, sfTS)
+
+	// DATE_ADD / DATE_SUB(x, INTERVAL n part) (MySQL, BigQuery) are DATEADD
+	// with n or -n: dates stay dates for date parts.
+	schema = h.expectRows(`SELECT DATE_ADD(DATE '2024-01-31', INTERVAL 1 MONTH), DATE_SUB(DATE '2024-03-01', INTERVAL 1 DAY),
+			DATE_ADD(DATE '2024-01-01', INTERVAL '3' DAY), DATE_ADD(DATE '2024-01-01', INTERVAL 2 HOUR),
+			DATE_SUB(TIMESTAMP '2024-01-01 00:00:00', INTERVAL 1 SECOND), DATE_SUB(DATE '2024-01-01', INTERVAL -1 YEAR)`,
+		"2024-02-29|2024-02-29|2024-01-04|2024-01-01T02:00:00|2023-12-31T23:59:59|2025-01-01")
+	expectTypes(t, schema, sfDate, sfDate, sfDate, sfTS, sfTS, sfDate)
+
+	// NULL in any argument gives NULL, with the result type.
+	schema = h.expectRows(`SELECT DATEADD(day, NULL, d), DATEADD(day, 1, NULL), DATEDIFF(day, NULL, d), DATEADD(hour, NULL, d)
+		FROM it_sf_dates WHERE id = 1`, "NULL|NULL|NULL|NULL")
+	expectTypes(t, schema, sfDate, sfTS, sfInt64, sfTS)
+
+	// What dbt_utils.date_spine generates: a window function as the count.
+	h.expectRows(`SELECT DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY id) - 1, CAST('2024-02-27' AS DATE)) AS date_day
+		FROM it_sf_dates ORDER BY date_day`,
+		"2024-02-27", "2024-02-28", "2024-02-29")
+
+	// Of constants, DATEADD is computed once and pushed into the index.
+	h.expectRows(`SELECT id FROM it_sf_dates WHERE d = DATEADD(day, 1, DATE '2024-01-30')`, "1")
+	h.expectRows(`SELECT id FROM it_sf_dates WHERE ts >= DATEADD(month, -1, TIMESTAMP '2024-02-15 00:00:00')`, "1")
+
+	// Errors.
+	h.expectError(`SELECT DATEADD('fortnight', 1, d) FROM it_sf_dates`, `DATEADD: unknown date part "fortnight"`)
+	h.expectError(`SELECT DATEADD(fortnight, 1, d) FROM it_sf_dates`, "fortnight")
+	h.expectError(`SELECT DATEADD(day, 'x', d) FROM it_sf_dates`, "DATEADD: the number of units must be an integer")
+	h.expectError(`SELECT DATEADD(day, 1, 5)`, "DATEADD expects a date, time or timestamp")
+	h.expectError(`SELECT DATEADD(day, 1)`, "DATEADD expects 3 argument(s)")
+	h.expectError(`SELECT DATEADD(year, 10000000, DATE '2024-01-01')`, "DATEADD: date out of range")
+	h.expectError(`SELECT DATEADD(day, 3000000000, DATE '2024-01-01')`, "DATEADD: interval out of range")
+	h.expectError(`SELECT DATEADD(year, 300000, TIMESTAMP '2024-01-01 00:00:00')`, "out of range")
+	h.expectError(`SELECT DATE_ADD(DATE '2024-01-01', INTERVAL '1 day')`, "DATE_ADD expects (part, n, x) or (x, INTERVAL n part)")
+	h.expectError(`SELECT DATE_SUB('day', 1, DATE '2024-01-01')`, "DATE_SUB expects (x, INTERVAL n part)")
 }

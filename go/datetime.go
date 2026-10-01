@@ -294,6 +294,114 @@ func dateDiff(unit string, a, b time.Time) (int64, error) {
 	}
 }
 
+// datePartNames maps the date parts of DATEADD and DATEDIFF, and their
+// abbreviations in Snowflake and SQL Server, to the part. As in Snowflake, m
+// is minute and w is week (SQL Server reads them as month and weekday).
+var datePartNames = func() map[string]string {
+	m := map[string]string{}
+	for part, aliases := range map[string][]string{
+		"year":        {"years", "y", "yy", "yyy", "yyyy", "yr", "yrs"},
+		"quarter":     {"quarters", "q", "qq", "qtr", "qtrs"},
+		"month":       {"months", "mm", "mon", "mons"},
+		"week":        {"weeks", "w", "wk", "ww", "wy", "woy", "weekofyear"},
+		"day":         {"days", "d", "dd", "dayofmonth"},
+		"hour":        {"hours", "h", "hh", "hr", "hrs"},
+		"minute":      {"minutes", "m", "mi", "n", "min", "mins"},
+		"second":      {"seconds", "s", "ss", "sec", "secs"},
+		"millisecond": {"milliseconds", "ms", "msec", "msecs"},
+		"microsecond": {"microseconds", "us", "usec", "usecs", "mcs"},
+		"decade":      {"decades"},
+		"century":     {"centuries"},
+		"millennium":  {"millennia", "millenniums"},
+	} {
+		m[part] = part
+		for _, a := range aliases {
+			m[a] = part
+		}
+	}
+	return m
+}()
+
+// datePartOf returns the date part that s names in DATEADD or DATEDIFF.
+func datePartOf(s string) (string, bool) {
+	p, ok := datePartNames[strings.ToLower(strings.TrimSpace(s))]
+	return p, ok
+}
+
+// dateAddType is the result type of DATEADD(part, n, x). As in Snowflake, a
+// date stays a date when the part is a day or longer and becomes a timestamp
+// otherwise; text is read as a timestamp.
+func dateAddType(part Expr, x ColType) ColType {
+	switch x.Kind {
+	case KindTimestamp, KindTime:
+		return x
+	case KindDate:
+		if lit, ok := part.(*Literal); ok && !lit.V.Null {
+			if p, ok := datePartOf(lit.V.Text()); ok && intervalUnits[p].nanos == 0 {
+				return typeDate
+			}
+		}
+	}
+	return typeTimestamp
+}
+
+// dateAdd implements DATEADD(part, n, x), and DATE_SUB with sign -1: x plus
+// n parts, as a value of type t. Months clamp to the end of the month, as
+// with intervals.
+func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
+	part, ok := datePartOf(args[0].Text())
+	if !ok {
+		return Value{}, fmt.Errorf("%s: unknown date part %q", name, args[0].Text())
+	}
+	n, err := intArg(name, "number of units", args[1])
+	if err != nil {
+		return Value{}, err
+	}
+	if sign < 0 {
+		if n == math.MinInt64 {
+			return Value{}, fmt.Errorf("%s: interval out of range", name)
+		}
+		n = -n
+	}
+	u := intervalUnits[part]
+	x := args[2]
+	switch x.T.Kind {
+	case KindDate, KindTimestamp:
+	case KindTime:
+		if u.nanos == 0 {
+			return Value{}, fmt.Errorf("%s: date part %s is not valid for TIME values", name, part)
+		}
+	case KindString:
+		if x, err = Coerce(x, t); err != nil {
+			return Value{}, fmt.Errorf("%s: %v", name, err)
+		}
+	default:
+		return Value{}, fmt.Errorf("%s expects a date, time or timestamp, got %s", name, x.T.SQLName())
+	}
+	// The interval of n parts. A part shorter than a day carries whole days
+	// into the days field, so that large counts don't overflow nanoseconds.
+	var iv Value
+	if u.nanos == 0 {
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return Value{}, fmt.Errorf("%s: interval out of range", name)
+		}
+		iv, err = intervalValue(n*int64(u.months), n*int64(u.days), 0)
+	} else {
+		ns := int64(u.nanos)
+		iv, err = intervalValue(0, n/(nsPerDay/ns), n%(nsPerDay/ns)*ns)
+	}
+	if err == nil {
+		x, err = temporalOp("+", x, iv, t)
+	}
+	if err == nil && t.Kind == KindDate && (x.I < math.MinInt32 || x.I > math.MaxInt32) {
+		err = fmt.Errorf("date out of range")
+	}
+	if err != nil {
+		return Value{}, fmt.Errorf("%s: %v", name, err)
+	}
+	return x, nil
+}
+
 // ---- TO_CHAR / TO_DATE / TO_TIMESTAMP formats ----
 
 type fmtToken struct {
@@ -635,8 +743,13 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 	case "CURRENT_TIME", "LOCALTIME", "MAKE_TIME":
 		return typeTimeUS, true
 	case "YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "DAYOFMONTH", "DAYOFYEAR", "HOUR", "MINUTE", "SECOND",
-		"DATE_DIFF", "DATEDIFF", "EPOCH_MS":
+		"DATE_DIFF", "DATEDIFF", "TIMESTAMPDIFF", "EPOCH_MS":
 		return typeInt64, true
+	case "DATEADD", "DATE_ADD", "DATE_SUB", "TIMESTAMPADD":
+		if len(args) == 3 {
+			return dateAddType(f.Args[0], args[2]), true
+		}
+		return typeTimestamp, true
 	case "EPOCH":
 		return typeFloat64, true
 	case "TO_CHAR":
@@ -767,7 +880,7 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 			return done(Value{}, err)
 		}
 		return done(fromTime(tr, t))
-	case "DATE_DIFF", "DATEDIFF":
+	case "DATE_DIFF", "DATEDIFF", "TIMESTAMPDIFF":
 		if err := need(3); err != nil {
 			return done(Value{}, err)
 		}
@@ -779,8 +892,21 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if err != nil {
 			return done(Value{}, err)
 		}
-		n, err := dateDiff(args[0].Text(), a, b)
+		unit := args[0].Text()
+		if p, ok := datePartOf(unit); ok {
+			unit = p
+		}
+		n, err := dateDiff(unit, a, b)
 		return done(intValue(typeInt64, n), err)
+	case "DATEADD", "DATE_ADD", "DATE_SUB", "TIMESTAMPADD":
+		if err := need(3); err != nil {
+			return done(Value{}, err)
+		}
+		sign := int64(1)
+		if f.Name == "DATE_SUB" {
+			sign = -1
+		}
+		return done(dateAdd(f.Name, args, sign, t))
 	case "LAST_DAY":
 		if err := need(1); err != nil {
 			return done(Value{}, err)

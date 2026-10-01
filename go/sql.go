@@ -2505,6 +2505,11 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				return &Cast{X: x, T: ct, OnError: onError}, nil
 			}
+		case "DATEADD", "DATE_ADD", "DATE_SUB", "TIMESTAMPADD", "DATEDIFF", "TIMESTAMPDIFF":
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				return p.parseDateArith(upper)
+			}
 		case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "DATETIME":
 			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...'
 			save := p.pos
@@ -2695,6 +2700,50 @@ func (p *parser) parseTrim() (Expr, error) {
 		f.Args = append(f.Args, chars)
 	}
 	return f, nil
+}
+
+// parseDateArith parses what follows `DATEADD(`, `DATEDIFF(` and their
+// aliases. A bare date part is the part's name, not a column:
+// DATEADD(day, 1, x) is DATEADD('day', 1, x). DATE_ADD(x, INTERVAL n part)
+// and DATE_SUB(x, INTERVAL n part) (MySQL, BigQuery) become
+// DATE_ADD('part', n, x) and DATE_SUB('part', n, x).
+func (p *parser) parseDateArith(name string) (Expr, error) {
+	var first Expr
+	bare := ""
+	if t := p.peek(); t.kind == tokIdent && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "," {
+		if _, ok := datePartOf(t.text); ok {
+			p.pos++
+			bare = t.text
+			first = &Literal{V: stringValue(strings.ToLower(t.text))}
+		}
+	}
+	if first == nil {
+		var err error
+		if first, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	call, err := p.finishCall(name, first)
+	if err != nil {
+		return nil, err
+	}
+	f := call.(*Func)
+	if (name != "DATE_ADD" && name != "DATE_SUB") || (name == "DATE_ADD" && len(f.Args) == 3) {
+		return f, nil
+	}
+	if len(f.Args) == 2 {
+		if iv, ok := f.Args[1].(*Func); ok && iv.Name == "__INTERVAL" {
+			x := f.Args[0]
+			if bare != "" {
+				x = &ColumnRef{Name: bare} // a column named like a date part
+			}
+			return &Func{Name: name, Args: []Expr{iv.Args[1], iv.Args[0], x}}, nil
+		}
+	}
+	if name == "DATE_ADD" {
+		return nil, syntaxErr("DATE_ADD expects (part, n, x) or (x, INTERVAL n part)")
+	}
+	return nil, syntaxErr("DATE_SUB expects (x, INTERVAL n part)")
 }
 
 // parseColumnRef parses the rest of [schema.][table.]column after its first

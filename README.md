@@ -636,6 +636,27 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     `SECOND()`
   - `DATE_TRUNC('unit', x)` (dates stay dates), `DATE_DIFF('unit', a, b)`
     (unit boundaries crossed), `LAST_DAY(d)`
+  - `DATEADD(part, n, x)` and `DATEDIFF(part, a, b)` (Snowflake, Redshift,
+    SQL Server; what dbt's `dateadd` and `datediff` emit), with `part` a bare
+    keyword or a string: `year`, `quarter`, `month`, `week`, `day`, `hour`,
+    `minute`, `second`, `millisecond`, `microsecond`, their plurals, and
+    abbreviations such as `yy` / `yyyy`, `qq`, `mm` / `mon`, `wk` / `ww`,
+    `dd` / `d`, `hh`, `mi` / `n` / `m`, `ss` / `s`, `ms`, `us` / `mcs` (`m`
+    is minute and `w` is week, as in Snowflake). In the part's position a
+    bare part name is the part even if a column has that name (write `"day"`
+    for the column); everywhere else it is the column
+  - `DATEDIFF` counts boundaries crossed, exactly like `DATE_DIFF`.
+    `DATEADD` adds `n` parts (a non-integer `n` is rounded, as by
+    `CAST(n AS BIGINT)`); months clamp to the end of the month. As in
+    Snowflake, a date stays a date for a part of a day or longer and becomes
+    a timestamp for a smaller one; timestamps and times keep their type
+    (times wrap around midnight, and date parts aren't valid for them), and
+    text is read as a timestamp
+  - Aliases: `TIMESTAMPADD` / `TIMESTAMPDIFF` (as in Snowflake; MySQL's
+    `TIMESTAMPDIFF` counts whole units elapsed instead),
+    `DATE_ADD(part, n, x)` (Trino, Databricks), and
+    `DATE_ADD(x, INTERVAL n part)` / `DATE_SUB(x, INTERVAL n part)` (MySQL,
+    BigQuery), which are `DATEADD(part, n, x)` / `DATEADD(part, -n, x)`
   - `MAKE_DATE`, `MAKE_TIME`, `MAKE_TIMESTAMP`, `MAKE_TIMESTAMPTZ`,
     `TO_TIMESTAMP(epoch_seconds)`, `EPOCH(x)`, `EPOCH_MS(x)`
   - `TO_CHAR(x, format)`, `TO_DATE(text, format)`,
