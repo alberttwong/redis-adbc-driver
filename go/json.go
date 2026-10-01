@@ -53,54 +53,15 @@ import (
 
 // ---- functions ----
 
-// jsonFuncs are the JSON scalar functions and operators, evaluated by
-// evalJSONFunc. The parser builds the ones starting with __: __JSON and
-// __JSONB for casts, __IS_JSON for IS JSON, and __JSON_OBJECT and
-// __JSON_ARRAY for the SQL/JSON constructors.
-var jsonFuncs = map[string]bool{
-	"->": true, "->>": true, "#>": true, "#>>": true,
-	"JSON_EXTRACT_PATH": true, "JSON_EXTRACT_PATH_TEXT": true, "JSONB_EXTRACT_PATH": true, "JSONB_EXTRACT_PATH_TEXT": true,
-	"JSON_TYPEOF": true, "JSONB_TYPEOF": true, "JSON_ARRAY_LENGTH": true, "JSONB_ARRAY_LENGTH": true,
-	"JSON_BUILD_OBJECT": true, "JSONB_BUILD_OBJECT": true, "JSON_BUILD_ARRAY": true, "JSONB_BUILD_ARRAY": true,
-	"JSON_OBJECT": true, "JSONB_OBJECT": true, "TO_JSON": true, "TO_JSONB": true,
-	"JSON_VALUE": true, "JSON_QUERY": true, "JSON_EXISTS": true,
-	"__JSON": true, "__JSONB": true, "__IS_JSON": true, "__JSON_OBJECT": true, "__JSON_ARRAY": true,
-}
-
-// jsonAggregates are the JSON aggregate functions. They are always computed
-// in the driver (driverAggregate), and may have an ORDER BY.
-var jsonAggregates = map[string]bool{"JSON_AGG": true, "JSONB_AGG": true, "JSON_OBJECT_AGG": true, "JSONB_OBJECT_AGG": true}
-
-// jsonArity gives the minimum and maximum number of arguments of the JSON
-// functions called by name (-1: no maximum).
-var jsonArity = map[string][2]int{
-	"JSON_EXTRACT_PATH": {2, -1}, "JSON_EXTRACT_PATH_TEXT": {2, -1}, "JSONB_EXTRACT_PATH": {2, -1}, "JSONB_EXTRACT_PATH_TEXT": {2, -1},
-	"JSON_TYPEOF": {1, 1}, "JSONB_TYPEOF": {1, 1}, "JSON_ARRAY_LENGTH": {1, 1}, "JSONB_ARRAY_LENGTH": {1, 1},
-	"JSON_BUILD_OBJECT": {0, -1}, "JSONB_BUILD_OBJECT": {0, -1}, "JSON_BUILD_ARRAY": {0, -1}, "JSONB_BUILD_ARRAY": {0, -1},
-	"JSON_OBJECT": {1, 2}, "JSONB_OBJECT": {1, 2}, "TO_JSON": {1, 1}, "TO_JSONB": {1, 1},
-	"JSON_AGG": {1, 1}, "JSONB_AGG": {1, 1}, "JSON_OBJECT_AGG": {2, 2}, "JSONB_OBJECT_AGG": {2, 2},
-}
-
-// checkJSONArity validates a call of a JSON function by name (the others are
-// built by the parser); it accepts any other function.
-func checkJSONArity(f *Func) error {
-	a, ok := jsonArity[f.Name]
-	if !ok {
-		return nil
-	}
+// checkJSONArgs checks the rules of the JSON functions beyond their
+// argument counts (which the registry has): JSON_BUILD_OBJECT's keys and
+// values come in pairs, object keys can't be JSON, and a JSON aggregate
+// with DISTINCT may only order by its arguments. The parser builds the
+// functions starting with __: __JSON and __JSONB for casts, __IS_JSON for
+// IS JSON, and __JSON_OBJECT and __JSON_ARRAY for the SQL/JSON
+// constructors.
+func checkJSONArgs(f *Func) error {
 	n := len(f.Args)
-	switch {
-	case f.Star:
-		return fmt.Errorf("%s does not accept *", f.Name)
-	case f.Distinct && !jsonAggregates[f.Name]:
-		return fmt.Errorf("%s does not accept DISTINCT", f.Name)
-	case a[1] < 0 && n < a[0]:
-		return fmt.Errorf("%s expects at least %d argument(s)", f.Name, a[0])
-	case a[0] == a[1] && n != a[0]:
-		return fmt.Errorf("%s expects %d argument(s)", f.Name, a[0])
-	case n < a[0] || (a[1] >= 0 && n > a[1]):
-		return fmt.Errorf("%s expects %d or %d arguments", f.Name, a[0], a[1])
-	}
 	switch f.Name {
 	case "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT":
 		if n%2 != 0 {
@@ -112,11 +73,11 @@ func checkJSONArity(f *Func) error {
 			}
 		}
 	case "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG":
-		if isJSONExpr(f.Args[0]) {
+		if n > 0 && isJSONExpr(f.Args[0]) {
 			return errJSONKey
 		}
 	}
-	if f.Distinct {
+	if f.Distinct && jsonAggregates[f.Name] {
 		for _, o := range f.OrderBy {
 			if !slices.ContainsFunc(f.Args, func(a Expr) bool { return exprEqual(a, o.Expr) }) {
 				return fmt.Errorf("in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
@@ -243,7 +204,7 @@ type jsonBehavior struct {
 	arg  int
 }
 
-// evalJSONFunc evaluates a JSON function or operator (see jsonFuncs).
+// evalJSONFunc evaluates a JSON function or operator (implJSON in funcs.go).
 func (env *evalEnv) evalJSONFunc(f *Func) (Value, error) {
 	if f.Name == "JSON_VALUE" || f.Name == "JSON_QUERY" || f.Name == "JSON_EXISTS" {
 		return env.evalJSONQuery(f)

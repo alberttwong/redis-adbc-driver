@@ -632,7 +632,7 @@ func TestSQLEmptyErrors(t *testing.T) {
 		{"SELECT id FROM it_empty_t UNION SELECT d FROM it_empty_t LIMIT 0", "cannot be matched"},
 		{"SELECT g, COUNT(*) FROM it_empty_t WHERE false GROUP BY 3", "GROUP BY position 3 is out of range"},
 		{"SELECT COUNT(*) FROM it_empty_t WHERE COUNT(*) > 0 AND false", "aggregates are not allowed in WHERE"},
-		{"SELECT REPLACE(g, 'a') FROM it_empty_t WHERE false", "REPLACE expects 3 argument(s)"},
+		{"SELECT REPLACE(g, 'a') FROM it_empty_t WHERE false", "REPLACE expects 3 arguments"},
 		{"SELECT g + 1 FROM it_empty_t LIMIT 0", "operator"},
 		{"SELECT * FROM it_empty_v WHERE nope AND false", `column "nope" does not exist`},
 		{"SELECT COUNT(*) LIMIT 0", "aggregates require a FROM clause"},

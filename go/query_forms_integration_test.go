@@ -676,10 +676,10 @@ func TestSQLGenerateSeries(t *testing.T) {
 
 	h.expectError(`SELECT generate_series(1, 3)`, "generate_series is only supported in FROM")
 	h.expectError(`SELECT * FROM unnest(1)`, "table function unnest is not supported")
-	h.expectError(`SELECT * FROM generate_series(1)`, "function generate_series(BIGINT) does not exist")
+	h.expectError(`SELECT * FROM generate_series(1)`, "GENERATE_SERIES expects 2 or 3 arguments")
 	h.expectError(`SELECT * FROM generate_series(1, 10, INTERVAL '1 day')`,
-		"function generate_series(BIGINT, BIGINT, INTERVAL) does not exist")
+		"function generate_series(bigint, bigint, interval) does not exist")
 	h.expectError(`SELECT * FROM generate_series(DATE '2024-01-01', DATE '2024-01-02')`,
-		"function generate_series(DATE, DATE) does not exist")
+		"function generate_series(date, date) does not exist")
 	h.expectError(`SELECT * FROM generate_series(1, COUNT(*))`, "aggregate functions are not allowed in functions in FROM")
 }

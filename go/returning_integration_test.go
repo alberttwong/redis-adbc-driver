@@ -285,7 +285,7 @@ func TestSQLReturningMerge(t *testing.T) {
 		WHEN MATCHED AND merge_action() = 'UPDATE' THEN DELETE`, "MERGE_ACTION() can only be used in the RETURNING list")
 	h.expectError(`SELECT merge_action()`, "MERGE_ACTION() can only be used in the RETURNING list")
 	h.expectError(`MERGE INTO it_ret_t t USING it_ret_s s ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING merge_action(1)`,
-		"MERGE_ACTION expects 0 argument(s)")
+		"MERGE_ACTION expects no arguments")
 	h.expectError(`MERGE INTO it_ret_t t USING it_ret_s s ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING id`, "ambiguous")
 	h.expectError(`MERGE INTO it_ret_t t USING it_ret_s s ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING MAX(t.v)`,
 		"aggregate functions are not allowed in RETURNING")

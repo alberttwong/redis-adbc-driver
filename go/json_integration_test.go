@@ -122,7 +122,7 @@ func TestSQLJSONFunctions(t *testing.T) {
 	h.expectRows(`SELECT JSON_ARRAY_LENGTH(doc #> '{a,b}') FROM it_json_fn WHERE id = 1`, "3")
 	h.expectError(`SELECT JSON_ARRAY_LENGTH(doc) FROM it_json_fn WHERE id = 1`, "cannot get array length of a non-array")
 	h.expectError(`SELECT JSON_ARRAY_LENGTH(doc) FROM it_json_fn WHERE id = 3`, "cannot get array length of a scalar")
-	h.expectError(`SELECT JSON_EXTRACT_PATH(doc) FROM it_json_fn`, "JSON_EXTRACT_PATH expects at least 2 argument(s)")
+	h.expectError(`SELECT JSON_EXTRACT_PATH(doc) FROM it_json_fn`, "JSON_EXTRACT_PATH expects at least 2 arguments")
 	h.expectError(`SELECT JSON_TYPEOF(id) FROM it_json_fn`, "JSON_TYPEOF expects JSON text, not INTEGER")
 
 	// The JSONB_ spellings give jsonb's normalized text: keys sorted (shorter
@@ -499,7 +499,7 @@ func TestSQLJSONAggregates(t *testing.T) {
 
 	h.expectError(`SELECT JSON_AGG(id) OVER () FROM it_json_sales`, "JSON_AGG is not a window function")
 	h.expectError(`SELECT JSON_AGG(*) FROM it_json_sales`, "JSON_AGG does not accept *")
-	h.expectError(`SELECT JSON_AGG(id, item) FROM it_json_sales`, "JSON_AGG expects 1 argument(s)")
+	h.expectError(`SELECT JSON_AGG(id, item) FROM it_json_sales`, "JSON_AGG expects 1 argument")
 	h.expectError(`SELECT JSON_OBJECT_AGG('{"a":1}'::json, id) FROM it_json_sales`, "key value must be scalar")
 	h.expectError(`SELECT LOWER(item ORDER BY id) FROM it_json_sales`, "ORDER BY specified, but LOWER is not an aggregate function")
 }

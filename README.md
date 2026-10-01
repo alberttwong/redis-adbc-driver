@@ -483,7 +483,7 @@ How SQL is executed:
 | Query shape | Execution |
 |-|-|
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
-| Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables and columns are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
+| Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables, columns and functions and wrong argument counts are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1) |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
@@ -501,7 +501,7 @@ How SQL is executed:
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
-| Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
+| Views | `CREATE VIEW` plans the body without running it, which checks its tables, columns and function calls. Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING`. An item whose `ON` can never be true (`ON false`), or that has no rows, isn't read when that settles the result: an inner join is then empty and reads no item, a `LEFT JOIN` keeps the left rows with NULLs for the item, and a `RIGHT JOIN` returns the item's rows without reading the items before it |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
@@ -718,8 +718,10 @@ field, even if later rows have it.
     bulk ingest. An explicit NULL stays NULL (and fails on a `NOT NULL`
     column). `UPDATE … SET col = DEFAULT` is not supported.
   - The default is checked when it is defined: it may not read columns or
-    use subqueries, parameters, aggregates or window functions, and it must
-    convert to the column's type (`INTEGER DEFAULT 'abc'` is an error then).
+    use subqueries, parameters, aggregates, `GROUPING` or window functions,
+    its function calls are checked as in a query (`DEFAULT nosuchfunc(NULL)`
+    is `function nosuchfunc(unknown) does not exist`), and it must convert
+    to the column's type (`INTEGER DEFAULT 'abc'` is an error then).
     `DEFAULT NULL` is the same as no default.
   - It is computed once per statement (or bulk ingest), so all the rows of
     a statement get the same `CURRENT_TIMESTAMP` / `NOW()` /
@@ -745,16 +747,19 @@ field, even if later rows have it.
     needn't exist, and `GetObjects` doesn't list them.
   - **`CHECK`, when written:** the expression is checked as in Postgres. It
     may read the table's columns (`col` or `t.col`) but not `__rowid` or
-    another table, may not use subqueries, parameters, aggregates or window
-    functions, and must be boolean. The errors are `column "x" does not
-    exist in table "t"`, `system column "__rowid" reference in check
-    constraint is invalid`, `missing FROM-clause entry for table "u"`,
-    `cannot use subquery in check constraint`, `cannot use parameter in
-    check constraint`, `aggregate functions are not allowed in check
-    constraints`, `window functions are not allowed in check constraints`
-    and `argument of CHECK must be type boolean, not type integer`. A
-    function the driver doesn't know is only reported when a row is
-    written.
+    another table, may not use subqueries, parameters, aggregates,
+    `GROUPING` or window functions, and must be boolean. Its function calls
+    are checked as in a query (see "Function calls" below). The errors are
+    `column "x" does not exist in table "t"`, `system column "__rowid"
+    reference in check constraint is invalid`, `missing FROM-clause entry
+    for table "u"`, `cannot use subquery in check constraint`, `cannot use
+    parameter in check constraint`, `aggregate functions are not allowed in
+    check constraints`, `grouping operations are not allowed in check
+    constraints`, `window functions are not allowed in check constraints`,
+    `function nosuchfunc(integer) does not exist`, `UPPER expects 1
+    argument` and `argument of CHECK must be type boolean, not type
+    integer`. A value the expression can't compute for a row (`LOG(0)`) is
+    an error when that row is written.
   - **Names:** `CONSTRAINT name` is used as written. Without one, the name
     is Postgres's: `<table>_<column>_check` if the expression reads exactly
     one column (`t_amount_check`, also for a table constraint such as
@@ -797,7 +802,11 @@ field, even if later rows have it.
     them, so upgrade every client of a database together. Earlier versions
     accepted table-level `CHECK`s without storing them, so tables they
     created don't enforce theirs; add them again with `ALTER TABLE … ADD
-    CHECK (…)`.
+    CHECK (…)`. Earlier versions also accepted a constraint that calls an
+    unknown function; every write to its table now fails with `check
+    constraint "c" of relation "t" can't be evaluated (function
+    nosuchfunc(integer) does not exist); drop it with ALTER TABLE … DROP
+    CONSTRAINT`.
 - `[WITH [RECURSIVE] name [(cols)] AS (SELECT …), …] SELECT [ALL | DISTINCT | DISTINCT ON (…)] … FROM item {, item |
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item |
   NATURAL [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item}
@@ -818,10 +827,11 @@ field, even if later rows have it.
   1`); `WITH TIES` is not supported, and a query has at most one `LIMIT` or
   `FETCH` (Postgres's "multiple LIMIT clauses not allowed")
 - A query that can't return rows (`WHERE false`, `LIMIT 0`, …; see "How SQL
-  is executed") reads none. Errors the driver raises only when it computes
-  a value on a row (division by zero, a failed cast, an unknown function or
-  a wrong argument count for most functions) are then not raised, as on an
-  empty table: `SELECT 1/0 FROM t WHERE false` returns no rows
+  is executed") reads none. It is still planned, so unknown tables, columns
+  and functions and wrong argument counts are errors. Errors the driver
+  raises only when it computes a value on a row (division by zero, a failed
+  cast, the logarithm of zero) are then not raised, as on an empty table:
+  `SELECT 1/0 FROM t WHERE false` returns no rows
 - `GROUP BY` items are expressions, output positions or aliases, and also
   (as in Postgres) `ROLLUP (…)`, `CUBE (…)`, `GROUPING SETS (…)` and `()`:
   - `ROLLUP (a, b)` is the grouping sets `(a, b), (a), ()`, and `CUBE (a, b)`
@@ -903,6 +913,47 @@ field, even if later rows have it.
   `NOT IN`
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
+- Function calls (the functions are listed below) are checked when the
+  statement is planned, before any row is read, wherever a call can be:
+  the SELECT list, `WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `ORDER BY`,
+  `ON`, window definitions, subqueries, CTEs and derived tables, the body
+  of `CREATE VIEW`, `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `RETURNING`,
+  and `CHECK` and `DEFAULT` expressions when they are defined. So the errors
+  don't depend on whether a table has rows, and a query that reads none
+  (`WHERE false`, dbt's `where false limit 0`, `ExecuteSchema`) gets them
+  too:
+  - Names are case-insensitive. A quoted name (`"upper"(x)`) or a
+    schema-qualified one (`pg_catalog.upper(x)`) is not a call (a syntax
+    error), except `"generate_series"(…)` in FROM
+  - An unknown function is Postgres's `function nosuchfunc(integer) does
+    not exist`, with the argument types the planner infers (`unknown` for
+    NULL and for a parameter without a type)
+  - A wrong argument count is `UPPER expects 1 argument`, `ROUND expects 1
+    or 2 arguments`, `REGEXP_INSTR expects 2 to 7 arguments`, `GREATEST
+    expects at least 1 argument` or `RANDOM expects no arguments`, also
+    when the arguments are NULL. Only `COUNT` takes `*` (`SUM does not
+    accept *`), and only aggregates take `DISTINCT` (`UPPER does not
+    accept * or DISTINCT`)
+  - Where an argument's type decides whether the call exists, it is
+    checked too: `BOOL_OR(int_col)` is `function bool_or(integer) does not
+    exist`, and the offset of `LAG` must be an integer
+  - As in Postgres, the tables of a statement are resolved before its
+    expressions, and an unknown column or function in a call's arguments
+    is reported before the call's own error
+  - Errors that depend on values (division by zero, a failed cast,
+    `LOG(0)`) are still raised when a row is evaluated, as in Postgres
+  - A view stored by an earlier version whose body calls an unknown
+    function fails whenever it is read, also when its tables are empty:
+    `view "v" is no longer valid: function nosuchfunc(integer) does not
+    exist`. `CREATE OR REPLACE VIEW` or `DROP VIEW` fixes it
+  - A CTE that no part of the statement reads isn't planned, so its calls
+    (like its columns) aren't checked
+  - `information_schema.routines` lists the functions, each alias too:
+    `routine_name` (lower case), `routine_schema` (`pg_catalog`, though a
+    call can't name it), `routine_type` (`FUNCTION`), `function_kind`
+    (`SCALAR`, `AGGREGATE`, `WINDOW` or `TABLE`), `min_arguments`,
+    `max_arguments` (NULL for no maximum) and `alias_of` (the function an
+    alias names, NULL otherwise)
 - Aggregates, with `GROUP BY` or over the whole input. They skip NULL
   inputs, and all but `COUNT` give NULL when there are none:
   - `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, `COUNT(DISTINCT x)`, and
@@ -1211,8 +1262,9 @@ field, even if later rows have it.
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`,
   each table's row `key_prefix` and `index_name`, NULL for views, and
   `comment`), `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
-  `numeric_scale`, `datetime_precision`, `is_indexed` and `comment`), and `views`
-  (`view_definition`). `comment` is the `COMMENT ON` text, NULL without
+  `numeric_scale`, `datetime_precision`, `is_indexed` and `comment`), `views`
+  (`view_definition`), and `routines`, the driver's functions (see "Function
+  calls" above). `comment` is the `COMMENT ON` text, NULL without
   one. Any SQL works on them, including joins
 - `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
   `[WITH …] DELETE FROM t [[AS] a] [USING item, …] [WHERE …]` (the Postgres

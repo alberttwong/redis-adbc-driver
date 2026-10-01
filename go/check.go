@@ -24,8 +24,10 @@ package redis
 //
 //   - Definition: the expression is bound over the table alone, so it may
 //     read any of the table's columns but not __rowid or another table, and
-//     it may not use subqueries, parameters, aggregates or window functions.
-//     It must be boolean. A constraint without a CONSTRAINT name is named as
+//     it may not use subqueries, parameters, aggregates, GROUPING or window
+//     functions. Its calls are resolved as in a query (funcs.go), so an
+//     unknown function or a wrong argument count is an error then. It must
+//     be boolean. A constraint without a CONSTRAINT name is named as
 //     Postgres does: <table>_<column>_check if the expression reads exactly
 //     one column, otherwise <table>_check, with 1, 2, … appended to a name
 //     the table already has.
@@ -240,8 +242,11 @@ func (e *executor) checkCheck(ctx context.Context, meta *tableMeta, x Expr) ([]s
 		case *WindowFunc:
 			err = errorf(adbc.StatusInvalidArgument, "window functions are not allowed in check constraints")
 		case *Func:
-			if aggregateFuncs[v.Name] {
+			switch {
+			case aggregateFuncs[v.Name]:
 				err = errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in check constraints")
+			case v.Name == "GROUPING":
+				err = errorf(adbc.StatusInvalidArgument, "grouping operations are not allowed in check constraints")
 			}
 		case *ColumnRef:
 			switch {
@@ -311,7 +316,8 @@ func (e *executor) tableChecks(ctx context.Context, meta *tableMeta) (*tableChec
 		}
 		if err != nil {
 			// Say a client older than CHECK support renamed or dropped a
-			// column it reads.
+			// column it reads, or the constraint calls a function that
+			// doesn't exist (stored before calls were checked).
 			return nil, errorf(adbc.StatusInvalidState,
 				"check constraint %q of relation %q can't be evaluated (%s); drop it with ALTER TABLE … DROP CONSTRAINT",
 				c.Name, meta.Name, errText(err))

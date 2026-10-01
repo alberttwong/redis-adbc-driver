@@ -45,12 +45,6 @@ type evalEnv struct {
 	action string
 }
 
-var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true,
-	"STRING_AGG": true, "LISTAGG": true, "BOOL_OR": true, "BOOL_AND": true, "EVERY": true, "ANY_VALUE": true,
-	"STDDEV": true, "STDDEV_SAMP": true, "STDDEV_POP": true, "VARIANCE": true, "VAR_SAMP": true, "VAR_POP": true,
-	"PERCENTILE_CONT": true, "PERCENTILE_DISC": true, "MODE": true, "MEDIAN": true,
-	"JSON_AGG": true, "JSONB_AGG": true, "JSON_OBJECT_AGG": true, "JSONB_OBJECT_AGG": true}
-
 func isAggregate(e Expr) bool {
 	found := false
 	walkExpr(e, func(x Expr) {
@@ -337,24 +331,36 @@ func concatValues(sep string, args []Value) Value {
 	return stringValue(b.String())
 }
 
+// evalFunc evaluates a call. The registry (funcs.go) says which code
+// evaluates it; binding has checked its name and arguments.
 func (env *evalEnv) evalFunc(f *Func) (Value, error) {
-	if aggregateFuncs[f.Name] {
+	d, ok := callee(f)
+	if !ok {
+		return Value{}, fmt.Errorf("unsupported function %s", f.Name)
+	}
+	switch d.kind {
+	case aggregateKind:
 		if v, ok := env.aggs[f]; ok {
 			return v, nil
 		}
 		return Value{}, fmt.Errorf("aggregate %s is not allowed here", f.Name)
-	}
-	if f.Name == "MERGE_ACTION" {
-		return env.mergeAction()
+	case windowKind:
+		return Value{}, fmt.Errorf("window function %s requires an OVER clause", f.Name)
+	case tableKind:
+		return Value{}, fmt.Errorf("%s is only supported in FROM", strings.ToLower(f.Name))
 	}
 	if err := checkArity(f); err != nil {
 		return Value{}, err
 	}
-	if f.Name == "IIF" {
+	switch d.impl {
+	case implMergeAction:
+		return env.mergeAction()
+	case implIIF:
 		return env.evalIIF(f)
-	}
-	if jsonFuncs[f.Name] {
+	case implJSON:
 		return env.evalJSONFunc(f)
+	case implGrouping:
+		return Value{}, fmt.Errorf("GROUPING is only allowed with GROUP BY")
 	}
 	args := make([]Value, len(f.Args))
 	for i, a := range f.Args {
@@ -364,14 +370,8 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 		args[i] = v
 	}
-	need := func(n int) error {
-		if len(args) != n {
-			return fmt.Errorf("%s expects %d argument(s)", f.Name, n)
-		}
-		return nil
-	}
-	switch f.Name {
-	case "COALESCE", "IFNULL", "NVL":
+	switch d.impl {
+	case implCoalesce:
 		// The result has the arguments' common type.
 		t := unifiedType(f, argTypes(args))
 		for _, a := range args {
@@ -380,14 +380,12 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			}
 		}
 		return nullValue(t), nil
-	case "NULLIF", "GREATEST", "LEAST":
+	case implConditional:
 		return evalConditional(f, args)
-	case "CONCAT":
+	case implConcat:
 		// NULL arguments are skipped, as in Postgres (|| propagates NULL).
-		return concatValues("", args), nil
-	case "CONCAT_WS":
-		if len(args) == 0 {
-			return Value{}, fmt.Errorf("CONCAT_WS expects a separator")
+		if f.Name == "CONCAT" {
+			return concatValues("", args), nil
 		}
 		if args[0].Null {
 			return nullValue(typeString), nil
@@ -399,49 +397,34 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			return nullValue(inferFuncType(f, argTypes(args))), nil
 		}
 	}
-	if v, ok, err := env.evalDateTimeFunc(f, args); ok {
-		return v, err
-	}
-	if v, ok, err := evalScalarFunc(f, args); ok {
-		return v, err
+	switch d.impl {
+	case implDateTime:
+		if v, ok, err := env.evalDateTimeFunc(f, args); ok {
+			return v, err
+		}
+		return Value{}, fmt.Errorf("unsupported function %s", f.Name)
+	case implScalar:
+		return scalarFunc(f, args)
 	}
 	switch f.Name {
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		b, err := hex.DecodeString(args[0].S)
 		if err != nil {
 			return Value{}, fmt.Errorf("invalid hex string %q", args[0].S)
 		}
 		return binaryValue(string(b)), nil
 	case "TO_HEX", "HEX":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		return stringValue(hex.EncodeToString([]byte(args[0].S))), nil
 	case "LOWER", "LCASE":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		return stringValue(strings.ToLower(args[0].Text())), nil
 	case "UPPER", "UCASE":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		return stringValue(strings.ToUpper(args[0].Text())), nil
 	case "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LEN":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		if args[0].T.Kind == KindBinary {
 			return intValue(typeInt64, int64(len(args[0].S))), nil
 		}
 		return intValue(typeInt64, int64(utf8.RuneCountInString(args[0].Text()))), nil
 	case "LIKE", "ILIKE":
-		if len(args) < 2 || len(args) > 3 {
-			return Value{}, fmt.Errorf("%s expects a pattern", f.Name)
-		}
 		esc := ""
 		if len(args) == 3 {
 			esc = args[2].Text()
@@ -455,9 +438,6 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 		return boolValue(likeMatch(s, pat, esc)), nil
 	case "ABS":
-		if err := need(1); err != nil {
-			return Value{}, err
-		}
 		v := args[0]
 		switch {
 		case v.T.Kind.isInteger():
@@ -749,6 +729,9 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 		}
 		return arithmeticType(x.Op, l, r)
 	case *Func:
+		if _, ok := callee(x); !ok {
+			return ColType{}, noSuchFunction(x.Name, x.Star, inferArgTypes(x.Args, cols, params))
+		}
 		if err := checkArity(x); err != nil {
 			return ColType{}, err
 		}

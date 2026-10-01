@@ -47,10 +47,6 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 )
 
-// orderedSetFuncs are the aggregates called with WITHIN GROUP (ORDER BY x),
-// x being the aggregated value.
-var orderedSetFuncs = map[string]bool{"PERCENTILE_CONT": true, "PERCENTILE_DISC": true, "MODE": true}
-
 // statFuncs are the variance and standard deviation aggregates.
 var statFuncs = map[string]bool{
 	"STDDEV": true, "STDDEV_SAMP": true, "STDDEV_POP": true, "VARIANCE": true, "VAR_SAMP": true, "VAR_POP": true,
@@ -86,7 +82,11 @@ func checkAggregate(f *Func, over bool) error {
 	fail := func(format string, args ...any) error {
 		return errorf(adbc.StatusInvalidArgument, format, args...)
 	}
-	n := len(f.Args)
+	if d, ok := lookupFunc(f.Name); ok {
+		if err := d.argsError(f); err != nil {
+			return err
+		}
+	}
 	if f.Nulls != NullsUnspecified {
 		return fail("aggregate functions do not accept RESPECT/IGNORE NULLS")
 	}
@@ -99,37 +99,18 @@ func checkAggregate(f *Func, over bool) error {
 			return fail("cannot use DISTINCT with WITHIN GROUP")
 		case len(f.OrderBy) != 1:
 			return fail("%s expects one ORDER BY expression in WITHIN GROUP", f.Name)
-		case f.Name == "MODE" && (n != 0 || f.Star):
-			return fail("MODE expects no arguments")
-		case f.Name != "MODE" && (n != 1 || f.Star):
-			return fail("%s expects one argument", f.Name)
 		}
 	case f.WithinGroup && f.Name != "STRING_AGG" && f.Name != "LISTAGG":
 		// LISTAGG … WITHIN GROUP (ORDER BY …), as in Snowflake and Oracle, and
 		// STRING_AGG … WITHIN GROUP, as in SQL Server, order the values.
 		return fail("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", f.Name)
-	case f.Name == "COUNT":
-		switch {
-		case !f.Star && n == 0:
-			return fail("COUNT(*) must be used to call a parameterless aggregate function")
-		case n > 1 && !f.Distinct:
-			return fail("COUNT of more than one argument requires DISTINCT")
-		}
-	case f.Name == "STRING_AGG":
-		if f.Star || n != 2 {
-			return fail("STRING_AGG expects two arguments")
-		}
-	case f.Name == "LISTAGG":
-		if f.Star || n < 1 || n > 2 {
-			return fail("LISTAGG expects one or two arguments")
-		}
+	case f.Name == "COUNT" && len(f.Args) > 1 && !f.Distinct:
+		return fail("COUNT of more than one argument requires DISTINCT")
 	case jsonAggregates[f.Name]:
 		// Checked like the other JSON functions (json.go).
-		if err := checkJSONArity(f); err != nil {
+		if err := checkJSONArgs(f); err != nil {
 			return fail("%v", err)
 		}
-	case f.Star || n != 1:
-		return fail("%s expects one argument", f.Name)
 	case f.Name == "MEDIAN" && f.Distinct:
 		return fail("DISTINCT is not supported for MEDIAN")
 	}
@@ -211,46 +192,45 @@ func aggregateType(f *Func, cols map[string]ColType, params []ColType, over bool
 			}
 		}
 	}
+	// The argument types the registry requires (funcs.go).
 	noSuch := func(t ColType) (ColType, bool, error) {
-		return ColType{}, true, errorf(adbc.StatusInvalidArgument, "function %s(%s) does not exist", f.Name, t.SQLName())
+		return ColType{}, true, noSuchFunction(f.Name, false, []ColType{t})
+	}
+	d, _ := lookupFunc(f.Name)
+	for i, at := range d.args {
+		if i >= len(args) || at.accepts(args[i]) {
+			continue
+		}
+		if d.orderedSet {
+			return ColType{}, true, errorf(adbc.StatusInvalidArgument, "the fraction of %s must be a number, not %s", f.Name, args[i].SQLName())
+		}
+		return noSuch(args[i])
+	}
+	if d.orderedSet && len(keys) == 1 && !d.within.accepts(keys[0]) {
+		return noSuch(keys[0])
 	}
 	// PERCENTILE_CONT interpolates numbers (as doubles) and intervals.
-	contType := func(t ColType) (ColType, bool, error) {
-		switch {
-		case t.Kind.isNumeric() || t.Kind == KindNull:
-			return typeFloat64, true, nil
-		case t.Kind == KindInterval:
-			return typeInterval, true, nil
+	contType := func(t ColType) ColType {
+		if t.Kind == KindInterval {
+			return typeInterval
 		}
-		return noSuch(t)
+		return typeFloat64
 	}
 	switch name := f.Name; {
 	case name == "STRING_AGG" || name == "LISTAGG":
 		return typeString, true, nil
 	case name == "BOOL_OR" || name == "BOOL_AND" || name == "EVERY":
-		if k := args[0].Kind; k != KindBool && k != KindNull {
-			return noSuch(args[0])
-		}
 		return typeBool, true, nil
 	case name == "ANY_VALUE":
 		return args[0], true, nil
 	case statFuncs[name]:
-		if k := args[0].Kind; !k.isNumeric() && k != KindNull {
-			return noSuch(args[0])
-		}
 		return typeFloat64, true, nil
-	case name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC":
-		if k := args[0].Kind; !k.isNumeric() && k != KindNull {
-			return ColType{}, true, errorf(adbc.StatusInvalidArgument, "the fraction of %s must be a number, not %s", name, args[0].SQLName())
-		}
-		if name == "PERCENTILE_DISC" {
-			return keys[0], true, nil
-		}
-		return contType(keys[0])
-	case name == "MEDIAN":
-		return contType(args[0])
-	case name == "MODE":
+	case name == "PERCENTILE_CONT":
+		return contType(keys[0]), true, nil
+	case name == "PERCENTILE_DISC" || name == "MODE":
 		return keys[0], true, nil
+	case name == "MEDIAN":
+		return contType(args[0]), true, nil
 	}
 	return inferFuncType(f, args), true, nil
 }

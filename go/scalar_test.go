@@ -402,10 +402,10 @@ func TestScalarErrors(t *testing.T) {
 		{"GREATEST(DATE '2024-01-01', CAST(1 AS INTEGER))", "GREATEST types DATE and INTEGER cannot be matched"},
 		{"LEAST('a', 1)", "LEAST types VARCHAR and BIGINT cannot be matched"},
 		{"ROUND(1, 2, 3)", "ROUND expects 1 or 2 arguments"},
-		{"RANDOM(1)", "RANDOM expects 0 argument(s)"},
-		{"GREATEST()", "GREATEST expects at least 1 argument(s)"},
-		{"IIF(TRUE, 1)", "IIF expects 3 argument(s)"},
-		{"LEFT('abc')", "LEFT expects 2 argument(s)"},
+		{"RANDOM(1)", "RANDOM expects no arguments"},
+		{"GREATEST()", "GREATEST expects at least 1 argument"},
+		{"IIF(TRUE, 1)", "IIF expects 3 arguments"},
+		{"LEFT('abc')", "LEFT expects 2 arguments"},
 		{"MD5(DISTINCT 'a')", "MD5 does not accept * or DISTINCT"},
 	} {
 		if _, _, err := evalTestExpr(t, c.expr); err == nil || !strings.Contains(err.Error(), c.err) {

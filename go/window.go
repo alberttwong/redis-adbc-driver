@@ -283,11 +283,17 @@ func (w *WindowFunc) children() []Expr {
 	if w.Func.Filter != nil {
 		out = append(out, w.Func.Filter)
 	}
-	out = append(out, w.Over.PartitionBy...)
-	for _, o := range w.Over.OrderBy {
+	return append(out, windowSpecExprs(w.Over)...)
+}
+
+// windowSpecExprs returns the expressions of a window definition: its
+// PARTITION BY and ORDER BY expressions and its frame offsets.
+func windowSpecExprs(s *WindowSpec) []Expr {
+	out := slices.Clone(s.PartitionBy)
+	for _, o := range s.OrderBy {
 		out = append(out, o.Expr)
 	}
-	if f := w.Over.Frame; f != nil {
+	if f := s.Frame; f != nil {
 		for _, b := range []FrameBound{f.Start, f.End} {
 			if b.Offset != nil {
 				out = append(out, b.Offset)
@@ -314,12 +320,6 @@ func containsWindow(e Expr) bool {
 }
 
 // ---- planning ----
-
-// windowOnlyFuncs exist only as window functions (aggregates can be both).
-var windowOnlyFuncs = map[string]bool{
-	"ROW_NUMBER": true, "RANK": true, "DENSE_RANK": true, "PERCENT_RANK": true, "CUME_DIST": true,
-	"NTILE": true, "LAG": true, "LEAD": true, "FIRST_VALUE": true, "LAST_VALUE": true, "NTH_VALUE": true,
-}
 
 // windowCall is a window function of a query with its result type.
 type windowCall struct {
@@ -382,79 +382,31 @@ func checkWindow(w *WindowFunc, types map[string]ColType, params []ColType) erro
 			return errorf(adbc.StatusInvalidArgument, "window function calls cannot be nested")
 		}
 	}
+	// Binding has resolved the call (resolveCall); this is for windows that
+	// weren't bound.
+	if err := resolveCall(f, true); err != nil {
+		if err == errUnknownFunction {
+			return noSuchFunction(f.Name, f.Star, inferArgTypes(f.Args, types, params))
+		}
+		return err
+	}
 	if f.Distinct {
 		return errorf(adbc.StatusNotImplemented, "DISTINCT is not supported in window functions")
 	}
-	argErr := func(want string) error {
-		return errorf(adbc.StatusInvalidArgument, "window function %s expects %s", f.Name, want)
-	}
-	intArg := func(i int) error {
+	// The integer arguments the registry requires (NTILE's, and the offset
+	// of LAG, LEAD and NTH_VALUE).
+	d, _ := lookupFunc(f.Name)
+	for i, at := range d.args {
+		if at != argInt || i >= len(f.Args) {
+			continue
+		}
 		t, err := inferType(f.Args[i], types, params)
 		if err != nil {
 			return invalidArg(err)
 		}
-		if !t.Kind.isInteger() && t.Kind != KindNull {
+		if !at.accepts(t) {
 			return errorf(adbc.StatusInvalidArgument, "argument %d of %s must be an integer, not %s", i+1, f.Name, t.SQLName())
 		}
-		return nil
-	}
-	n := len(f.Args)
-	switch f.Name {
-	case "ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST":
-		if n != 0 || f.Star {
-			return argErr("no arguments")
-		}
-	case "NTILE":
-		if n != 1 {
-			return argErr("one argument")
-		}
-		if err := intArg(0); err != nil {
-			return err
-		}
-	case "LAG", "LEAD":
-		if n < 1 || n > 3 {
-			return argErr("1 to 3 arguments")
-		}
-		if n >= 2 {
-			if err := intArg(1); err != nil {
-				return err
-			}
-		}
-	case "FIRST_VALUE", "LAST_VALUE":
-		if n != 1 {
-			return argErr("one argument")
-		}
-	case "NTH_VALUE":
-		if n != 2 {
-			return argErr("two arguments")
-		}
-		if err := intArg(1); err != nil {
-			return err
-		}
-	case "COUNT":
-		if !f.Star && n != 1 {
-			return argErr("one argument or *")
-		}
-	case "SUM", "AVG", "MIN", "MAX", "BOOL_OR", "BOOL_AND", "EVERY", "ANY_VALUE",
-		"STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
-		if f.Star || n != 1 {
-			return argErr("one argument")
-		}
-	case "STRING_AGG":
-		if n != 2 {
-			return argErr("two arguments")
-		}
-	case "LISTAGG":
-		if n < 1 || n > 2 {
-			return argErr("one or two arguments")
-		}
-	case "PERCENTILE_CONT", "PERCENTILE_DISC", "MODE", "MEDIAN":
-		return errorf(adbc.StatusNotImplemented, "OVER is not supported for ordered-set aggregate %s", f.Name)
-	default:
-		return errorf(adbc.StatusInvalidArgument, "%s is not a window function or an aggregate (supported with OVER: "+
-			"ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, "+
-			"COUNT, SUM, AVG, MIN, MAX, STRING_AGG, LISTAGG, BOOL_OR, BOOL_AND, EVERY, ANY_VALUE, "+
-			"STDDEV, STDDEV_SAMP, STDDEV_POP, VARIANCE, VAR_SAMP, VAR_POP)", f.Name)
 	}
 	switch {
 	case f.Filter != nil && windowOnlyFuncs[f.Name]:
@@ -469,9 +421,6 @@ func checkWindow(w *WindowFunc, types map[string]ColType, params []ColType) erro
 	}
 	return checkFrame(w, types, params)
 }
-
-// nullTreatmentFuncs take IGNORE NULLS / RESPECT NULLS.
-var nullTreatmentFuncs = map[string]bool{"LAG": true, "LEAD": true, "FIRST_VALUE": true, "LAST_VALUE": true, "NTH_VALUE": true}
 
 var frameUnitNames = map[FrameUnit]string{FrameRows: "ROWS", FrameRange: "RANGE", FrameGroups: "GROUPS"}
 

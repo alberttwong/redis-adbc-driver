@@ -824,6 +824,15 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		}
 		plan.qualify = qualify
 	}
+	// The WINDOW clause's definitions are bound even if no call uses them,
+	// as in Postgres (those that are used were bound with their calls).
+	for _, nw := range sel.Windows {
+		for _, x := range windowSpecExprs(nw.Spec) {
+			if err := e.bind(ctx, x); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := e.planWindows(plan, types); err != nil {
 		return nil, err
 	}

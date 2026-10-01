@@ -580,11 +580,12 @@ func (r *groupingRewriter) node(e Expr) Expr {
 // grouping rewrites a GROUPING(…) call into the column holding its value.
 func (r *groupingRewriter) grouping(f *Func) Expr {
 	gp := r.gp
-	switch {
-	case f.Star || f.Distinct || len(f.Args) == 0:
-		r.fail(errorf(adbc.StatusInvalidArgument, "GROUPING expects one or more grouping expressions"))
+	d, _ := lookupFunc(f.Name)
+	if err := d.argsError(f); err != nil { // checked when bound, too
+		r.fail(err)
 		return f
-	case len(f.Args) > maxGroupingArgs:
+	}
+	if len(f.Args) > maxGroupingArgs {
 		r.fail(errorf(adbc.StatusInvalidArgument, "GROUPING must have fewer than %d arguments", maxGroupingArgs+1))
 		return f
 	}

@@ -26,13 +26,15 @@ package redis
 //	          numeric_precision, numeric_scale, datetime_precision,
 //	          is_indexed, comment)
 //	views    (table_catalog, table_schema, table_name, view_definition)
+//	routines (routine_catalog, routine_schema, routine_name, routine_type,
+//	          function_kind, min_arguments, max_arguments, alias_of)
 //
 // The connection's own temporary tables and views are included under schema
 // pg_temp (temporary tables with table_type LOCAL TEMPORARY, as in
 // Postgres); other connections' temporary objects are not. key_prefix and
 // index_name are a table's row key prefix and RediSearch index (NULL for
 // views). comment is the COMMENT ON text of a table, view or column (NULL
-// without one).
+// without one). routines lists the driver's functions (see routineRows).
 
 import (
 	"context"
@@ -82,6 +84,16 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "table_schema", Type: typeString},
 		{Name: "table_name", Type: typeString},
 		{Name: "view_definition", Type: typeString},
+	},
+	"routines": {
+		{Name: "routine_catalog", Type: typeString},
+		{Name: "routine_schema", Type: typeString},
+		{Name: "routine_name", Type: typeString},
+		{Name: "routine_type", Type: typeString},
+		{Name: "function_kind", Type: typeString},
+		{Name: "min_arguments", Type: typeInt32},
+		{Name: "max_arguments", Type: typeInt32},
+		{Name: "alias_of", Type: typeString},
 	},
 }
 
@@ -146,6 +158,9 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 	}
 	if e.planOnly {
 		return memTable(key, cols, nil, nil) // only its columns are wanted (see empty.go)
+	}
+	if key == "routines" {
+		return memTable(key, cols, routineRows(), nil)
 	}
 	schemas, err := e.store.listSchemas(ctx)
 	if err != nil {
