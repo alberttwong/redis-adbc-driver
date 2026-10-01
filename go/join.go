@@ -145,7 +145,7 @@ func (jp *joinPlan) finish() (*tableMeta, []relation) {
 	for i, it := range jp.items {
 		for _, c := range it.base.Columns {
 			joined.Columns = append(joined.Columns, columnMeta{
-				Name: it.prefix + c.Name, Field: c.Name, Type: c.Type, Nullable: true,
+				Name: it.prefix + c.Name, label: c.Name, Type: c.Type, Nullable: true,
 			})
 		}
 		rels[i] = relation{name: it.alias, meta: it.base, prefix: it.prefix}

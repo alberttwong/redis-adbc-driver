@@ -76,7 +76,7 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 				return nil, err
 			}
 			for _, c := range cols {
-				ret.items = append(ret.items, planItem{expr: &ColumnRef{Name: c.Name}, name: outputName(c, joined), typ: c.Type})
+				ret.items = append(ret.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.outputName(), typ: c.Type})
 			}
 			continue
 		}
@@ -99,7 +99,7 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 			if c, ok := it.Expr.(*ColumnRef); ok {
 				name = c.Name
 				if col, ok := star.column(c.Name); ok {
-					name = outputName(col, joined)
+					name = col.outputName()
 				}
 			}
 		}
@@ -113,15 +113,6 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 	}
 	e.returning = ret
 	return ret, nil
-}
-
-// outputName is the name of a column in a result: its own name, also in a
-// join, where the relation names it alias.column.
-func outputName(c columnMeta, joined bool) string {
-	if joined {
-		return c.field()
-	}
-	return c.Name
 }
 
 // add evaluates the list for a changed row, keyed like the rows of the
