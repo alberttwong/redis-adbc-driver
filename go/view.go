@@ -26,10 +26,10 @@ package redis
 // plans the view's SELECT (in the view's schema, without the caller's CTEs or
 // scopes):
 //
-//   - A simple view (one table, no GROUP BY / aggregates / LIMIT / OFFSET) is
-//     lazy: predicates the outer query applies to the view are rewritten in
-//     terms of the base table and pushed into the base table's index scan
-//     together with the view's own WHERE.
+//   - A simple view (one table, no GROUP BY / aggregates / window functions /
+//     LIMIT / OFFSET) is lazy: predicates the outer query applies to the view
+//     are rewritten in terms of the base table and pushed into the base
+//     table's index scan together with the view's own WHERE.
 //   - Any other view is computed once per statement, like a derived table.
 //
 // A temporary view (CREATE TEMP VIEW) lives in the connection's temporary
@@ -365,7 +365,9 @@ func (e *executor) viewRelation(ctx context.Context, v *viewMeta, alias string) 
 
 func isSimpleView(plan *selectPlan) bool {
 	sel := plan.sel
-	return plan.meta != nil && !plan.meta.isMem && !plan.aggregate &&
+	// Outer filters can't be pushed below window functions: they would
+	// change the rows the windows see.
+	return plan.meta != nil && !plan.meta.isMem && !plan.aggregate && !plan.windowed() &&
 		len(sel.Joins) == 0 && sel.Limit == nil && sel.Offset == nil
 }
 

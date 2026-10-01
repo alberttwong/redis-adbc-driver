@@ -110,6 +110,9 @@ func (e *executor) bindWhere(ctx context.Context, where Expr) error {
 	if isAggregate(where) {
 		return errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHERE")
 	}
+	if containsWindow(where) {
+		return errWindowPlacement()
+	}
 	return e.bind(ctx, where)
 }
 
@@ -134,6 +137,9 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 	}
 	need := map[string]bool{}
 	for _, s := range st.Sets {
+		if containsWindow(s.Expr) {
+			return 0, errWindowPlacement()
+		}
 		if err := e.bind(ctx, s.Expr); err != nil {
 			return 0, err
 		}
@@ -362,6 +368,9 @@ func (e *executor) bindMergeClause(ctx context.Context, c *MergeClause, need map
 		exprs = append(exprs, s.Expr)
 	}
 	for _, x := range exprs {
+		if containsWindow(x) {
+			return errWindowPlacement()
+		}
 		if err := e.bind(ctx, x); err != nil {
 			return err
 		}

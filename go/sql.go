@@ -110,6 +110,66 @@ type Func struct {
 	Distinct bool
 }
 
+// WindowFunc is a window function call, fn(args) OVER (…). Over is fully
+// resolved by the parser: references to named windows are replaced by the
+// definitions they refer to.
+type WindowFunc struct {
+	Func *Func
+	Over *WindowSpec
+}
+
+func (*WindowFunc) exprNode() {}
+
+// WindowSpec is a window definition: [PARTITION BY …] [ORDER BY …] [frame].
+type WindowSpec struct {
+	// Ref names a window of the query's WINDOW clause this one is based on
+	// (`OVER w` or `OVER (w ORDER BY …)`); it is empty once resolved.
+	Ref         string
+	PartitionBy []Expr
+	OrderBy     []OrderItem
+	Frame       *WindowFrame // nil: the default frame
+	bare        bool         // OVER w, without parentheses
+}
+
+// FrameUnit is the unit of a window frame.
+type FrameUnit int
+
+const (
+	FrameRows FrameUnit = iota
+	FrameRange
+	FrameGroups
+)
+
+// BoundKind is the kind of a window frame bound.
+type BoundKind int
+
+const (
+	BoundUnboundedPreceding BoundKind = iota
+	BoundPreceding
+	BoundCurrentRow
+	BoundFollowing
+	BoundUnboundedFollowing
+)
+
+// FrameBound is one end of a window frame; Offset is set for n PRECEDING and
+// n FOLLOWING.
+type FrameBound struct {
+	Kind   BoundKind
+	Offset Expr
+}
+
+// WindowFrame is `{ROWS | RANGE | GROUPS} BETWEEN start AND end`.
+type WindowFrame struct {
+	Unit       FrameUnit
+	Start, End FrameBound
+}
+
+// NamedWindow is one `name AS (…)` of a WINDOW clause.
+type NamedWindow struct {
+	Name string
+	Spec *WindowSpec
+}
+
 func (*Literal) exprNode()   {}
 func (*ColumnRef) exprNode() {}
 func (*Param) exprNode()     {}
@@ -202,6 +262,8 @@ type SelectStmt struct {
 	Where      Expr
 	GroupBy    []Expr
 	Having     Expr
+	Windows    []NamedWindow // WINDOW clause
+	Qualify    Expr          // filters rows after window functions
 	OrderBy    []OrderItem
 	Limit      *int64
 	Offset     *int64
@@ -764,6 +826,7 @@ var reservedAfterExpr = map[string]bool{
 	"INTERSECT": true, "EXCEPT": true, "MINUS": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
+	"WINDOW": true, "QUALIFY": true,
 }
 
 // isQueryStart reports whether the next token begins a (sub)query.
@@ -891,32 +954,11 @@ func (p *parser) parseSelectBody(with []CTE) (Stmt, error) {
 	// query (the combined result of a set operation).
 	sel := &SelectStmt{}
 	if p.acceptKeyword("ORDER", "BY") {
-		for {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			item := OrderItem{Expr: e}
-			if p.acceptKeyword("DESC") {
-				item.Desc = true
-			} else {
-				p.acceptKeyword("ASC")
-			}
-			if p.acceptKeyword("NULLS") {
-				switch {
-				case p.acceptKeyword("FIRST"):
-					item.Nulls = NullsFirst
-				case p.acceptKeyword("LAST"):
-					item.Nulls = NullsLast
-				default:
-					return nil, syntaxErr("expected FIRST or LAST after NULLS")
-				}
-			}
-			sel.OrderBy = append(sel.OrderBy, item)
-			if !p.acceptOp(",") {
-				break
-			}
+		items, err := p.parseOrderItems()
+		if err != nil {
+			return nil, err
 		}
+		sel.OrderBy = items
 	}
 	for {
 		if p.acceptKeyword("LIMIT") {
@@ -958,7 +1000,46 @@ func (p *parser) parseSelectBody(with []CTE) (Stmt, error) {
 	if hasOuter {
 		body.OrderBy, body.Limit, body.Offset = sel.OrderBy, sel.Limit, sel.Offset
 	}
+	if body.SetOp == nil {
+		// ORDER BY may call window functions over the query's named windows.
+		for _, o := range body.OrderBy {
+			if err := resolveWindowRefs(body.Windows, o.Expr); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return body, nil
+}
+
+// parseOrderItems parses `expr [ASC | DESC] [NULLS FIRST | LAST], …`.
+func (p *parser) parseOrderItems() ([]OrderItem, error) {
+	var items []OrderItem
+	for {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		item := OrderItem{Expr: e}
+		if p.acceptKeyword("DESC") {
+			item.Desc = true
+		} else {
+			p.acceptKeyword("ASC")
+		}
+		if p.acceptKeyword("NULLS") {
+			switch {
+			case p.acceptKeyword("FIRST"):
+				item.Nulls = NullsFirst
+			case p.acceptKeyword("LAST"):
+				item.Nulls = NullsLast
+			default:
+				return nil, syntaxErr("expected FIRST or LAST after NULLS")
+			}
+		}
+		items = append(items, item)
+		if !p.acceptOp(",") {
+			return items, nil
+		}
+	}
 }
 
 // parseSetExpr parses branches combined with UNION / EXCEPT (left to right),
@@ -1086,6 +1167,33 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 			return nil, err
 		}
 		sel.Having = e
+	}
+	// WINDOW and QUALIFY, in either order.
+	for {
+		if sel.Windows == nil && p.acceptKeyword("WINDOW") {
+			if err := p.parseWindowClause(sel); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if sel.Qualify == nil && p.acceptKeyword("QUALIFY") {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			sel.Qualify = e
+			continue
+		}
+		break
+	}
+	exprs := []Expr{sel.Qualify}
+	for _, it := range sel.Items {
+		exprs = append(exprs, it.Expr)
+	}
+	for _, e := range exprs {
+		if err := resolveWindowRefs(sel.Windows, e); err != nil {
+			return nil, err
+		}
 	}
 	return sel, nil
 }
@@ -2372,6 +2480,13 @@ func (p *parser) parsePrimary() (Expr, error) {
 			}
 			if err := p.expectOp(")"); err != nil {
 				return nil, err
+			}
+			if p.acceptKeyword("OVER") {
+				spec, err := p.parseOver()
+				if err != nil {
+					return nil, err
+				}
+				return &WindowFunc{Func: f, Over: spec}, nil
 			}
 			return f, nil
 		}

@@ -106,6 +106,9 @@ func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, name 
 	if err := e.bind(ctx, expr); err != nil {
 		return nil, err
 	}
+	if containsWindow(expr) {
+		return nil, errWindowPlacement()
+	}
 	return sc.needs, nil
 }
 
@@ -122,6 +125,12 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 			err = e.resolveColumn(v)
 		case *Subquery:
 			err = e.planSubquery(ctx, v)
+		case *Func:
+			// A window call's own *Func is not visited, so this is a call
+			// without OVER.
+			if windowOnlyFuncs[v.Name] {
+				err = errorf(adbc.StatusInvalidArgument, "window function %s requires an OVER clause", v.Name)
+			}
 		}
 	})
 	return err
