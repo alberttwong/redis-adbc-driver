@@ -38,6 +38,10 @@ type ColumnRef struct {
 	Qualifier string
 	Outer     int
 	OuterType ColType
+	// written is the name as written; binding always resolves from it, so
+	// binding a node twice (it may be shared, e.g. by an expanded IN list)
+	// gives the same result.
+	written string
 }
 
 // Subquery is a SELECT used as an expression: a scalar subquery
@@ -630,7 +634,7 @@ var reservedAfterExpr = map[string]bool{
 	"OFFSET": true, "AND": true, "OR": true, "NOT": true, "AS": true, "IS": true,
 	"ASC": true, "DESC": true, "HAVING": true, "UNION": true, "NULLS": true,
 	"LIKE": true, "IN": true, "BETWEEN": true, "SET": true, "VALUES": true,
-	"WHEN": true, "THEN": true, "ELSE": true, "END": true,
+	"WHEN": true, "THEN": true, "ELSE": true, "END": true, "ILIKE": true, "ESCAPE": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
 }
@@ -1470,6 +1474,33 @@ func (p *parser) parseComparison() (Expr, error) {
 				return nil, syntaxErr("expected NULL after IS")
 			}
 			l = &IsNull{X: l, Not: not}
+			continue
+		}
+		if p.isKeyword("LIKE") || p.isKeyword("ILIKE") ||
+			(p.isKeyword("NOT") && (p.isKeywordAt(1, "LIKE") || p.isKeywordAt(1, "ILIKE"))) {
+			not := p.acceptKeyword("NOT")
+			name := "LIKE"
+			if p.acceptKeyword("ILIKE") {
+				name = "ILIKE"
+			} else {
+				p.acceptKeyword("LIKE")
+			}
+			pat, err := p.parseAdditive()
+			if err != nil {
+				return nil, err
+			}
+			f := &Func{Name: name, Args: []Expr{l, pat}}
+			if p.acceptKeyword("ESCAPE") {
+				esc, err := p.parseAdditive()
+				if err != nil {
+					return nil, err
+				}
+				f.Args = append(f.Args, esc)
+			}
+			l = f
+			if not {
+				l = &Unary{Op: "NOT", X: f}
+			}
 			continue
 		}
 		if p.isKeyword("BETWEEN") || (p.isKeyword("NOT") && p.isKeywordAt(1, "BETWEEN")) {

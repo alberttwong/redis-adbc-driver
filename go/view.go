@@ -81,6 +81,9 @@ func (s *store) viewExists(ctx context.Context, schema, name string) (bool, erro
 }
 
 func (s *store) putView(ctx context.Context, v *viewMeta) error {
+	if isInfoSchema(v.Schema) {
+		return infoSchemaReadOnly()
+	}
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return errorf(adbc.StatusInternal, "failed to encode view: %v", err)

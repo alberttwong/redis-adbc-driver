@@ -126,6 +126,10 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 }
 
 func (e *executor) resolveColumn(c *ColumnRef) error {
+	if c.written == "" {
+		c.written = c.Name
+	}
+	c.Name = c.written
 	top := len(e.scopes) - 1
 	for depth := 0; depth <= top; depth++ {
 		sc := e.scopes[top-depth]
@@ -300,6 +304,10 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 	case table != nil:
 		if alias == "" {
 			alias = table.Name
+		}
+		if isInfoSchema(table.Schema) && (table.Catalog == "" || table.Catalog == catalogName) {
+			meta, err := e.infoSchemaTable(ctx, table.Name)
+			return meta, alias, err
 		}
 		if table.Schema == "" && table.Catalog == "" {
 			if def := e.lookupCTE(table.Name); def != nil {

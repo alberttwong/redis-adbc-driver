@@ -238,6 +238,13 @@ SELECT order_id, customer_id, country, product, quantity FROM sales WHERE status
 SELECT COUNT(*) FROM shipped_sales WHERE country = 'JPN' AND quantity >= 15;
 DROP VIEW shipped_sales;
 
+-- information_schema: which columns of sales are indexed?
+SELECT column_name, data_type, is_nullable, is_indexed
+FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position;
+
+-- LIKE; a prefix pattern on an indexed column is an index prefix query
+SELECT COUNT(*) FROM sales WHERE product LIKE 'gi%';
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -320,6 +327,7 @@ How SQL is executed:
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" LOAD 1 @__key SORTBY … LIMIT … WITHCURSOR`, then pipelined `HMGET` of only the needed columns |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
+| `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
@@ -372,11 +380,16 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   where an item is a table, a CTE, or `(SELECT …)`, each with an optional
   alias (`t.col` qualifies a column),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
-  `CAST`, `IS [NOT] NULL`, subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `CAST`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
 - `SELECT` without `FROM` for literal expressions
+- `information_schema` (read-only, built from the driver's metadata when
+  queried): `schemata`, `tables` (`BASE TABLE` / `VIEW`), `columns`
+  (`ordinal_position`, `data_type`, `is_nullable`, `numeric_precision`,
+  `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
+  (`view_definition`). Any SQL works on them, including joins
 - `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
   comparisons, `UNION`/`INTERSECT`/`EXCEPT`, window functions
