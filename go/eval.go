@@ -41,6 +41,8 @@ type evalEnv struct {
 	// the window input; winRow is the current row's position in it.
 	win    map[*WindowFunc][]Value
 	winRow int
+	// action is merge_action() while MERGE … RETURNING evaluates a row.
+	action string
 }
 
 var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true}
@@ -85,6 +87,8 @@ func walkExpr(e Expr, fn func(Expr)) {
 	case *Subquery:
 		// The body is a separate scope; only the IN operand belongs here.
 		walkExpr(x.X, fn)
+	case *RowColumn:
+		walkExpr(x.Sub, fn)
 	case *WindowFunc:
 		// The call itself is not visited as a *Func: SUM(x) OVER (…) is not
 		// an aggregate, but aggregates in its arguments (SUM(COUNT(*))) are.
@@ -267,6 +271,8 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		return env.evalCase(x)
 	case *Subquery:
 		return env.evalSubquery(x)
+	case *RowColumn:
+		return env.evalRowColumn(x)
 	case *WindowFunc:
 		vals, ok := env.win[x]
 		if !ok {
@@ -329,6 +335,9 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			return v, nil
 		}
 		return Value{}, fmt.Errorf("aggregate %s is not allowed here", f.Name)
+	}
+	if f.Name == "MERGE_ACTION" {
+		return env.mergeAction()
 	}
 	if err := checkArity(f); err != nil {
 		return Value{}, err
@@ -657,6 +666,8 @@ func inferFuncType(f *Func, args []ColType) ColType {
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
 		return typeBinary
 	case "TO_HEX", "HEX", "LOWER", "LCASE", "UPPER", "UCASE", "CONCAT", "CONCAT_WS":
+		return typeString
+	case "MERGE_ACTION":
 		return typeString
 	case "AVG":
 		return typeFloat64

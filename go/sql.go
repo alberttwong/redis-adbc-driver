@@ -51,6 +51,9 @@ type Subquery struct {
 	Kind   SubqueryKind
 	X      Expr // IN operand
 	Not    bool // NOT IN
+	// Width is set for a scalar subquery assigned to a column list (UPDATE
+	// … SET (a, b) = (SELECT …)): the number of columns it must return.
+	Width int
 
 	// Set while binding.
 	plan       *selectPlan
@@ -77,6 +80,15 @@ type outerRef struct {
 	name string
 	up   int
 }
+
+// RowColumn is column Index of the row returned by a subquery assigned to a
+// column list: SET (a, b) = (SELECT x, y …) sets a to RowColumn 0 and b to
+// RowColumn 1 of the same subquery, which runs once per row.
+type RowColumn struct {
+	Sub   *Subquery
+	Index int
+}
+
 type Param struct{ Index int }
 type Unary struct {
 	Op string
@@ -190,6 +202,7 @@ func (*Cast) exprNode()      {}
 func (*Func) exprNode()      {}
 func (*Case) exprNode()      {}
 func (*Subquery) exprNode()  {}
+func (*RowColumn) exprNode() {}
 
 type TableName struct {
 	Catalog string
@@ -295,6 +308,8 @@ type InsertStmt struct {
 	// DefaultValues is set for INSERT INTO … DEFAULT VALUES (one row of
 	// column defaults).
 	DefaultValues bool
+	// Returning is the RETURNING list (written like a select list), if any.
+	Returning []SelectItem
 }
 
 // DefaultValue is the DEFAULT keyword written in place of a value in INSERT
@@ -358,14 +373,16 @@ type DropTableStmt struct {
 }
 
 // SetClause is one `column = expr` of a SET list. Qualifier is the optional
-// target table or alias written before the column (`t.col = …`).
+// target table or alias written before the column (`t.col = …`). A column
+// list assignment `(a, b) = …` is parsed into one SetClause per column.
 type SetClause struct {
 	Qualifier string
 	Column    string
 	Expr      Expr
 }
 
-// UpdateStmt is [WITH …] UPDATE t [[AS] alias] SET … [FROM …] [WHERE …].
+// UpdateStmt is [WITH …] UPDATE t [[AS] alias] SET … [FROM …] [WHERE …]
+// [RETURNING …].
 type UpdateStmt struct {
 	With  []CTE
 	Table TableName
@@ -375,20 +392,25 @@ type UpdateStmt struct {
 	// the first has an empty Kind, the rest are joins or comma items.
 	From  []JoinClause
 	Where Expr
+	// Returning is the RETURNING list, if any.
+	Returning []SelectItem
 }
 
-// DeleteStmt is [WITH …] DELETE FROM t [[AS] alias] [USING …] [WHERE …];
-// Using holds the items like UpdateStmt.From.
+// DeleteStmt is [WITH …] DELETE FROM t [[AS] alias] [USING …] [WHERE …]
+// [RETURNING …]; Using holds the items like UpdateStmt.From.
 type DeleteStmt struct {
 	With  []CTE
 	Table TableName
 	Alias string
 	Using []JoinClause
 	Where Expr
+	// Returning is the RETURNING list, if any.
+	Returning []SelectItem
 }
 
 // MergeStmt is [WITH …] MERGE INTO t [[AS] alias] USING source ON cond
-// followed by WHEN clauses. Source is a FROM item (Kind is empty).
+// followed by WHEN clauses and an optional RETURNING list. Source is a FROM
+// item (Kind is empty).
 type MergeStmt struct {
 	With    []CTE
 	Table   TableName
@@ -396,6 +418,8 @@ type MergeStmt struct {
 	Source  JoinClause
 	On      Expr
 	Clauses []MergeClause
+	// Returning is the RETURNING list, if any.
+	Returning []SelectItem
 }
 
 // MergeMatch says which rows a WHEN clause applies to.
@@ -686,6 +710,9 @@ func ParseScript(src string) ([]ParsedStmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := p.parseReturning(stmt); err != nil {
+			return nil, err
+		}
 		end := p.peek().pos
 		if !p.isOp(";") && p.peek().kind != tokEOF {
 			return nil, syntaxErr("unexpected %q", p.peek().text)
@@ -855,7 +882,7 @@ var reservedAfterExpr = map[string]bool{
 	"INTERSECT": true, "EXCEPT": true, "MINUS": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
-	"WINDOW": true, "QUALIFY": true,
+	"WINDOW": true, "QUALIFY": true, "RETURNING": true,
 }
 
 // isQueryStart reports whether the next token begins a (sub)query.
@@ -1802,10 +1829,22 @@ func (p *parser) parseUpdate() (*UpdateStmt, error) {
 	return st, nil
 }
 
-// parseSetList parses `[qualifier.]column = expr, …`.
+// parseSetList parses `[qualifier.]column = expr, …`, where an item may
+// also assign a row to a column list (see parseRowAssignment).
 func (p *parser) parseSetList() ([]SetClause, error) {
 	var sets []SetClause
 	for {
+		if p.isOp("(") {
+			row, err := p.parseRowAssignment()
+			if err != nil {
+				return nil, err
+			}
+			sets = append(sets, row...)
+			if !p.acceptOp(",") {
+				return sets, nil
+			}
+			continue
+		}
 		col, err := p.parseIdent()
 		if err != nil {
 			return nil, err
@@ -1826,6 +1865,126 @@ func (p *parser) parseSetList() ([]SetClause, error) {
 		sets = append(sets, s)
 		if !p.acceptOp(",") {
 			return sets, nil
+		}
+	}
+}
+
+// parseRowAssignment parses `([qualifier.]column, …) = source` in a SET
+// list. As in Postgres, the source is a row constructor, `ROW(…)` or `(x, y,
+// …)` with at least two values, or a subquery returning one row of a value
+// per column. It returns a SetClause per column, set to its value of the row
+// constructor or to a RowColumn of the (shared) subquery.
+func (p *parser) parseRowAssignment() ([]SetClause, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var sets []SetClause
+	for {
+		col, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		s := SetClause{Column: col}
+		if p.acceptOp(".") {
+			if s.Column, err = p.parseIdent(); err != nil {
+				return nil, err
+			}
+			s.Qualifier = col
+		}
+		sets = append(sets, s)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if err := p.expectOp("="); err != nil {
+		return nil, err
+	}
+	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH")) {
+		p.pos++
+		sel, err := p.parseSubquery()
+		if err != nil {
+			return nil, err
+		}
+		sq := &Subquery{Select: sel, Kind: SubqueryScalar, Width: len(sets)}
+		for i := range sets {
+			sets[i].Expr = &RowColumn{Sub: sq, Index: i}
+		}
+		return sets, nil
+	}
+	explicit := p.isKeyword("ROW") && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "("
+	if explicit {
+		p.pos++
+	}
+	if !p.acceptOp("(") {
+		return nil, &sqlError{msg: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"}
+	}
+	var values []Expr
+	for !p.isOp(")") {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, e)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if !explicit && len(values) < 2 {
+		// A single parenthesized value is just that value, not a row.
+		return nil, &sqlError{msg: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"}
+	}
+	if len(values) != len(sets) {
+		return nil, &sqlError{msg: "number of columns does not match number of values"}
+	}
+	for i := range sets {
+		sets[i].Expr = values[i]
+	}
+	return sets, nil
+}
+
+// parseReturning parses the RETURNING list that may end an INSERT, UPDATE,
+// DELETE or MERGE, written like a select list (`*`, `t.*`, `expr [[AS]
+// alias]`), into the statement.
+func (p *parser) parseReturning(st Stmt) error {
+	var list *[]SelectItem
+	switch st := st.(type) {
+	case *InsertStmt:
+		list = &st.Returning
+	case *UpdateStmt:
+		list = &st.Returning
+	case *DeleteStmt:
+		list = &st.Returning
+	case *MergeStmt:
+		list = &st.Returning
+	}
+	if list == nil || !p.acceptKeyword("RETURNING") {
+		return nil
+	}
+	for {
+		start := p.peek().pos
+		if p.acceptOp("*") {
+			*list = append(*list, SelectItem{Star: true, Text: "*"})
+		} else if q, ok := p.parseQualifiedStar(); ok {
+			*list = append(*list, SelectItem{Star: true, StarOf: q, Text: strings.TrimSpace(p.src[start:p.toks[p.pos-1].end])})
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			item := SelectItem{Expr: e, Text: strings.TrimSpace(p.src[start:p.toks[p.pos-1].end])}
+			if item.Alias, err = p.parseAlias(); err != nil {
+				return err
+			}
+			*list = append(*list, item)
+		}
+		if !p.acceptOp(",") {
+			return nil
 		}
 	}
 }

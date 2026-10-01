@@ -45,6 +45,9 @@ type executor struct {
 	// noTemp stops unqualified names from resolving to temporary objects
 	// (inside permanent views).
 	noTemp bool
+	// returning is the RETURNING list of the INSERT, UPDATE, DELETE or
+	// MERGE being run (see returning.go).
+	returning *returning
 }
 
 // execResult is the outcome of one statement.
@@ -137,6 +140,7 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (execResult, error) {
 	e.cache = newExecCache()
 	e.params, e.paramTypes = params, paramTypes
+	e.returning = nil
 	if e.now.IsZero() {
 		e.now = time.Now().UTC()
 	}
@@ -152,17 +156,13 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		}
 		return execResult{isQuery: true, cols: plan.columns(), rows: rows, affected: int64(len(rows))}, nil
 	case *InsertStmt:
-		n, err := e.runInsert(ctx, st, params)
-		return execResult{affected: n}, err
+		return e.dmlResult(e.runInsert(ctx, st, params))
 	case *UpdateStmt:
-		n, err := e.runUpdate(ctx, st, params)
-		return execResult{affected: n}, err
+		return e.dmlResult(e.runUpdate(ctx, st, params))
 	case *DeleteStmt:
-		n, err := e.runDelete(ctx, st, params)
-		return execResult{affected: n}, err
+		return e.dmlResult(e.runDelete(ctx, st, params))
 	case *MergeStmt:
-		n, err := e.runMerge(ctx, st, params)
-		return execResult{affected: n}, err
+		return e.dmlResult(e.runMerge(ctx, st, params))
 	case *CreateTableStmt:
 		if st.AsSelect != nil {
 			n, err := e.runCreateTableAs(ctx, st)
@@ -367,6 +367,9 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 	if err != nil {
 		return 0, err
 	}
+	if _, err := e.planReturning(ctx, st.Returning, []relation{{name: meta.Name, meta: meta}}, meta, false, nil); err != nil {
+		return 0, err
+	}
 	if st.Select != nil {
 		return e.insertSelect(ctx, st, meta, targets)
 	}
@@ -392,7 +395,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 		}
 		rows = append(rows, row)
 	}
-	return e.store.insertRows(ctx, meta, rows)
+	return e.insertRows(ctx, meta, rows)
 }
 
 // insertTargets resolves an INSERT column list (all columns if empty) to
@@ -481,7 +484,7 @@ func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *table
 		}
 		rows[r] = row
 	}
-	return e.store.insertRows(ctx, meta, rows)
+	return e.insertRows(ctx, meta, rows)
 }
 
 // ---- SELECT ----
@@ -1123,6 +1126,10 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 		columnRefs(s.Expr, need)
 		maps.Copy(need, needs)
 	}
+	ret, err := e.planReturning(ctx, st.Returning, []relation{{name: name, meta: meta}}, meta, false, need)
+	if err != nil {
+		return 0, err
+	}
 	keys, rows, err := e.matchRows(ctx, meta, name, st.Where, params, need)
 	if err != nil {
 		return 0, err
@@ -1136,6 +1143,9 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 			return 0, err
 		}
 		changes[r] = newRowChange(meta, key, cols, vals)
+		if err := ret.addChanged(rows[r], meta, "", cols, vals, ""); err != nil {
+			return 0, err
+		}
 	}
 	if err := e.writeUpdates(ctx, changes); err != nil {
 		return 0, err
@@ -1160,9 +1170,19 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 	if name == "" {
 		name = meta.Name
 	}
-	keys, _, err := e.matchRows(ctx, meta, name, st.Where, params, nil)
+	need := map[string]bool{}
+	ret, err := e.planReturning(ctx, st.Returning, []relation{{name: name, meta: meta}}, meta, false, need)
 	if err != nil {
 		return 0, err
+	}
+	keys, rows, err := e.matchRows(ctx, meta, name, st.Where, params, need)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		if err := ret.add(row, ""); err != nil {
+			return 0, err
+		}
 	}
 	if err := e.deleteKeys(ctx, keys); err != nil {
 		return 0, err

@@ -738,6 +738,15 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   that matches several FROM / USING rows is updated or deleted once. For
   UPDATE the matches must give the same new values, otherwise it's an error
   (Postgres silently uses one of them)
+- `UPDATE … SET (a, b) = …` assigns a row to a column list, as in Postgres,
+  also in `UPDATE … FROM` and in MERGE's `UPDATE SET`. The row is
+  `(x, y, …)`, `ROW(x, …)` (also for a single column) or a subquery
+  `(SELECT x, y …)`, which must return as many columns ("number of columns
+  does not match number of values") and at most one row: no row sets the
+  columns to NULL, more than one is an error. The subquery runs once per
+  row (once in all if it isn't correlated), not once per column. As with
+  `col = …`, every value is computed from the row before the change, so
+  `SET (a, b) = (b, a)` swaps
 - `[WITH …] MERGE INTO t [[AS] a] USING item [[AS] s] ON cond` followed by
   any number of
   - `WHEN MATCHED [AND cond] THEN UPDATE SET … | DELETE | DO NOTHING`
@@ -756,8 +765,37 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   never match. The result is the number of rows inserted, updated and
   deleted. `INSERT` gives the columns it leaves out (or sets to `DEFAULT`)
   their defaults, and `INSERT DEFAULT VALUES` inserts a row of defaults
+- `RETURNING …` at the end of `INSERT`, `UPDATE`, `DELETE` and `MERGE`,
+  written like a select list: `*`, `t.*`, and expressions with optional
+  aliases, including subqueries (aggregates and window functions are not
+  allowed, as in Postgres). It reads the target's columns, and in
+  `UPDATE … FROM`, `DELETE … USING` and `MERGE` the other items' too. As in
+  Postgres, `*` lists the target's columns first, then the FROM / USING
+  items'; in `MERGE`, the source's columns, then the target's. The
+  statement returns one row per row it changed (`INSERT`: in `VALUES` or
+  query order; otherwise in no particular order):
+  - `INSERT`: the new row as stored (cast to the column types);
+    `RETURNING __rowid` gives the row id it was given
+  - `UPDATE`: the row after the change
+  - `DELETE`: the deleted row
+  - `MERGE`: each row inserted, updated or deleted, with the source row it
+    came from (NULLs for `WHEN NOT MATCHED BY SOURCE`); `merge_action()`
+    (Postgres 17) is `'INSERT'`, `'UPDATE'` or `'DELETE'`
+
+  The list is computed with the other checks, before anything is written, so
+  an error in it leaves the table untouched, and its subqueries see the
+  tables as they were before the statement. `ExecuteQuery` returns the rows
+  (with the RETURNING columns, also when no row changed); `ExecuteUpdate`
+  runs the statement and returns the number of rows changed, as Postgres
+  drivers do; `ExecuteSchema` returns the columns without running it. Without
+  `RETURNING`, `ExecuteQuery` on these statements still returns an empty
+  result with no columns, and the number of rows changed. `__rowid` can't be
+  read in the `RETURNING` list of `UPDATE … FROM`, `DELETE … USING` or
+  `MERGE` (as in any join), and `merge_action()` can't be called inside a
+  subquery
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
-  comparisons
+  comparisons, data-modifying statements in `WITH` (`WITH d AS (DELETE …
+  RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres 18)
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)
@@ -767,7 +805,7 @@ Tables can be qualified as `schema.table` or `redis.schema.table`, and
 namespaces (default `public`). There are no transactions (autocommit
 only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
 every change first (new values and casts, `NOT NULL`, MERGE's
-one-change-per-row rule), so such an error leaves the table untouched. Then
+one-change-per-row rule, `RETURNING`), so such an error leaves the table untouched. Then
 they write, in pipelined batches of up to 1,000 rows (`MERGE`: updates, then
 deletes, then inserts). If a write fails part-way, for example because the
 connection drops, the batches already written stay written, and other
