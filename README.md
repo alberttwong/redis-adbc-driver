@@ -480,6 +480,81 @@ Scale tips: keep column names short (they are repeated in every HASH), raise
 `hash-max-listpack-entries` / `hash-max-listpack-value` so small rows use the
 compact encoding, and index only the columns you filter or aggregate on.
 
+## Performance
+
+Measured with `go/examples/bench.py` (see below) on the sample data set
+scaled to **100,000 `sales` rows × 10 columns** and 50 `customers`.
+Setup: Apple M4 (10 cores, 16 GB), Docker Desktop, Redis 8.4.4 (Search
+8.4.10) in Docker on the same machine, driver at `main` after v0.0.3 plus the
+string-parameter fix. Times are the median of 5 runs after a warm-up, measured
+in Python and including the Arrow transfer; "Redis commands" are counted with
+`INFO commandstats` (summed over shards on the cluster). Numbers on a laptop
+vary from run to run; treat them as orders of magnitude.
+
+Bulk ingest (`adbc_ingest`): 100,000 rows in 1.5 s standalone (67,000 rows/s)
+and 1.7 s on a 3-shard cluster (59,000 rows/s).
+
+| Query | Rows out | Standalone (ms) | 3-shard cluster (ms) | Redis commands |
+|-|-:|-:|-:|-:|
+| Point lookup, `WHERE __rowid = N` | 1 | 1.4 | 15.7 | 2 |
+| Indexed TAG filters + `ORDER BY … LIMIT 10` | 10 | 14 | 30 | 12 |
+| `COUNT(*)` with an indexed range | 1 | 6.5 | 19 | 2 |
+| `COUNT(*)` with `ts >= TIMESTAMP … - INTERVAL '30 days'` | 1 | 15 | 1.8 | 2 |
+| `GROUP BY` with `COUNT` / integer `SUM` (index reduce) | 6 | 15 | 4.6 | 2 |
+| `UNION` of two indexed filters | 1,750 | 40 | 88 | 1,954 |
+| `COUNT(*)` on a view, filter pushed into its base table | 1 | 45 | 66 | 1,688 |
+| Selective join (index lookup join) + `GROUP BY` | 8 | 138 | 66 | 5,318 |
+| Correlated scalar subquery for each of 50 customers | 50 | 287 | 291 | 104 |
+| `COUNT(*)` with `LIKE 'gi%'` (index prefix query) | 1 | 428 | 383 | 20,125 |
+| Fetch 10% of the rows (indexed range) | 10,000 | 356 | 284 | 10,013 |
+| Unfiltered join + `GROUP BY` (hash join over all rows) | 6 | 2,092 | 643 | 100,157 |
+| `GROUP BY` with `AVG` of a `DOUBLE` (driver-side) | 6 | 3,435 | 3,241 | 100,104 |
+| `GROUP BY` of an expression `SUM(quantity * unit_price)` | 5 | 3,443 | 3,401 | 100,104 |
+| `GROUP BY DATE_TRUNC('month', ts)` | 12 | 2,326 | 3,335 | 100,103 |
+| Filter on a non-indexed column (`notes LIKE '%x%'`) | 1 | 3,366 | 2,238 | 100,104 |
+| Full scan, `SELECT *` | 100,000 | 2,867 | 2,706 | 100,104 |
+
+What drives the numbers:
+
+- **Queries the index answers on its own take milliseconds**, independent of
+  table size: counts and ranges, TAG equality filters with `ORDER BY … LIMIT`,
+  and `GROUP BY` with `COUNT` and integer `SUM`/`MIN`/`MAX`. On the cluster,
+  each search fans out to all shards (`_FT.AGGREGATE`), and there is also a
+  fixed overhead of roughly 10–15 ms per query that hasn't been profiled yet
+  (the point lookup, which sends no search command, still takes ~16 ms).
+  Some differences are run-to-run noise: the standalone interval count's
+  fastest run was 2.4 ms against a 15 ms median.
+- **Reading rows costs about 30 µs per row**, because each matching row is
+  fetched with its own (pipelined) `HMGET`: about 0.3 s for 10,000 rows and
+  2–3.5 s for 100,000. Queries that need the driver to see every row pay
+  this: aggregates the index can't compute exactly (`AVG` of doubles,
+  expressions, `DATE_TRUNC` groups), filters on non-indexed columns, and
+  unfiltered joins.
+- **Selective joins are fast** because the smaller side is filtered in its
+  index first and only matching rows of the other side are fetched. A
+  correlated subquery costs one indexed query per distinct outer value
+  (about 6 ms each here).
+
+Known ways to make the slow cases faster (not done yet):
+
+- Read rows with `FT.AGGREGATE … LOAD *` inside the cursor pages, which
+  already return 1,000 keys at a time. `LOAD *` returns the exact stored
+  values (checked: `3.14159265358979` and `9223372036854775807` come back
+  intact, unlike `LOAD @field` on a SORTABLE field). That would replace one
+  `HMGET` per row with one cursor read per 1,000 rows.
+- `COUNT(*)` with a `LIKE` prefix, and `COUNT(*)` on a lazy view, re-check rows
+  the index has already matched exactly, so they could be answered by the
+  index alone.
+
+To reproduce (from `go`, with a Redis running):
+
+```bash
+REDIS_URI=redis://localhost:6379/0 uv run --project validation --with redis python examples/bench.py --rows 100000
+```
+
+The script **replaces** the `sales` and `customers` tables with benchmark data;
+run `examples/load_sample.py` afterwards to get the quick-start data back.
+
 ## Building and testing
 
 See the [Quick start](#quick-start) for building. To run the ADBC validation
