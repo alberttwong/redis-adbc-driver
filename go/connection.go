@@ -270,13 +270,18 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 					nullable = 1
 					isNullable = "YES"
 				}
-				info.TableColumns = append(info.TableColumns, driverbase.ColumnInfo{
+				ci := driverbase.ColumnInfo{
 					ColumnName:      col.Name,
 					OrdinalPosition: &pos,
 					XdbcTypeName:    &typeName,
 					XdbcNullable:    &nullable,
 					XdbcIsNullable:  &isNullable,
-				})
+				}
+				if col.Default != "" {
+					def := col.Default
+					ci.XdbcColumnDef = &def
+				}
+				info.TableColumns = append(info.TableColumns, ci)
 			}
 			info.TableConstraints = []driverbase.ConstraintInfo{}
 		}

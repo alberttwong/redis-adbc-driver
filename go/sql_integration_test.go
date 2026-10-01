@@ -893,7 +893,7 @@ func TestSQLAlterTable(t *testing.T) {
 	h.exec(`ALTER TABLE it_alter ADD COLUMN IF NOT EXISTS note VARCHAR`)
 	h.expectError(`ALTER TABLE it_alter ADD COLUMN note VARCHAR`, "already exists")
 	h.expectError(`ALTER TABLE it_alter ADD COLUMN must INTEGER NOT NULL`, "NOT NULL")
-	h.expectError(`ALTER TABLE it_alter ADD COLUMN d INTEGER DEFAULT 5`, "defaults")
+	h.expectError(`ALTER TABLE it_alter ADD COLUMN d INTEGER DEFAULT RANDOM()`, "volatile DEFAULT")
 
 	// DROP COLUMN: gone at once; its field is removed from rows in the
 	// background; re-adding the name never shows the old values.

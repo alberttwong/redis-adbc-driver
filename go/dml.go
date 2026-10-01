@@ -298,6 +298,7 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 
 	// Decide and check every change before writing any.
 	env := e.newEnv(ctx, dj.joined.types(), params)
+	defs := e.columnDefaults(ctx, dj.meta)
 	var updates []rowChange
 	var deletes []string
 	var inserts [][]Value
@@ -319,7 +320,7 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 			continue
 		}
 		if c.Action == MergeInsert {
-			r, err := insertRow(env, dj.meta, c.targets, c.Values)
+			r, err := insertRow(env, dj.meta, defs, c.targets, c.Values)
 			if err != nil {
 				return 0, err
 			}

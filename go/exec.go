@@ -239,7 +239,13 @@ func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) erro
 	meta := &tableMeta{Schema: schema, Name: name}
 	noIndex := map[string]bool{}
 	for _, c := range st.Columns {
-		meta.Columns = append(meta.Columns, columnMeta{Name: c.Name, Type: c.Type, Nullable: !c.NotNull})
+		col := columnMeta{Name: c.Name, Type: c.Type, Nullable: !c.NotNull}
+		if c.Default != nil {
+			if col.Default, _, err = e.checkDefault(ctx, c); err != nil {
+				return err
+			}
+		}
+		meta.Columns = append(meta.Columns, col)
 		if c.NoIndex {
 			noIndex[c.Name] = true
 		}
@@ -364,9 +370,14 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 	if st.Select != nil {
 		return e.insertSelect(ctx, st, meta, targets)
 	}
+	values := st.Rows
+	if st.DefaultValues {
+		targets, values = nil, [][]Expr{nil}
+	}
 	env := e.newEnv(ctx, nil, params)
-	rows := make([][]Value, 0, len(st.Rows))
-	for _, exprs := range st.Rows {
+	defs := e.columnDefaults(ctx, meta)
+	rows := make([][]Value, 0, len(values))
+	for _, exprs := range values {
 		if len(exprs) != len(targets) {
 			return 0, errorf(adbc.StatusInvalidArgument, "INSERT has %d target columns but %d values", len(targets), len(exprs))
 		}
@@ -375,7 +386,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 				return 0, err
 			}
 		}
-		row, err := insertRow(env, meta, targets, exprs)
+		row, err := insertRow(env, meta, defs, targets, exprs)
 		if err != nil {
 			return 0, err
 		}
@@ -408,14 +419,15 @@ func insertTargets(meta *tableMeta, cols []string) ([]int, error) {
 }
 
 // insertRow evaluates the values of one inserted row into a full row ordered
-// like meta.Columns (columns not listed are NULL), coerced to the column
-// types and checked against NOT NULL.
-func insertRow(env *evalEnv, meta *tableMeta, targets []int, exprs []Expr) ([]Value, error) {
+// like meta.Columns (columns not listed, or given as DEFAULT, get their
+// defaults), coerced to the column types and checked against NOT NULL.
+func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, targets []int, exprs []Expr) ([]Value, error) {
 	row := make([]Value, len(meta.Columns))
-	for i, c := range meta.Columns {
-		row[i] = nullValue(c.Type)
-	}
+	given := make([]bool, len(meta.Columns))
 	for j, expr := range exprs {
+		if _, ok := expr.(*DefaultValue); ok {
+			continue
+		}
 		v, err := env.eval(expr)
 		if err != nil {
 			return nil, invalidArg(err)
@@ -425,7 +437,10 @@ func insertRow(env *evalEnv, meta *tableMeta, targets []int, exprs []Expr) ([]Va
 		if err != nil {
 			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 		}
-		row[targets[j]] = cv
+		row[targets[j]], given[targets[j]] = cv, true
+	}
+	if err := defs.fill(row, given); err != nil {
+		return nil, err
 	}
 	for i, c := range meta.Columns {
 		if row[i].Null && !c.Nullable {
@@ -448,19 +463,21 @@ func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *table
 	if err != nil {
 		return 0, err
 	}
+	defs := e.columnDefaults(ctx, meta)
 	rows := make([][]Value, len(results))
 	for r, res := range results {
 		row := make([]Value, len(meta.Columns))
-		for i, c := range meta.Columns {
-			row[i] = nullValue(c.Type)
-		}
+		given := make([]bool, len(meta.Columns))
 		for j, v := range res {
 			col := meta.Columns[targets[j]]
 			cv, err := Coerce(v, col.Type)
 			if err != nil {
 				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 			}
-			row[targets[j]] = cv
+			row[targets[j]], given[targets[j]] = cv, true
+		}
+		if err := defs.fill(row, given); err != nil {
+			return 0, err
 		}
 		rows[r] = row
 	}
@@ -1204,10 +1221,19 @@ func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChan
 	ch := rowChange{key: key}
 	for i, v := range vals {
 		col := meta.Columns[cols[i]]
+		// A row that would read the column's missing value without a field
+		// is marked when it is set to NULL (see defaults.go).
+		marked := col.readsMissing(meta, key)
 		if v.Null {
 			ch.del = append(ch.del, col.field())
+			if marked {
+				ch.set = append(ch.set, nullMarker(col.field()), "1")
+			}
 		} else {
 			ch.set = append(ch.set, col.field(), encodeStored(v))
+			if marked {
+				ch.del = append(ch.del, nullMarker(col.field()))
+			}
 		}
 	}
 	return ch
