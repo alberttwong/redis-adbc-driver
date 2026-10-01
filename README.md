@@ -81,7 +81,9 @@ requirement is the Query Engine.
 
 - `CREATE TABLE` and bulk ingest create the table's index
   (`FT.CREATE idx:<schema>:<table> …`) and its metadata keys. `DROP TABLE`
-  removes the index and all of the table's rows.
+  removes the index and all of the table's rows (a statement still writing
+  to the table then deletes what it writes; see "Key prefixes" in the
+  architecture section).
 - Every filterable column is indexed by default. Narrow this with `NOINDEX`
   in `CREATE TABLE` or `adbc.redis.ingest.index_columns` on ingest. Queries
   still work on columns that aren't indexed: the driver scans the table's
@@ -374,8 +376,10 @@ DROP TABLE events;
 
 Each row is a plain HASH, and each table has one RediSearch index. A renamed
 table keeps its key names unless `adbc.redis.rename_rekey` is set (see
-`ALTER TABLE` below); `information_schema.tables` shows each table's
-`key_prefix` and `index_name`:
+`ALTER TABLE` below), and a table created again after `DROP TABLE` gets new
+ones (`public:sales~2:`, see "Key prefixes" below);
+`information_schema.tables` shows each table's `key_prefix` and
+`index_name`:
 
 ```bash
 docker exec redis-adbc-test redis-cli HGETALL public:sales:42
@@ -413,7 +417,9 @@ Stop Redis with `docker compose down`.
 
 - **Rows** are flat HASHes `<schema>:<table>:<rowid>` holding every column
   (NULL = field absent, except for missing values, below; a hidden `__rowid`
-  field keeps all-NULL rows alive).
+  field keeps all-NULL rows alive). A table that isn't the first of its
+  name has the prefix `<schema>:<table>~N:` and the index
+  `idx:<schema>:<table>~N` (see "Key prefixes" below).
 - **Selective index**: `FT.CREATE idx:<schema>:<table> ON HASH PREFIX 1
   <schema>:<table>:` covering only filterable columns: numeric, boolean,
   decimal, date/time and timestamp columns as `NUMERIC SORTABLE`, strings as
@@ -464,17 +470,62 @@ Stop Redis with `docker compose down`.
   Each table's metadata records its row key prefix and index name, and
   `adbc:{meta}:prefixes` / `adbc:{meta}:indexes` reserve them, so a renamed
   table's rows can never be shared with a new table of the old name.
+  `adbc:{meta}:names:next` holds the last `~N` handed out for each table
+  name (see "Key prefixes" below).
   `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress.
   `adbc:{meta}:rekey` records renames that are moving a table's rows
   (`adbc.redis.rename_rekey`), keyed by the old prefix, and
   `adbc:{meta}:rekey:alive:<id>` (30-second TTL, renewed by the renaming
   connection) shows that the connection doing one is alive.
   `adbc:{meta}:released` counts how often each key prefix was released (by
-  `DROP TABLE` or a re-keying rename); a table's metadata records the count
-  when it takes its prefix, so that a statement that read it earlier can
-  tell when its rows have moved away. Metadata written by
+  `DROP TABLE` or a re-keying rename), one field per prefix that was ever
+  released; a statement checks it and `adbc:{meta}:prefixes` to tell when
+  its table's rows have moved away. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
+- **Key prefixes are never reused.** A table takes the first of
+  `<schema>:<table>:`, `<schema>:<table>~2:`, … that no table has had
+  before, with the index name of the same N (`idx:<schema>:<table>~2`).
+  So a table created again after `DROP TABLE` gets new keys, and so does a
+  re-keying rename onto a name that a table had before. The reason is
+  writes still running when a table is dropped: a statement that read the
+  table's metadata before the `DROP` goes on writing rows under the old
+  prefix until it finds out, and those rows outlive the `DROP`, which only
+  deletes the rows its index knows about. Up to v0.0.7 the next table of
+  that name took the same prefix, and its row ids started at 1 again, so
+  its rows were written into those leftover HASHes: a column that should
+  have been NULL read the dropped table's value. Now:
+  - An insert reads the table's metadata again in the `MULTI` that
+    allocates its row ids (each Arrow batch, in bulk ingest), at no extra
+    cost. If the table was dropped, renamed or created again since the
+    statement started, it writes nothing.
+  - A write of more than 1,000 rows (`CREATE TABLE … AS`, `INSERT …
+    SELECT`, bulk ingest, a large `UPDATE`) also checks that the table
+    still has its keys: between pipelines of 1,000 rows once 100 ms have
+    passed since the last check, and always after its last pipeline (one
+    round trip each). Smaller writes check at the end only when 100 ms have
+    passed since they read the metadata, as before.
+  - A statement whose table was dropped (or whose rows a re-keying rename
+    moved away) stops and fails: "table … was renamed with its rows moved to
+    new keys, or dropped, while this statement was writing to it; some of
+    its changes may be lost or have gone to another table". If no table has
+    the old prefix any more, it first deletes every key it wrote there
+    (one pipelined `DEL` per 1,000 keys).
+  - Keys can still be left under a dropped table's prefix, where no table or
+    query reads them: when the writing process exits before it finds out,
+    and when a write of 1,000 rows or fewer that read the metadata within
+    100 ms of the `DROP` reaches Redis after it (it doesn't check, and
+    succeeds, as if it had run before the `DROP`). To remove them, check
+    that no table has the prefix (`information_schema.tables.key_prefix`,
+    or `SISMEMBER adbc:{meta}:prefixes '<prefix>'` returns 0), then delete
+    its keys, on every primary of a cluster: `redis-cli --scan --pattern
+    '<prefix>*' | xargs redis-cli unlink`.
+  - **Upgrading:** tables created by earlier versions keep their names and
+    work as before. Prefixes released by v0.0.6 and v0.0.7 are recorded in
+    `adbc:{meta}:released` and are skipped too, so rows they left behind
+    can't reach a new table; v0.0.5 and earlier didn't record releases.
+    Upgrade every client that writes to the database: an earlier version
+    still gives a dropped table's prefix to the next table of that name.
 - **Missing values**: `ALTER TABLE … ADD COLUMN c … DEFAULT v` doesn't
   rewrite the existing rows. As with Postgres's "missing value", the
   column's metadata records `v` and the row id high-water mark (the
@@ -649,12 +700,14 @@ field, even if later rows have it.
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
     was created), so no row is touched. A table that dbt builds as
     `t__dbt_tmp` and renames to `t` keeps the keys `public:t__dbt_tmp:<rowid>`
-    and the index `idx:public:t__dbt_tmp` (or `t__dbt_tmp~2`, when the
-    previous build's table still holds those names).
+    and the index `idx:public:t__dbt_tmp` (or `t__dbt_tmp~N`: names are never
+    reused, so every build after the first takes a new N).
   - With the option `adbc.redis.rename_rekey` set to `true` (on the
     database, e.g. in dbt's `db_kwargs`, or on the connection), `RENAME TO`
     also moves the rows and the index to the new name's: `public:t:<rowid>`
-    and `idx:public:t`, or `~N` if another table still uses those. This
+    and `idx:public:t`, or `~N` if a table has had those before. In dbt's
+    swap the previous build's `t` gives them up on every build, so from the
+    second build on the keys are `public:t~N:`, with a new N each time. This
     reads and writes every row, so it takes time proportional to the number
     of rows (and about 100 ms more), and the table takes twice its memory
     until the copy is done (if Redis runs out, the rename fails and is
@@ -683,7 +736,8 @@ field, even if later rows have it.
       was moved, or dropped), and if so fails with "some of its changes may
       be lost or have gone to another table": like a write that fails
       part-way, some of them may have been applied. Faster statements don't
-      pay for the check.
+      pay for the check, unless they write more than 1,000 rows (see "Key
+      prefixes" in the architecture section).
     - If the renaming process exits, the table is unchanged under its old
       name and refuses changes until the move's 30-second lease has
       expired. Then the next connection to open, the next statement refused,

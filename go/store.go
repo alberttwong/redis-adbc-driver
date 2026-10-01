@@ -52,6 +52,14 @@ package redis
 // Schema and table names are percent-escaped in key names so that ':' in a
 // name cannot make two tables share a key prefix, and '{' / '}' cannot form
 // a hash tag.
+//
+// Key prefixes are never reused. A table that is created, or that a
+// re-keying rename moves (rekey.go), takes the first <schema>:<table>: or
+// <schema>:<table>~N: (and the index name idx:<schema>:<table>[~N]) that no
+// table has ever had: a statement that read a dropped table's metadata may
+// still be writing rows under its prefix, and rows left there must not
+// become another table's. adbc:{meta}:names:next (HASH) holds the last N
+// handed out for each name. See claimNames.
 
 import (
 	"context"
@@ -201,6 +209,9 @@ type tableMeta struct {
 	// readAt is when the metadata was read (or last found not to be moving),
 	// for the checks in rekey.go.
 	readAt time.Time
+	// wrote lists what the statement wrote through this metadata, to be
+	// deleted if the table turns out to have been dropped (discardWritten).
+	wrote rowLog
 
 	// In-memory relations (CTEs, derived tables) hold their rows here and
 	// have no index or HASHes.
@@ -300,30 +311,142 @@ func indexAttrArgs(c columnMeta) []any {
 
 // Registry of key prefixes and index names in use. A renamed table keeps its
 // prefix and index, so a new table with the old name must get different ones.
+// namesNextKey holds, for each table name (its plain key prefix), the last N
+// its prefixes were given.
 const (
 	prefixesKey    = metaPrefix + "prefixes"
 	indexesKey     = metaPrefix + "indexes"
 	registryMarker = metaPrefix + "registry"
 	cleanupKey     = metaPrefix + "cleanup"
+	namesNextKey   = metaPrefix + "names:next"
 )
 
-// claim atomically reserves the first free name among base, base_2, … in a
-// registry set; suffix formats a candidate from base and a counter.
-func (s *store) claim(ctx context.Context, set, base string, suffix func(string, int) string) (string, error) {
-	for n := 1; n < 10000; n++ {
-		cand := base
-		if n > 1 {
-			cand = suffix(base, n)
+// tableNames are the key prefix and index name a table takes: for N = 1,
+// <schema>:<table>: and idx:<schema>:<table>, otherwise the same with ~N.
+type tableNames struct {
+	base          string // the plain prefix, which namesNextKey counts by
+	prefix, index string
+	n             int64
+	temp          bool
+}
+
+func namesFor(schema, table string, n int64) tableNames {
+	base := rowPrefix(schema, table)
+	nm := tableNames{base: base, prefix: base, index: indexName(schema, table), n: n, temp: isTempSchema(schema)}
+	if n > 1 {
+		suffix := "~" + strconv.FormatInt(n, 10)
+		nm.prefix = strings.TrimSuffix(base, ":") + suffix + ":"
+		nm.index += suffix
+	}
+	return nm
+}
+
+// lastNames returns the N of the last names handed out for a table name.
+// The counter only saves probing: every candidate is still checked.
+func (s *store) lastNames(ctx context.Context, c goredis.Cmdable, schema, table string) (int64, error) {
+	if isTempSchema(schema) {
+		return s.tempLastNames(rowPrefix(schema, table)), nil
+	}
+	n, err := c.HGet(ctx, namesNextKey, rowPrefix(schema, table)).Int64()
+	if errors.Is(err, goredis.Nil) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// claimNames reserves the key prefix and index name of a new table: the
+// first names after the last ones handed out for its name whose prefix no
+// table has ever had (it is neither reserved in prefixesKey nor counted in
+// releasedKey) and whose index name is free. A prefix that was released may
+// still have rows: a statement that read a dropped table's metadata goes on
+// writing until it finds out, and one that crashed never does.
+//
+// Each candidate is reserved with SADD, then checked against releasedKey in
+// the same pipeline (one hash slot, so in order): a prefix that was free
+// when it was added can't be released later, since only its owner releases
+// it. Temporary schemas don't count releases; their connection remembers
+// every prefix it handed out instead (see tempSpace).
+func (s *store) claimNames(ctx context.Context, schema, table string) (tableNames, error) {
+	last, err := s.lastNames(ctx, s.client, schema, table)
+	if err != nil {
+		return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
+	}
+	for n := last + 1; n < last+10000; n++ {
+		nm := namesFor(schema, table, n)
+		if nm.temp && s.tempUsedPrefix(nm.prefix) {
+			continue
 		}
-		added, err := s.client.SAdd(ctx, set, cand).Result()
-		if err != nil {
-			return "", wrapRedis(err, "failed to reserve a key prefix")
+		pipe := s.client.Pipeline()
+		addP := pipe.SAdd(ctx, prefixesKey, nm.prefix)
+		addI := pipe.SAdd(ctx, indexesKey, nm.index)
+		var released *goredis.BoolCmd
+		if !nm.temp {
+			released = pipe.HExists(ctx, releasedKey, nm.prefix)
+			pipe.HSet(ctx, namesNextKey, nm.base, n)
 		}
-		if added == 1 {
-			return cand, nil
+		if _, err := pipe.Exec(ctx); err != nil {
+			return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
+		}
+		if addP.Val() == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
+			s.noteTempNames(nm)
+			return nm, nil
+		}
+		// Give back what this candidate got.
+		pipe = s.client.Pipeline()
+		if addP.Val() == 1 {
+			pipe.SRem(ctx, prefixesKey, nm.prefix)
+		}
+		if addI.Val() == 1 {
+			pipe.SRem(ctx, indexesKey, nm.index)
+		}
+		if pipe.Len() > 0 {
+			if _, err := pipe.Exec(ctx); err != nil {
+				return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
+			}
 		}
 	}
-	return "", errorf(adbc.StatusInternal, "could not reserve a unique name for %q", base)
+	return tableNames{}, errorf(adbc.StatusInternal, "could not reserve a unique key prefix for %q", rowPrefix(schema, table))
+}
+
+// freeNames is claimNames inside a transaction that watches prefixesKey,
+// indexesKey and releasedKey: it only reads, and the caller reserves the
+// names it returns in the transaction (reserveNames).
+func (s *store) freeNames(ctx context.Context, tx *goredis.Tx, schema, table string) (tableNames, error) {
+	last, err := s.lastNames(ctx, tx, schema, table)
+	if err != nil {
+		return tableNames{}, err
+	}
+	for n := last + 1; n < last+10000; n++ {
+		nm := namesFor(schema, table, n)
+		if nm.temp && s.tempUsedPrefix(nm.prefix) {
+			continue
+		}
+		var usedP, usedI, released *goredis.BoolCmd
+		if _, err := tx.Pipelined(ctx, func(p goredis.Pipeliner) error {
+			usedP = p.SIsMember(ctx, prefixesKey, nm.prefix)
+			usedI = p.SIsMember(ctx, indexesKey, nm.index)
+			if !nm.temp {
+				released = p.HExists(ctx, releasedKey, nm.prefix)
+			}
+			return nil
+		}); err != nil {
+			return tableNames{}, err
+		}
+		if !usedP.Val() && !usedI.Val() && (released == nil || !released.Val()) {
+			return nm, nil
+		}
+	}
+	return tableNames{}, errorf(adbc.StatusInternal, "could not reserve a unique key prefix for %q", rowPrefix(schema, table))
+}
+
+// reserveNames adds the commands that reserve names found by freeNames to a
+// transaction; noteTempNames must follow once it has committed.
+func reserveNames(ctx context.Context, p goredis.Pipeliner, nm tableNames) {
+	p.SAdd(ctx, prefixesKey, nm.prefix)
+	p.SAdd(ctx, indexesKey, nm.index)
+	if !nm.temp {
+		p.HSet(ctx, namesNextKey, nm.base, nm.n)
+	}
 }
 
 // ensureRegistry records the prefixes and indexes of tables created before
@@ -581,10 +704,6 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	for i := range meta.Columns {
 		meta.Columns[i].initTags()
 	}
-	raw, err := json.Marshal(meta)
-	if err != nil {
-		return false, errorf(adbc.StatusInternal, "failed to encode metadata: %v", err)
-	}
 	if exists, err := s.viewExists(ctx, meta.Schema, meta.Name); err != nil {
 		return false, err
 	} else if exists {
@@ -593,50 +712,42 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		}
 		return false, errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", displaySchema(meta.Schema), meta.Name)
 	}
-	ok, err := s.client.SetNX(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Result()
-	if err != nil {
-		return false, wrapRedis(err, "failed to create table")
-	}
-	if !ok {
+	key := metaKey(meta.Schema, meta.Name)
+	exists := func() (bool, error) {
 		if ifNotExists {
 			return false, nil
 		}
 		return false, errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", displaySchema(meta.Schema), meta.Name)
 	}
-
-	// Reserve a key prefix and index name no other table uses (a renamed
-	// table keeps the ones derived from its old name).
-	release := func() {
-		s.client.Del(ctx, metaKey(meta.Schema, meta.Name))
-		if meta.KeyPrefix != "" {
-			s.client.SRem(ctx, prefixesKey, meta.KeyPrefix)
-		}
-		if meta.IndexName != "" {
-			s.client.SRem(ctx, indexesKey, meta.IndexName)
-		}
-	}
-	if meta.KeyPrefix, err = s.claim(ctx, prefixesKey, rowPrefix(meta.Schema, meta.Name), func(b string, n int) string {
-		return strings.TrimSuffix(b, ":") + "~" + strconv.Itoa(n) + ":"
-	}); err != nil {
-		release()
-		return false, err
-	}
-	if meta.IndexName, err = s.claim(ctx, indexesKey, indexName(meta.Schema, meta.Name), func(b string, n int) string {
-		return b + "~" + strconv.Itoa(n)
-	}); err != nil {
-		release()
-		return false, err
-	}
-	if meta.PrefixGen, err = prefixGen(ctx, s.client, meta.KeyPrefix); err != nil {
-		release()
+	if n, err := s.client.Exists(ctx, key).Result(); err != nil {
 		return false, wrapRedis(err, "failed to create table")
+	} else if n > 0 {
+		return exists()
 	}
-	if raw, err = json.Marshal(meta); err == nil {
-		err = s.client.Set(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Err()
+
+	// Reserve a key prefix and index name that no table has had (see
+	// claimNames), and create the index. The metadata is written last, so
+	// no statement sees the table before its keys are known and indexed.
+	nm, err := s.claimNames(ctx, meta.Schema, meta.Name)
+	if err != nil {
+		return false, err
 	}
+	meta.KeyPrefix, meta.IndexName, meta.PrefixGen = nm.prefix, nm.index, 0
+	created := false
+	release := func() {
+		bg := context.WithoutCancel(ctx)
+		if created {
+			_ = s.searchDo(bg, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err()
+		}
+		pipe := s.client.Pipeline()
+		pipe.SRem(bg, prefixesKey, meta.KeyPrefix)
+		pipe.SRem(bg, indexesKey, meta.IndexName)
+		_, _ = pipe.Exec(bg)
+	}
+	raw, err := json.Marshal(meta)
 	if err != nil {
 		release()
-		return false, wrapRedis(err, "failed to create table")
+		return false, errorf(adbc.StatusInternal, "failed to encode metadata: %v", err)
 	}
 
 	// The index name was free in the registry, so an index with that name is
@@ -647,14 +758,37 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		release()
 		return false, wrapRedis(err, "failed to create search index")
 	}
-	pipe := s.client.TxPipeline()
-	pipe.SAdd(ctx, tablesKey(meta.Schema), meta.Name)
-	if !isTempSchema(meta.Schema) {
-		pipe.SAdd(ctx, schemasKey, meta.Schema)
+	created = true
+	// The metadata, a fresh row id sequence and the registration, in one
+	// transaction, unless the table was created meanwhile.
+	won := false
+	for attempt := 0; attempt < 20 && !won; attempt++ {
+		err = s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			if n, err := tx.Exists(ctx, key).Result(); err != nil || n > 0 {
+				return err
+			}
+			_, err := tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Set(ctx, key, raw, 0)
+				p.Del(ctx, seqKey(meta.Schema, meta.Name))
+				p.SAdd(ctx, tablesKey(meta.Schema), meta.Name)
+				if !isTempSchema(meta.Schema) {
+					p.SAdd(ctx, schemasKey, meta.Schema)
+				}
+				return nil
+			})
+			won = err == nil
+			return err
+		}, key)
+		if !errors.Is(err, goredis.TxFailedErr) {
+			break
+		}
 	}
-	pipe.Del(ctx, seqKey(meta.Schema, meta.Name))
-	if _, err := pipe.Exec(ctx); err != nil {
-		return false, wrapRedis(err, "failed to register table")
+	if !won {
+		release()
+		if err != nil {
+			return false, wrapRedis(err, "failed to create table")
+		}
+		return exists()
 	}
 	s.trackTemp(meta.Schema, meta.Name, true)
 	return true, nil
@@ -892,16 +1026,69 @@ func (s *store) allocRows(ctx context.Context, meta *tableMeta, rows [][]Value) 
 	if err != nil {
 		return rowAlloc{}, wrapRedis(err, "failed to allocate row ids")
 	}
+	if !sameKeys(meta, cur.Val()) {
+		// The table was dropped, renamed or created again since meta was
+		// read, so these ids are not from its sequence: write nothing.
+		if err := s.checkKeys(ctx, meta, true); err != nil {
+			return rowAlloc{}, err
+		}
+		return rowAlloc{}, writeMovedErr(meta)
+	}
 	return rowAlloc{first: last - int64(len(rows)) + 1, added: addedMissing(meta, cur.Val())}, nil
 }
 
-// writeRows writes rows allocated by allocRows as HASHes.
+// sameKeys reports whether raw, the current metadata under meta's name, is
+// still meta's table: it has the same key prefix and generation.
+func sameKeys(meta *tableMeta, raw string) bool {
+	if raw == "" {
+		return false
+	}
+	// The common case, without decoding the metadata: it has meta's prefix
+	// and, like meta, no generation. JSON escapes the quotes inside string
+	// values, so neither field name can match inside one.
+	if meta.KeyPrefix != "" && meta.PrefixGen == 0 && !strings.Contains(raw, `"prefix_gen":`) {
+		if enc, err := json.Marshal(meta.KeyPrefix); err == nil && strings.Contains(raw, `"key_prefix":`+string(enc)) {
+			return true
+		}
+	}
+	var cur struct {
+		KeyPrefix string `json:"key_prefix"`
+		PrefixGen int64  `json:"prefix_gen"`
+	}
+	if json.Unmarshal([]byte(raw), &cur) != nil {
+		return false
+	}
+	prefix := cur.KeyPrefix
+	if prefix == "" {
+		prefix = rowPrefix(meta.Schema, meta.Name)
+	}
+	return prefix == meta.prefix() && cur.PrefixGen == meta.PrefixGen
+}
+
+// testHookRowsWritten, when set by a test, runs after each pipeline of rows
+// that writeRows sends, with the number of rows written so far.
+var testHookRowsWritten func(meta *tableMeta, written int)
+
+// writeRows writes rows allocated by allocRows as HASHes. A write of more
+// than one pipeline checks between pipelines, once rekeyFence has passed
+// since the table's keys were last checked, and always at the end, that the
+// table still has its keys (checkKeys): if it was dropped or its rows moved
+// meanwhile, the statement stops, deletes the rows it wrote, and fails.
 func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows [][]Value) (int64, error) {
 	if err := s.raiseTagLevels(ctx, meta, rowTagLevels(meta, rows)); err != nil {
 		return 0, err
 	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
 	prefix := meta.prefix()
+	meta.wrote.ranges = append(meta.wrote.ranges, [2]int64{a.first, int64(len(rows))})
 	for start := 0; start < len(rows); start += pipelineChunk {
+		if start > 0 {
+			if err := s.checkWritten(ctx, meta); err != nil {
+				return 0, err
+			}
+		}
 		end := min(start+pipelineChunk, len(rows))
 		pipe := s.client.Pipeline()
 		for r := start; r < end; r++ {
@@ -919,13 +1106,62 @@ func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows
 		if _, err := pipe.Exec(ctx); err != nil {
 			return 0, wrapRedis(err, "failed to write rows")
 		}
-	}
-	if len(rows) > 0 {
-		if err := s.checkWritten(ctx, meta); err != nil {
-			return 0, err
+		if testHookRowsWritten != nil {
+			testHookRowsWritten(meta, end)
 		}
 	}
+	check := s.checkWritten
+	if len(rows) > pipelineChunk {
+		check = func(ctx context.Context, meta *tableMeta) error { return s.checkKeys(ctx, meta, true) }
+	}
+	if err := check(ctx, meta); err != nil {
+		return 0, err
+	}
 	return int64(len(rows)), nil
+}
+
+// rowLog lists the keys a statement wrote through a table's metadata: the
+// row ids it inserted (first id, count) and the rows it set fields of.
+type rowLog struct {
+	ranges [][2]int64
+	keys   []string
+}
+
+// discardWritten deletes the keys a statement wrote under a table's key
+// prefix once no table has that prefix (checkKeys): its table was dropped
+// or its rows moved while the statement was writing, so these keys either
+// were deleted with the table or are left over, and no table can take the
+// prefix again (see claimNames). It is best effort; see the README for
+// keys left behind.
+func (s *store) discardWritten(ctx context.Context, meta *tableMeta) {
+	log := meta.wrote
+	meta.wrote = rowLog{}
+	prefix := meta.prefix()
+	ctx = context.WithoutCancel(ctx)
+	pipe := s.client.Pipeline()
+	flush := func(force bool) bool {
+		if pipe.Len() == 0 || (!force && pipe.Len() < pipelineChunk) {
+			return true
+		}
+		_, err := pipe.Exec(ctx)
+		pipe = s.client.Pipeline()
+		return err == nil
+	}
+	for _, r := range log.ranges {
+		for id := r[0]; id < r[0]+r[1]; id++ {
+			pipe.Del(ctx, prefix+strconv.FormatInt(id, 10))
+			if !flush(false) {
+				return
+			}
+		}
+	}
+	for _, k := range log.keys {
+		pipe.Del(ctx, k)
+		if !flush(false) {
+			return
+		}
+	}
+	flush(true)
 }
 
 // fetchRows reads the given fields of each row HASH with pipelined HMGET.

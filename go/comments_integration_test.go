@@ -242,10 +242,11 @@ func TestSQLCommentRename(t *testing.T) {
 	h.expectComments("public", "it_cmt_r", "Orders", "id=NULL", "name=Label", "qty=Quantity")
 	h.exec(`COMMENT ON COLUMN it_cmt_r.name IS 'Name'`)
 	h.expectError(`COMMENT ON COLUMN it_cmt_r.label IS 'x'`, `column "label" of relation "it_cmt_r" does not exist`)
+	before, _ := h.tableNames(raw, "public", "it_cmt_r")
 	h.exec(`ALTER TABLE it_cmt_r RENAME TO it_cmt_r2`)
 	h.expectComments("public", "it_cmt_r2", "Orders", "id=NULL", "name=Name", "qty=Quantity")
-	if prefix, _ := h.tableNames(raw, "public", "it_cmt_r2"); prefix != "public:it_cmt_r:" {
-		t.Errorf("a plain rename moved the rows to %q", prefix)
+	if prefix, _ := h.tableNames(raw, "public", "it_cmt_r2"); prefix != before {
+		t.Errorf("a plain rename moved the rows from %q to %q", before, prefix)
 	}
 	// A new table with the old name has none.
 	h.exec(`CREATE TABLE it_cmt_r (id INTEGER)`)
@@ -269,9 +270,7 @@ func TestSQLCommentRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.exec(`ALTER TABLE it_cmt_r2 RENAME TO it_cmt_r3`)
-	if prefix, _ := h.tableNames(raw, "public", "it_cmt_r3"); prefix != "public:it_cmt_r3:" {
-		t.Errorf("a re-keying rename left the rows under %q", prefix)
-	}
+	h.namesN(raw, "public", "it_cmt_r3", "it_cmt_r3") // the new name's keys
 	h.expectComments("public", "it_cmt_r3", "Orders", "id=NULL", "name=Name", "qty=Quantity again")
 	h.expectRows(`SELECT id, name, qty FROM it_cmt_r3 WHERE name = 'c'`, "3|c|30")
 
