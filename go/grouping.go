@@ -521,6 +521,8 @@ func (r *groupingRewriter) node(e Expr) Expr {
 		return &Binary{Op: x.Op, L: r.rewrite(x.L), R: r.rewrite(x.R)}
 	case *IsNull:
 		return &IsNull{X: r.rewrite(x.X), Not: x.Not}
+	case *RowExpr:
+		return &RowExpr{Items: r.rewriteAll(x.Items)}
 	case *Cast:
 		return &Cast{X: r.rewrite(x.X), T: x.T}
 	case *Case:

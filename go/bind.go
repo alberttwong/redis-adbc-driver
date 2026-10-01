@@ -62,6 +62,7 @@ type scope struct {
 type execCache struct {
 	sub           map[*Subquery][][]Value
 	inSets        map[*Subquery]*inSet
+	rowSets       map[*Subquery]*rowSet
 	inLists       map[*Binary]*inList // nil: evaluate the OR chain as written
 	memo          map[*Subquery]map[string][][]Value
 	semi          map[*Subquery]*semiResult
@@ -84,6 +85,7 @@ func newExecCache() *execCache {
 	return &execCache{
 		sub:           map[*Subquery][][]Value{},
 		inSets:        map[*Subquery]*inSet{},
+		rowSets:       map[*Subquery]*rowSet{},
 		inLists:       map[*Binary]*inList{},
 		memo:          map[*Subquery]map[string][][]Value{},
 		semi:          map[*Subquery]*semiResult{},
@@ -146,6 +148,25 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 		switch v := x.(type) {
 		case *ColumnRef:
 			err = e.resolveColumn(v)
+		case *Binary:
+			if _, ok := v.L.(*RowExpr); ok {
+				err = e.rowOperatorError(ctx, v)
+			} else if _, ok := v.R.(*RowExpr); ok {
+				err = e.rowOperatorError(ctx, v)
+			}
+		case *IsNull:
+			if _, ok := v.X.(*RowExpr); ok {
+				// The parser rewrites a row's IS NULL: this row was nested.
+				if err = e.bindRowItems(ctx, v.X); err == nil {
+					err = errNestedRow()
+				}
+			}
+		case *RowExpr:
+			// Rows are rewritten or are a subquery's operand (which walkExpr
+			// doesn't visit as a row): this one is out of place.
+			if err = e.bindRowItems(ctx, v); err == nil {
+				err = errRowValue()
+			}
 		case *Subquery:
 			err = e.planSubquery(ctx, v)
 		case *Func:
@@ -270,7 +291,13 @@ func containsRef(refs []outerRef, r outerRef) bool {
 
 // planSubquery plans the body of a subquery in a nested scope.
 func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
-	if sq.X != nil {
+	width := 1 // of the operand
+	if r, ok := sq.X.(*RowExpr); ok {
+		if err := e.bindRowOperand(ctx, r); err != nil {
+			return err
+		}
+		width = len(r.Items)
+	} else if sq.X != nil {
 		if err := e.bind(ctx, sq.X); err != nil {
 			return err
 		}
@@ -288,9 +315,18 @@ func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
 		return err
 	}
 	switch {
+	case sq.rowCompare:
+		// (a, b) = (SELECT x, y …)
+		if err := subqueryWidthError(len(plan.items), sq.Width); err != nil {
+			return err
+		}
 	case sq.Width > 0:
 		if len(plan.items) != sq.Width {
 			return errorf(adbc.StatusInvalidArgument, "number of columns does not match number of values")
+		}
+	case sq.Kind == SubqueryIn || sq.Kind == SubqueryAny || sq.Kind == SubqueryAll:
+		if err := subqueryWidthError(len(plan.items), width); err != nil {
+			return err
 		}
 	case sq.Kind != SubqueryExists && len(plan.items) != 1:
 		return errorf(adbc.StatusInvalidArgument, "subquery must return exactly one column, got %d", len(plan.items))
@@ -549,9 +585,15 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 		}
 		return Value{}, fmt.Errorf("scalar subquery returned %d rows", len(rows))
 	case SubqueryAny, SubqueryAll:
+		if r, ok := sq.X.(*RowExpr); ok {
+			return env.evalRowQuantified(sq, r, rows)
+		}
 		return env.evalQuantified(sq, rows)
 	}
 	// IN
+	if r, ok := sq.X.(*RowExpr); ok {
+		return env.evalRowIn(sq, r, rows)
+	}
 	x, err := env.eval(sq.X)
 	if err != nil {
 		return Value{}, err

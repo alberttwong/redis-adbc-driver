@@ -513,7 +513,7 @@ func TestSQLQuantifiedComparisons(t *testing.T) {
 	}
 
 	h.expectError(`SELECT id FROM it_qf_g WHERE id = ANY (1, 2)`, "ANY (…) needs a subquery")
-	h.expectError(`SELECT id FROM it_qf_g WHERE v > ALL (SELECT id, v FROM it_qf_g)`, "subquery must return exactly one column")
+	h.expectError(`SELECT id FROM it_qf_g WHERE v > ALL (SELECT id, v FROM it_qf_g)`, "subquery has too many columns")
 	h.expectError(`SELECT id FROM it_qf_g WHERE v > ANY (SELECT k FROM it_qf_g WHERE k IS NOT NULL)`, "cannot compare")
 }
 
