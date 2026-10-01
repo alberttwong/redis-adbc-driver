@@ -486,3 +486,25 @@ func TestScalarPushdownPlan(t *testing.T) {
 		t.Error("RANDOM() must not be a constant; other functions of constants must be")
 	}
 }
+
+func TestScalarConcat(t *testing.T) {
+	runScalarCases(t, []scalarCase{
+		// CONCAT skips NULL arguments, as in Postgres; || propagates them.
+		{"CONCAT('a', 'b', 'c')", "abc", "VARCHAR"},
+		{"CONCAT('a', NULL, 'b')", "ab", "VARCHAR"},
+		{"CONCAT(NULL, NULL)", "", "VARCHAR"},
+		{"CONCAT(NULL)", "", "VARCHAR"},
+		{"CONCAT('n=', 42, ', d=', DATE '2024-01-02')", "n=42, d=2024-01-02", "VARCHAR"},
+		{"CONCAT('é', NULL, 'ü')", "éü", "VARCHAR"},
+		{"'a' || NULL", "NULL", "VARCHAR"},
+		{"'a' || 'b'", "ab", "VARCHAR"},
+
+		{"CONCAT_WS('-', 'a', 'b', 'c')", "a-b-c", "VARCHAR"},
+		{"CONCAT_WS('-', 'a', NULL, 'c')", "a-c", "VARCHAR"},
+		{"CONCAT_WS('-', NULL, 'b')", "b", "VARCHAR"},
+		{"CONCAT_WS('-', NULL, NULL)", "", "VARCHAR"},
+		{"CONCAT_WS(NULL, 'a', 'b')", "NULL", "VARCHAR"},
+		{"CONCAT_WS(', ', 1, 2.5, TRUE)", "1, 2.5, true", "VARCHAR"},
+		{"CONCAT_WS('')", "", "VARCHAR"},
+	})
+}

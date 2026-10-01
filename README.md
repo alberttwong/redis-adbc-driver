@@ -495,7 +495,9 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `CAST(x AS type)` / `x::type`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`/`MERGE`),
-  `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
+  `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
+  `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
+  returns NULL if either side is NULL), `from_hex`
 - `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` (`INTERSECT` binds
   tighter; parenthesized branches may have their own `ORDER BY`/`LIMIT`).
   Columns are matched by position and widened to a common type; NULLs count

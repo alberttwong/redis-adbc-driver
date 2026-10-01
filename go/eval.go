@@ -268,6 +268,23 @@ func (env *evalEnv) evalCase(c *Case) (Value, error) {
 	return nullValue(typeNull), nil
 }
 
+// concatValues joins the text of the non-NULL values with sep.
+func concatValues(sep string, args []Value) Value {
+	var b strings.Builder
+	first := true
+	for _, a := range args {
+		if a.Null {
+			continue
+		}
+		if !first {
+			b.WriteString(sep)
+		}
+		b.WriteString(a.Text())
+		first = false
+	}
+	return stringValue(b.String())
+}
+
 func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 	if aggregateFuncs[f.Name] {
 		if v, ok := env.aggs[f]; ok {
@@ -307,6 +324,17 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		return nullValue(t), nil
 	case "NULLIF", "GREATEST", "LEAST":
 		return evalConditional(f, args)
+	case "CONCAT":
+		// NULL arguments are skipped, as in Postgres (|| propagates NULL).
+		return concatValues("", args), nil
+	case "CONCAT_WS":
+		if len(args) == 0 {
+			return Value{}, fmt.Errorf("CONCAT_WS expects a separator")
+		}
+		if args[0].Null {
+			return nullValue(typeString), nil
+		}
+		return concatValues(args[0].Text(), args[1:]), nil
 	}
 	for _, a := range args {
 		if a.Null {
@@ -352,12 +380,6 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			return intValue(typeInt64, int64(len(args[0].S))), nil
 		}
 		return intValue(typeInt64, int64(utf8.RuneCountInString(args[0].Text()))), nil
-	case "CONCAT":
-		var b strings.Builder
-		for _, a := range args {
-			b.WriteString(a.Text())
-		}
-		return stringValue(b.String()), nil
 	case "LIKE", "ILIKE":
 		if len(args) < 2 || len(args) > 3 {
 			return Value{}, fmt.Errorf("%s expects a pattern", f.Name)
@@ -601,7 +623,7 @@ func inferFuncType(f *Func, args []ColType) ColType {
 		return typeBool
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
 		return typeBinary
-	case "TO_HEX", "HEX", "LOWER", "LCASE", "UPPER", "UCASE", "CONCAT":
+	case "TO_HEX", "HEX", "LOWER", "LCASE", "UPPER", "UCASE", "CONCAT", "CONCAT_WS":
 		return typeString
 	case "AVG":
 		return typeFloat64
