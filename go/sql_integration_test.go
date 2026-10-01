@@ -1361,3 +1361,65 @@ func TestSQLDropBehaviorKeywords(t *testing.T) {
 	h.expectRows("SELECT COUNT(*) FROM information_schema.tables WHERE table_name LIKE 'it_dropkw%'", "0")
 	h.expectError("DROP TABLE it_dropkw CASCADE extra", "syntax error")
 }
+
+func TestSQLAlterViewRename(t *testing.T) {
+	h := newSQLHarness(t)
+	views := []string{"it_av_v", "it_av_v2", "it_av_v3", "it_av_dep", "it_av_m", "it_av_m__dbt_tmp", "it_av_m__dbt_backup", "it_av_other"}
+	drop := func() {
+		for _, v := range views {
+			h.exec("DROP VIEW IF EXISTS " + v)
+		}
+		h.exec("DROP TABLE IF EXISTS it_av_base")
+		h.exec("DROP TABLE IF EXISTS it_av_table")
+	}
+	drop()
+	t.Cleanup(drop)
+
+	h.exec("CREATE TABLE it_av_base (id BIGINT, s VARCHAR)")
+	h.exec("INSERT INTO it_av_base VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+	h.exec("CREATE TABLE it_av_table (x BIGINT)")
+	h.exec("CREATE VIEW it_av_v AS SELECT id, s FROM it_av_base WHERE id > 1")
+	h.exec("CREATE VIEW it_av_dep AS SELECT id FROM it_av_v")
+	h.exec("CREATE VIEW it_av_other AS SELECT 1 AS one")
+
+	// ALTER VIEW … RENAME TO, and ALTER TABLE … RENAME TO on a view.
+	h.exec("ALTER VIEW it_av_v RENAME TO it_av_v2")
+	h.expectRows("SELECT id, s FROM it_av_v2 WHERE id < 3", "2|b")
+	h.expectError("SELECT * FROM it_av_v", "does not exist")
+	h.exec("ALTER TABLE it_av_v2 RENAME TO it_av_v3")
+	h.expectRows("SELECT COUNT(*) FROM it_av_v3", "2")
+	h.expectRows(`SELECT table_name, table_type FROM information_schema.tables
+		WHERE table_name LIKE 'it_av_v%' ORDER BY table_name`, "it_av_v3|VIEW")
+	h.expectRows("SELECT table_name FROM information_schema.views WHERE table_name LIKE 'it_av_v%'", "it_av_v3")
+	h.exec("ALTER VIEW it_av_v3 RENAME TO it_av_v3") // same name: no-op
+	// A view that reads the old name breaks, as it does when a table is renamed.
+	h.expectError("SELECT * FROM it_av_dep", "does not exist")
+
+	// dbt's view materialization: build __dbt_tmp, move the old view to
+	// __dbt_backup, move __dbt_tmp into place, drop the backup.
+	h.exec("CREATE VIEW it_av_m AS SELECT id FROM it_av_base WHERE id = 1")
+	h.exec("CREATE VIEW it_av_m__dbt_tmp AS SELECT id FROM it_av_base WHERE id >= 2")
+	h.exec("ALTER TABLE it_av_m RENAME TO it_av_m__dbt_backup")
+	h.exec("ALTER TABLE it_av_m__dbt_tmp RENAME TO it_av_m")
+	h.exec("DROP VIEW IF EXISTS it_av_m__dbt_backup")
+	h.expectRows("SELECT id FROM it_av_m ORDER BY id", "2", "3")
+
+	// Tables and views share one namespace.
+	h.expectError("ALTER VIEW it_av_m RENAME TO it_av_other", `view "public"."it_av_other" already exists`)
+	h.expectError("ALTER VIEW it_av_m RENAME TO it_av_table", "already exists as a table")
+	h.expectError("ALTER TABLE it_av_table RENAME TO it_av_other", "already exists as a view")
+	h.expectError("ALTER VIEW it_av_m RENAME TO secondary.it_av_m", "cannot move a view to another schema")
+
+	// Missing objects, wrong object kinds, and unsupported ALTER VIEW actions.
+	h.exec("ALTER VIEW IF EXISTS it_av_missing RENAME TO it_av_x")
+	h.exec("ALTER TABLE IF EXISTS it_av_missing RENAME TO it_av_x")
+	h.expectError("ALTER VIEW it_av_missing RENAME TO it_av_x", `view "public"."it_av_missing" does not exist`)
+	h.expectError("ALTER VIEW it_av_table RENAME TO it_av_x", "is a table, not a view")
+	h.expectError("ALTER TABLE it_av_m ADD COLUMN z INT", "is a view; ALTER TABLE on a view supports only RENAME TO")
+	h.expectError("ALTER TABLE it_av_m RENAME COLUMN id TO k", "is a view")
+	h.expectError("ALTER VIEW it_av_m RENAME COLUMN id TO k", "ALTER VIEW supports only RENAME TO")
+	h.expectError("ALTER VIEW it_av_m ADD COLUMN z INT", "ALTER VIEW supports only RENAME TO")
+	h.expectError("ALTER VIEW it_av_m SET SCHEMA x", "unsupported ALTER VIEW action")
+	h.expectError("ALTER SEQUENCE s RENAME TO t", "expected ALTER TABLE or ALTER VIEW")
+	h.expectRows("SELECT id FROM it_av_m ORDER BY id", "2", "3")
+}

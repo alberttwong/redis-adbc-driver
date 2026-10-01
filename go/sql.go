@@ -237,8 +237,10 @@ const (
 )
 
 type AlterTableStmt struct {
-	Table             TableName
-	IfExists          bool
+	Table    TableName
+	IfExists bool
+	// View is set for ALTER VIEW (which only supports RENAME TO).
+	View              bool
 	Action            AlterAction
 	NewTable          TableName // RENAME TO
 	Column            string    // RENAME COLUMN (old) / DROP COLUMN
@@ -1252,10 +1254,15 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 // RENAME TO u | RENAME [COLUMN] a TO b | ADD [COLUMN] [IF NOT EXISTS] def |
 // DROP [COLUMN] [IF EXISTS] c.
 func (p *parser) parseAlter() (Stmt, error) {
-	if err := p.expectKeyword("ALTER", "TABLE"); err != nil {
+	if err := p.expectKeyword("ALTER"); err != nil {
 		return nil, err
 	}
 	st := &AlterTableStmt{}
+	if p.acceptKeyword("VIEW") {
+		st.View = true
+	} else if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, syntaxErr("expected ALTER TABLE or ALTER VIEW")
+	}
 	st.IfExists = p.acceptKeyword("IF", "EXISTS")
 	t, err := p.parseTableName()
 	if err != nil {
@@ -1297,7 +1304,13 @@ func (p *parser) parseAlter() (Stmt, error) {
 		p.parseDropBehavior()
 		st.Action = AlterDropColumn
 	default:
+		if st.View {
+			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER VIEW action near %q (supported: RENAME TO)", p.peek().text)}
+		}
 		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN)", p.peek().text)}
+	}
+	if st.View && st.Action != AlterRenameTable {
+		return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
 	}
 	return st, nil
 }

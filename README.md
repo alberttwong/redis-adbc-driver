@@ -390,7 +390,11 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]`,
   `CREATE SCHEMA [IF NOT EXISTS] s`,
   `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS SELECT …`,
-  `DROP VIEW [IF EXISTS] v [CASCADE | RESTRICT]`
+  `DROP VIEW [IF EXISTS] v [CASCADE | RESTRICT]`,
+  `ALTER VIEW [IF EXISTS] v RENAME TO w` (`ALTER TABLE v RENAME TO w` also
+  renames a view, as in Postgres; other `ALTER TABLE` actions on a view are
+  rejected). Renaming changes metadata only; views that read the object by
+  its old name stop working, as they do after a table rename
 - `DROP SCHEMA [IF EXISTS] s [CASCADE | RESTRICT]`: `RESTRICT` (the default)
   refuses a schema that still has tables or views; `CASCADE` drops its views,
   then its tables (indexes and rows), then the schema. Dependencies between
