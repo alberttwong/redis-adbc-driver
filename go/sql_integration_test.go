@@ -3066,3 +3066,51 @@ func TestSQLInexactConstantPushdown(t *testing.T) {
 		}
 	}
 }
+
+// Literal IN lists longer than maxUnionTerms are evaluated by the driver;
+// they now probe a hash set (built once per statement) instead of
+// comparing every value for every row.
+func TestSQLLongInList(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() { h.exec("DROP TABLE IF EXISTS it_inlist") }
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_inlist (id BIGINT, u BIGINT NOINDEX, s VARCHAR, f DOUBLE PRECISION)")
+	var rows []string
+	for i := 1; i <= 3000; i++ {
+		if i%100 == 0 {
+			rows = append(rows, fmt.Sprintf("(%d, NULL, NULL, NULL)", i))
+			continue
+		}
+		rows = append(rows, fmt.Sprintf("(%d, %d, 's%d', %d.5)", i, i, i, i))
+	}
+	for i := 0; i < len(rows); i += 500 {
+		h.exec("INSERT INTO it_inlist VALUES " + strings.Join(rows[i:i+500], ", "))
+	}
+	// Every third id from 3 to 4500: 1,000 of them exist (3..3000), and
+	// the ones that are multiples of 100 have NULL u, s and f.
+	var ids, strs, floats []string
+	for i := 3; i <= 4500; i += 3 {
+		ids = append(ids, fmt.Sprint(i))
+		strs = append(strs, fmt.Sprintf("'s%d'", i))
+		floats = append(floats, fmt.Sprintf("%d.5", i))
+	}
+	list := strings.Join(ids, ", ")
+	before := subqueryStats.inLists.Load()
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE id IN ("+list+")", "1000")
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE u IN ("+list+")", "990")
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE s IN ("+strings.Join(strs, ", ")+")", "990")
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE f IN ("+strings.Join(floats, ", ")+")", "990")
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE u NOT IN ("+list+")", "1980")
+	// A NULL in the list makes NOT IN never true.
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE u NOT IN ("+list+", NULL)", "0")
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE u IN ("+list+", NULL)", "990")
+	// Integers compare with the decimals and doubles of the list exactly.
+	h.expectRows("SELECT COUNT(*) FROM it_inlist WHERE u IN ("+list+", 1.0, CAST(2 AS DOUBLE PRECISION))", "992")
+	if subqueryStats.inLists.Load() == before {
+		t.Error("no IN list used its hash set")
+	}
+	// A string column against numbers can fail to compare: it is still
+	// evaluated value by value, with the same error as before.
+	h.expectError("SELECT COUNT(*) FROM it_inlist WHERE s IN ("+list+")", "cannot compare")
+}

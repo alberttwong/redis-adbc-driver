@@ -45,6 +45,7 @@ var subqueryStats struct {
 	runs      atomic.Int64 // subquery bodies run by subqueryRows
 	semiJoins atomic.Int64 // semi-join bodies run
 	inSets    atomic.Int64 // IN hash sets built
+	inLists   atomic.Int64 // rows answered by a literal IN list's hash set
 }
 
 // ---- equality keys ----

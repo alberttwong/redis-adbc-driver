@@ -201,6 +201,11 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 	case *Binary:
 		switch x.Op {
 		case "AND", "OR":
+			if x.Op == "OR" {
+				if v, ok, err := env.evalInList(x); ok {
+					return v, err
+				}
+			}
 			l, err := env.eval(x.L)
 			if err != nil {
 				return Value{}, err
