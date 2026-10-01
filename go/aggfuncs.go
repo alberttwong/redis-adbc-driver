@@ -20,9 +20,9 @@ package redis
 //   - STRING_AGG(x, sep [ORDER BY …]) and LISTAGG(x [, sep]) [WITHIN GROUP
 //     (ORDER BY …)] concatenate the non-NULL values.
 //   - BOOL_OR, BOOL_AND / EVERY and ANY_VALUE.
-//   - VAR_SAMP / VARIANCE, VAR_POP, STDDEV_SAMP / STDDEV, STDDEV_POP. Integer
-//     and decimal inputs are summed exactly, so the result is the correctly
-//     rounded double; floating-point inputs use Welford's algorithm.
+//   - VAR_SAMP / VARIANCE, VAR_POP, STDDEV_SAMP / STDDEV, STDDEV_POP. The
+//     values and their squares are summed exactly (exactsum.go), whatever
+//     their type, so the result is the correctly rounded double.
 //   - The ordered-set aggregates PERCENTILE_CONT / PERCENTILE_DISC(fraction)
 //     and MODE() WITHIN GROUP (ORDER BY x), and MEDIAN(x), which is
 //     PERCENTILE_CONT(0.5). The direct argument (the fraction) is evaluated
@@ -38,7 +38,6 @@ package redis
 import (
 	"fmt"
 	"math"
-	"math/big"
 	"slices"
 	"sort"
 	"strconv"
@@ -285,7 +284,7 @@ func newAggState(f *Func) aggState {
 	case f.Name == "ANY_VALUE":
 		return &anyValueAgg{}
 	case statFuncs[f.Name]:
-		return &statAgg{name: f.Name, acc: newStatAcc(true, false)}
+		return &statAgg{name: f.Name, acc: &exactSum{squares: true}}
 	case orderedSetFuncs[f.Name] || f.Name == "MEDIAN":
 		return &orderedSetAgg{fn: f}
 	case jsonAggregates[f.Name]:
@@ -459,7 +458,7 @@ func (a *anyValueAgg) result(_ *evalEnv, t ColType) (Value, error) {
 
 type statAgg struct {
 	name string
-	acc  *statAcc
+	acc  *exactSum
 }
 
 func (s *statAgg) add(in []Value) error {
@@ -469,7 +468,7 @@ func (s *statAgg) add(in []Value) error {
 	return nil
 }
 
-func (s *statAgg) result(*evalEnv, ColType) (Value, error) { return s.acc.result(s.name), nil }
+func (s *statAgg) result(*evalEnv, ColType) (Value, error) { return s.acc.varianceValue(s.name), nil }
 
 // orderedSetAgg is PERCENTILE_CONT, PERCENTILE_DISC, MODE or MEDIAN: it
 // keeps the non-NULL values and sorts them once the group is complete.
@@ -567,223 +566,4 @@ func lerp(lo, hi Value, p float64) (Value, error) {
 		return Value{}, err
 	}
 	return binaryOp("+", lo, d)
-}
-
-// ---- variance and standard deviation ----
-
-// statAcc accumulates the input of a variance or standard deviation.
-// Integers and decimals are summed exactly: the count, Σx and Σx² as
-// integers at a common scale, so values can also be removed exactly (from a
-// window frame) and the result is the correctly rounded double. A
-// floating-point value switches to Welford's algorithm; window frames, which
-// remove values, choose the mode up front and keep doubles in a
-// welfordQueue.
-type statAcc struct {
-	exact  bool
-	n      int64
-	scale  int32
-	s1, s2 *big.Int
-	tmp    big.Int
-	w      welford       // doubles, without removal
-	q      *welfordQueue // doubles in a window frame
-}
-
-func newStatAcc(exact, window bool) *statAcc {
-	s := &statAcc{exact: exact, s1: new(big.Int), s2: new(big.Int)}
-	if window && !exact {
-		s.q = &welfordQueue{}
-	}
-	return s
-}
-
-func (s *statAcc) reset() {
-	s.n, s.scale = 0, 0
-	s.s1.SetInt64(0)
-	s.s2.SetInt64(0)
-	s.w = welford{}
-	if s.q != nil {
-		s.q.reset()
-	}
-}
-
-// add adds a non-NULL number.
-func (s *statAcc) add(v Value) { s.update(v, 1) }
-
-// remove removes the oldest value added.
-func (s *statAcc) remove(v Value) { s.update(v, -1) }
-
-func (s *statAcc) update(v Value, sign int64) {
-	x := &s.tmp
-	scale := int32(0)
-	switch k := v.T.Kind; {
-	case s.exact && (k.isInteger() || k == KindBool):
-		x.SetInt64(v.I)
-	case s.exact && k == KindDecimal:
-		x.Set(v.D)
-		scale = v.T.Scale
-	default:
-		if s.exact {
-			s.toFloat()
-		}
-		f, _ := v.asFloat()
-		switch {
-		case s.q == nil:
-			s.w.add(f)
-		case sign > 0:
-			s.q.push(f)
-		default:
-			s.q.pop()
-		}
-		return
-	}
-	if scale > s.scale {
-		// Bring the sums to the finer scale.
-		s.s1.Mul(s.s1, pow10(scale-s.scale))
-		s.s2.Mul(s.s2, pow10(2*(scale-s.scale)))
-		s.scale = scale
-	}
-	if scale < s.scale {
-		x.Mul(x, pow10(s.scale-scale))
-	}
-	if sign < 0 {
-		x.Neg(x)
-	}
-	s.s1.Add(s.s1, x)
-	x.Mul(x, x)
-	if sign < 0 {
-		s.s2.Sub(s.s2, x)
-	} else {
-		s.s2.Add(s.s2, x)
-	}
-	s.n += sign
-}
-
-// toFloat switches a running exact accumulation to Welford's algorithm.
-func (s *statAcc) toFloat() {
-	s.exact = false
-	if s.n == 0 {
-		return
-	}
-	n := big.NewInt(s.n)
-	unit := pow10(s.scale)
-	mean, _ := new(big.Rat).SetFrac(s.s1, new(big.Int).Mul(n, unit)).Float64()
-	// Σ(x - mean)² = (nΣx² - (Σx)²) / n
-	num := new(big.Int).Mul(n, s.s2)
-	num.Sub(num, new(big.Int).Mul(s.s1, s.s1))
-	m2, _ := new(big.Rat).SetFrac(num, new(big.Int).Mul(n, new(big.Int).Mul(unit, unit))).Float64()
-	s.w = welford{n: s.n, mean: mean, m2: m2}
-}
-
-// result returns the variance or standard deviation called name: NULL for
-// no values, and for one value in a sample.
-func (s *statAcc) result(name string) Value {
-	pop := name == "VAR_POP" || name == "STDDEV_POP"
-	root := strings.HasPrefix(name, "STDDEV")
-	n := s.n
-	if !s.exact {
-		w := s.w
-		if s.q != nil {
-			w = s.q.state()
-		}
-		n = w.n
-		if n == 0 || (n == 1 && !pop) {
-			return nullValue(typeFloat64)
-		}
-		div := float64(n - 1)
-		if pop {
-			div = float64(n)
-		}
-		v := w.m2 / div
-		if root {
-			v = math.Sqrt(v)
-		}
-		return floatValue(typeFloat64, v)
-	}
-	if n == 0 || (n == 1 && !pop) {
-		return nullValue(typeFloat64)
-	}
-	// (nΣx² - (Σx)²) / (n(n - 1)), or / n² for a population, at scale².
-	bn := big.NewInt(n)
-	num := new(big.Int).Mul(bn, s.s2)
-	num.Sub(num, new(big.Int).Mul(s.s1, s.s1))
-	den := new(big.Int).Mul(bn, big.NewInt(n-1))
-	if pop {
-		den.Mul(bn, bn)
-	}
-	den.Mul(den, pow10(2*s.scale))
-	r := new(big.Rat).SetFrac(num, den)
-	if !root {
-		v, _ := r.Float64()
-		return floatValue(typeFloat64, v)
-	}
-	f := new(big.Float).SetPrec(256).SetRat(r)
-	v, _ := f.Sqrt(f).Float64()
-	return floatValue(typeFloat64, v)
-}
-
-// welford is the count, mean and sum of squared differences from the mean
-// of a set of doubles, updated with Welford's algorithm.
-type welford struct {
-	n    int64
-	mean float64
-	m2   float64
-}
-
-func (w *welford) add(x float64) {
-	w.n++
-	d := x - w.mean
-	w.mean += d / float64(w.n)
-	// The conversion keeps the product from being fused into an FMA.
-	w.m2 += float64(d * (x - w.mean))
-}
-
-// mergeWelford combines the states of two sets (Chan et al.).
-func mergeWelford(a, b welford) welford {
-	switch {
-	case a.n == 0:
-		return b
-	case b.n == 0:
-		return a
-	}
-	n := a.n + b.n
-	d := b.mean - a.mean
-	fa, fb, fn := float64(a.n), float64(b.n), float64(n)
-	return welford{n: n, mean: a.mean + float64(d*fb)/fn, m2: a.m2 + b.m2 + float64(d*d)*fa*fb/fn}
-}
-
-// welfordQueue is a first-in, first-out window of doubles with their
-// Welford state, kept without removing values from a state (which would
-// cost precision), like floatQueue: in holds the newest values and inW their
-// state; out holds the states of the oldest ones as suffixes, its top
-// covering all of them.
-type welfordQueue struct {
-	in  []float64
-	inW welford
-	out []welford
-}
-
-func (q *welfordQueue) reset() { q.in, q.inW, q.out = q.in[:0], welford{}, q.out[:0] }
-
-func (q *welfordQueue) push(f float64) {
-	q.in = append(q.in, f)
-	q.inW.add(f)
-}
-
-func (q *welfordQueue) pop() {
-	if len(q.out) == 0 {
-		var w welford
-		for i := len(q.in) - 1; i >= 0; i-- {
-			w.add(q.in[i])
-			q.out = append(q.out, w)
-		}
-		q.in, q.inW = q.in[:0], welford{}
-	}
-	q.out = q.out[:len(q.out)-1]
-}
-
-func (q *welfordQueue) state() welford {
-	if len(q.out) == 0 {
-		return q.inW
-	}
-	return mergeWelford(q.out[len(q.out)-1], q.inW)
 }

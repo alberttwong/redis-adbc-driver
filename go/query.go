@@ -31,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -877,8 +878,8 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		}
 	}
 
-	// Build APPLY / GROUPBY / REDUCE steps.
-	var steps []any
+	// Check the aggregates and pick their columns.
+	var nonNullCols []string       // columns whose exists() flags are summed, in order
 	nonNull := map[string]string{} // column -> alias of exists() flag
 	argCol := make([]columnMeta, len(aggs))
 	for i, f := range aggs {
@@ -911,29 +912,78 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		}
 		argCol[i] = col
 		if _, ok := nonNull[col.Name]; !ok {
-			alias := fmt.Sprintf("__nn%d", len(nonNull))
-			nonNull[col.Name] = alias
-			steps = append(steps, "APPLY", fmt.Sprintf("exists(@%s)", col.field()), "AS", alias)
+			nonNull[col.Name] = fmt.Sprintf("__nn%d", len(nonNull))
+			nonNullCols = append(nonNullCols, col.Name)
 		}
 	}
-	steps = append(steps, "GROUPBY", len(groupCols))
-	for _, c := range groupCols {
-		steps = append(steps, "@"+c.field())
-	}
-	steps = append(steps, "REDUCE", "COUNT", 0, "AS", "__count")
-	for col, alias := range nonNull {
-		steps = append(steps, "REDUCE", "SUM", 1, "@"+alias, "AS", alias+"_n")
-		_ = col
-	}
-	for i, f := range aggs {
-		if f.Star || f.Name == "COUNT" {
-			continue
+	summed := func(i int) bool { return aggs[i].Name == "SUM" || aggs[i].Name == "AVG" }
+	summedCols := map[string]bool{}
+	for i := range aggs {
+		if !aggs[i].Star && summed(i) {
+			summedCols[argCol[i].Name] = true
 		}
-		steps = append(steps, "REDUCE", indexReducers[f.Name], 1, "@"+argCol[i].field(), "AS", fmt.Sprintf("__a%d", i))
 	}
-	raw, err := e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: steps})
+
+	// pipeline builds the APPLY / GROUPBY / REDUCE steps. With zeroed, SUM
+	// and AVG add case(exists(@c), @c, 0) instead of @c (see below).
+	pipeline := func(zeroed bool) []any {
+		var steps []any
+		for _, name := range nonNullCols {
+			col, _ := meta.column(name)
+			steps = append(steps, "APPLY", fmt.Sprintf("exists(@%s)", col.field()), "AS", nonNull[name])
+			if zeroed && summedCols[name] {
+				steps = append(steps, "APPLY", fmt.Sprintf("case(exists(@%s), @%s, 0)", col.field(), col.field()), "AS", nonNull[name]+"_z")
+			}
+		}
+		steps = append(steps, "GROUPBY", len(groupCols))
+		for _, c := range groupCols {
+			steps = append(steps, "@"+c.field())
+		}
+		steps = append(steps, "REDUCE", "COUNT", 0, "AS", "__count")
+		for _, name := range nonNullCols {
+			steps = append(steps, "REDUCE", "SUM", 1, "@"+nonNull[name], "AS", nonNull[name]+"_n")
+		}
+		for i, f := range aggs {
+			if f.Star || f.Name == "COUNT" {
+				continue
+			}
+			arg := "@" + argCol[i].field()
+			if zeroed && summed(i) {
+				arg = "@" + nonNull[argCol[i].Name] + "_z"
+			}
+			steps = append(steps, "REDUCE", indexReducers[f.Name], 1, arg, "AS", fmt.Sprintf("__a%d", i))
+		}
+		return steps
+	}
+	raw, err := e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: pipeline(false)})
 	if err != nil {
 		return nil, false, err
+	}
+	// On a cluster, a shard whose rows of a group all lack the value sends
+	// NaN as its partial SUM, so the group's SUM (and AVG) came back NaN
+	// although it has values (#101). Then run again with the missing values
+	// as 0. A real NaN (+Infinity and -Infinity) stays NaN; a server without
+	// case() aggregates in the driver.
+	lost := false
+	for _, r := range raw {
+		for i := range aggs {
+			if aggs[i].Star || !summed(i) {
+				continue
+			}
+			nn, _ := strconv.ParseFloat(r[nonNull[argCol[i].Name]+"_n"], 64)
+			if v, err := strconv.ParseFloat(r[fmt.Sprintf("__a%d", i)], 64); nn > 0 && err == nil && math.IsNaN(v) {
+				lost = true
+			}
+		}
+	}
+	if lost {
+		raw, err = e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: pipeline(true)})
+		if err != nil {
+			if strings.Contains(err.Error(), "Unknown function name 'case'") {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
 	}
 	if len(raw) == 0 && len(groupCols) == 0 {
 		raw = []aggRow{{"__count": "0"}}

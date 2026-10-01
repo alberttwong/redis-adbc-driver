@@ -186,6 +186,140 @@ func TestScalarMath(t *testing.T) {
 	}
 }
 
+// TestScalarTrigonometry checks the trigonometric functions, PI, CBRT,
+// RADIANS and DEGREES. The values are Postgres's: the examples of its
+// documentation (sin(1), cot(0.5), degrees(0.5), …) and the exact results
+// its degree functions guarantee at 0, 30, 45, 60 and 90 degrees. The
+// radian functions are Go's math package, which can differ from the C
+// library Postgres uses in the last bit: Go's tan(1) is 1.557407724654902,
+// glibc's 1.5574077246549023.
+func TestScalarTrigonometry(t *testing.T) {
+	const d = "DOUBLE PRECISION"
+	runScalarCases(t, []scalarCase{
+		{"PI()", "3.141592653589793", d},
+		{"SIN(1)", "0.8414709848078965", d},
+		{"SIN(1.0)", "0.8414709848078965", d}, // a NUMERIC argument
+		{"SIN('1')", "0.8414709848078965", d},
+		{"COS(1)", "0.5403023058681398", d},
+		{"TAN(1)", "1.557407724654902", d},
+		{"COT(0.5)", "1.830487721712452", d},
+		{"ASIN(1)", "1.5707963267948966", d},
+		{"ACOS(1)", "0", d},
+		{"ATAN(1)", "0.7853981633974483", d},
+		{"ATAN2(1, 0)", "1.5707963267948966", d},
+		{"SIN(PI() / 2)", "1", d},
+		{"COS(PI())", "-1", d},
+		{"SIN(0)", "0", d},
+		{"COS(0)", "1", d},
+		{"TAN(0)", "0", d},
+		{"TAN(PI() / 4)", "0.9999999999999998", d},
+		{"COT(PI() / 4)", "1.0000000000000002", d},
+		{"COT(0)", "+Inf", d}, // not an overflow, as in Postgres
+		{"ACOS(-1) = PI()", "true", "BOOLEAN"},
+		{"ASIN(-1) = -PI() / 2", "true", "BOOLEAN"},
+		{"ATAN2(1, 1) = PI() / 4", "true", "BOOLEAN"},
+		{"ATAN2(0, -1) = PI()", "true", "BOOLEAN"},
+		{"ATAN(CAST('Infinity' AS DOUBLE)) = PI() / 2", "true", "BOOLEAN"},
+		{"SIN(CAST('NaN' AS DOUBLE))", "NaN", d},
+		{"ASIN(CAST('NaN' AS DOUBLE))", "NaN", d},
+		{"ATAN2(1, CAST('NaN' AS DOUBLE))", "NaN", d},
+		{"SIN(NULL)", "NULL", d},
+		{"ATAN2(NULL, 1)", "NULL", d},
+		{"ATAN2D(1, NULL)", "NULL", d},
+		{"PI() + NULL", "NULL", d},
+
+		// Degrees: exact at 0, 30, 45, 60 and 90, and in every quadrant.
+		{"SIND(30)", "0.5", d},
+		{"SIND(90)", "1", d},
+		{"SIND(150)", "0.5", d},
+		{"SIND(180)", "0", d},
+		{"SIND(210)", "-0.5", d},
+		{"SIND(270)", "-1", d},
+		{"SIND(-30)", "-0.5", d},
+		{"SIND(390)", "0.5", d},
+		{"SIND(-720)", "0", d},
+		{"COSD(0)", "1", d},
+		{"COSD(60)", "0.5", d},
+		{"COSD(90)", "0", d},
+		{"COSD(120)", "-0.5", d},
+		{"COSD(180)", "-1", d},
+		{"COSD(-60)", "0.5", d},
+		{"COSD(300)", "0.5", d},
+		{"TAND(45)", "1", d},
+		{"TAND(135)", "-1", d},
+		{"TAND(-45)", "-1", d},
+		{"TAND(0)", "0", d},
+		{"TAND(180)", "0", d}, // not -0
+		{"TAND(90)", "+Inf", d},
+		{"TAND(-90)", "-Inf", d},
+		{"COTD(45)", "1", d},
+		{"COTD(-45)", "-1", d},
+		{"COTD(90)", "0", d},
+		{"COTD(270)", "0", d},
+		{"COTD(0)", "+Inf", d},
+		{"ASIND(0.5)", "30", d},
+		{"ASIND(1)", "90", d},
+		{"ASIND(-0.5)", "-30", d},
+		{"ASIND(0)", "0", d},
+		{"ACOSD(0.5)", "60", d},
+		{"ACOSD(1)", "0", d},
+		{"ACOSD(0)", "90", d},
+		{"ACOSD(-0.5)", "120", d},
+		{"ACOSD(-1)", "180", d},
+		{"ATAND(1)", "45", d},
+		{"ATAND(-1)", "-45", d},
+		{"ATAND(CAST('Infinity' AS DOUBLE))", "90", d},
+		{"ATAN2D(1, 0)", "90", d},
+		{"ATAN2D(1, 1)", "45", d},
+		{"ATAN2D(0, -1)", "180", d},
+		{"ATAN2D(-1, 0)", "-90", d},
+		{"SIND(CAST('NaN' AS DOUBLE))", "NaN", d},
+
+		{"RADIANS(45.0)", "0.7853981633974483", d},
+		{"RADIANS(180)", "3.141592653589793", d},
+		{"RADIANS(180) = PI()", "true", "BOOLEAN"},
+		{"DEGREES(0.5)", "28.64788975654116", d},
+		{"DEGREES(PI())", "180", d},
+		{"DEGREES(PI() / 2)", "90", d},
+		{"DEGREES(CAST('Infinity' AS DOUBLE))", "+Inf", d},
+		{"CBRT(64.0)", "4", d},
+		{"CBRT(27)", "3", d},
+		{"CBRT(-8)", "-2", d},
+		{"CBRT(2)", "1.2599210498948732", d},
+		{"CBRT(0)", "0", d},
+	})
+	for _, c := range []struct{ expr, err string }{
+		{"ASIN(2)", "ASIN: input is out of range"},
+		{"ASIN(-1.0000001)", "ASIN: input is out of range"},
+		{"ACOS(-1.5)", "ACOS: input is out of range"},
+		{"ASIND(1.5)", "ASIND: input is out of range"},
+		{"ACOSD(-2)", "ACOSD: input is out of range"},
+		{"SIN(CAST('Infinity' AS DOUBLE))", "SIN: input is out of range"},
+		{"COS(CAST('-Infinity' AS DOUBLE))", "COS: input is out of range"},
+		{"TAN(CAST('Infinity' AS DOUBLE))", "TAN: input is out of range"},
+		{"COT(CAST('Infinity' AS DOUBLE))", "COT: input is out of range"},
+		{"SIND(CAST('Infinity' AS DOUBLE))", "SIND: input is out of range"},
+		{"COSD(CAST('-Infinity' AS DOUBLE))", "COSD: input is out of range"},
+		{"TAND(CAST('Infinity' AS DOUBLE))", "TAND: input is out of range"},
+		{"COTD(CAST('Infinity' AS DOUBLE))", "COTD: input is out of range"},
+		{"DEGREES(1e308)", "DEGREES: value out of range: overflow"},
+		{"RADIANS(5e-324)", "RADIANS: value out of range: underflow"},
+		{"SIN(TRUE)", "SIN expects a number, got BOOLEAN"},
+		{"ATAN2D(1, DATE '2024-01-01')", "ATAN2D expects a number, got DATE"},
+		{"COS('abc')", `COS: cannot convert "abc"`},
+		{"SIN()", "SIN expects 1 argument"},
+		{"ATAN2(1)", "ATAN2 expects 2 arguments"},
+		{"PI(1)", "PI expects no arguments"},
+	} {
+		if _, _, err := evalTestExpr(t, c.expr); err == nil || !strings.Contains(err.Error(), c.err) {
+			t.Errorf("%s: error %v, want one containing %q", c.expr, err, c.err)
+		}
+	}
+	if !isConstant(parseTestExpr(t, "SIN(PI())")) {
+		t.Errorf("SIN(PI()) should be a constant")
+	}
+}
+
 func TestScalarStrings(t *testing.T) {
 	runScalarCases(t, []scalarCase{
 		// Positions are 1-based and count characters; a start before the

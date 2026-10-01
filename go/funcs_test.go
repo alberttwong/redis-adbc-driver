@@ -41,6 +41,10 @@ var funcSamples = map[string]string{
 	"ROUND": "ROUND(2.5)", "TRUNC": "TRUNC(2.55, 1)", "FLOOR": "FLOOR(2.5)", "CEIL": "CEIL(2.5)", "CEILING": "CEILING(2.5)",
 	"MOD": "MOD(5, 3)", "POWER": "POWER(2, 3)", "POW": "POW(2, 3)", "SQRT": "SQRT(4)", "LN": "LN(1)", "LOG": "LOG(2, 8)",
 	"LOG10": "LOG10(100)", "EXP": "EXP(1)", "SIGN": "SIGN(-2)", "RANDOM": "RANDOM()", "ABS": "ABS(-1)",
+	"CBRT": "CBRT(27)", "PI": "PI()", "SIN": "SIN(1)", "COS": "COS(1)", "TAN": "TAN(1)", "COT": "COT(1)",
+	"ASIN": "ASIN(0.5)", "ACOS": "ACOS(0.5)", "ATAN": "ATAN(1)", "ATAN2": "ATAN2(1, 2)", "SIND": "SIND(30)",
+	"COSD": "COSD(60)", "TAND": "TAND(45)", "COTD": "COTD(45)", "ASIND": "ASIND(0.5)", "ACOSD": "ACOSD(0.5)",
+	"ATAND": "ATAND(1)", "ATAN2D": "ATAN2D(1, 1)", "RADIANS": "RADIANS(180)", "DEGREES": "DEGREES(1)",
 	// strings
 	"SUBSTRING": "SUBSTRING('abc' FROM 2 FOR 1)", "SUBSTR": "SUBSTR('abc', 2)", "LEFT": "LEFT('abc', 1)", "RIGHT": "RIGHT('abc', 1)",
 	"REPLACE": "REPLACE('abc', 'b', 'x')", "BTRIM": "TRIM(' a ')", "LTRIM": "TRIM(LEADING FROM ' a')",

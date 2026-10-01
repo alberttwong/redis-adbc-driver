@@ -17,9 +17,7 @@ package redis
 import (
 	"context"
 	"errors"
-	"fmt"
 	"maps"
-	"math/big"
 	"slices"
 	"strings"
 	"time"
@@ -1133,24 +1131,24 @@ func (e *executor) selectWithoutTable(ctx context.Context, plan *selectPlan, par
 
 // accumulator reduces one aggregate call over a group: COUNT, SUM, AVG, MIN
 // and MAX here, the other aggregates in ext (aggfuncs.go). addRow applies
-// FILTER and DISTINCT.
+// FILTER and DISTINCT. SUM and AVG add their values exactly (exactsum.go).
 type accumulator struct {
 	fn       *Func
 	count    int64
-	sumI     int64
-	sumD     *big.Int
-	sumScale int32
-	sumF     float64
+	sum      *exactSum // SUM, AVG
 	best     Value
 	has      bool
-	overflow bool
 	distinct map[string]bool
 	ext      aggState
 	in       []Value // input buffer (aggInput)
 }
 
 func newAccumulator(f *Func) *accumulator {
-	return &accumulator{fn: f, ext: newAggState(f)}
+	a := &accumulator{fn: f, ext: newAggState(f)}
+	if f.Name == "SUM" || f.Name == "AVG" {
+		a.sum = &exactSum{}
+	}
+	return a
 }
 
 func (a *accumulator) add(v Value) {
@@ -1164,24 +1162,7 @@ func (a *accumulator) add(v Value) {
 	a.count++
 	switch a.fn.Name {
 	case "SUM", "AVG":
-		switch {
-		case v.T.Kind.isInteger() || v.T.Kind == KindBool:
-			s := a.sumI + v.I
-			if (s > a.sumI) != (v.I > 0) {
-				a.overflow = true
-			}
-			a.sumI = s
-			a.sumF += float64(v.I)
-		case v.T.Kind == KindDecimal:
-			if a.sumD == nil {
-				a.sumD, a.sumScale = new(big.Int), v.T.Scale
-			}
-			a.sumD.Add(a.sumD, rescaleDecimal(v.D, v.T.Scale, a.sumScale))
-			a.sumF += decimalToFloat(v.D, v.T.Scale)
-		default:
-			f, _ := v.asFloat()
-			a.sumF += f
-		}
+		a.sum.add(v)
 	case "MIN", "MAX":
 		if !a.has {
 			a.best, a.has = v, true
@@ -1207,21 +1188,12 @@ func (a *accumulator) result(env *evalEnv, t ColType) (Value, error) {
 		if a.count == 0 {
 			return nullValue(typeFloat64), nil
 		}
-		return floatValue(typeFloat64, a.sumF/float64(a.count)), nil
+		return floatValue(typeFloat64, a.sum.mean()), nil
 	case "SUM":
 		if a.count == 0 {
 			return nullValue(t), nil
 		}
-		switch t.Kind {
-		case KindInt64:
-			if a.overflow {
-				return Value{}, fmt.Errorf("integer overflow in SUM")
-			}
-			return intValue(typeInt64, a.sumI), nil
-		case KindDecimal:
-			return decimalValue(a.sumD, t.Precision, a.sumScale), nil
-		}
-		return floatValue(typeFloat64, a.sumF), nil
+		return a.sum.sumValue(t)
 	default:
 		if !a.has {
 			return nullValue(t), nil

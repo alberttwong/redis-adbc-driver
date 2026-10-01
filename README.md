@@ -562,7 +562,7 @@ How SQL is executed:
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables, columns and functions and wrong argument counts are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
-| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1) |
+| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1). On a cluster, a shard whose rows of a group all lack the value sends NaN as its partial `SUM`, which made the group's `SUM` and `AVG` NaN up to v0.0.7 (`AVG` of an integer column also in the default mode). So when a `SUM` comes back NaN for a group that has values, the driver runs the command again with `case(exists(@c), @c, 0)` in place of `@c` (about 2.5 times as long; a real NaN, from adding +Infinity and -Infinity, stays NaN), and a server without `case()` aggregates the query in the driver |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
 | `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` on the prefix's tag, re-checked by the driver (other patterns are checked by the driver alone). RediSearch expands a prefix into at most `search-max-prefix-expansions` tags (200 by default, per shard) and silently ignores the rest, so the driver first runs the prefix query under `FT.PROFILE … LIMIT 0 1` (one more round trip, about 0.3 ms) and, unless every shard's profile reports no warning, checks the prefix on every row the rest of the WHERE clause selects instead. The server's configuration is never changed |
@@ -575,7 +575,7 @@ How SQL is executed:
 | `WITH RECURSIVE` | Working-table iteration in memory: the non-recursive term runs once, then the recursive term runs against the rows the last iteration added (its joins with tables still use their indexes, such as an index lookup join on the new rows' keys) until it adds none. `UNION` drops rows produced before. At most 10,000 iterations and 1,000,000 rows. With `SEARCH` / `CYCLE`, the recursive term runs once per row of the working table, to know each row's parent |
 | `LATERAL`, `GENERATE_SERIES` | Join items computed while the join runs. One that reads earlier FROM items runs for each row joined so far (a `LATERAL` subquery memoised on the values it reads, like a correlated subquery); otherwise it runs once and is joined like a derived table. A join with such an item keeps its written order. `GENERATE_SERIES` makes its rows in memory, at most 1,000,000 per call |
 | `SELECT DISTINCT` | Over plain expressions it is the same as `GROUP BY` them, so it runs in the index (`FT.AGGREGATE … GROUPBY`) when they're indexed columns. Otherwise (stars, aggregates, window functions, `DISTINCT ON`) the driver removes duplicate rows after the rest of the query, NULLs counting as equal. `LIMIT` / `OFFSET` apply afterwards and never run in the index. As in Postgres, `ORDER BY` must use the select list, and `DISTINCT ON` keys must match the leading `ORDER BY` expressions |
-| Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
+| Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; sums, averages and variances add and subtract exact sums, also of doubles). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata, one for all the actions of a statement), plus `FT.INFO` and one `FT.ALTER` for the added columns and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan for all the statement's new `CHECK`s, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
@@ -612,8 +612,20 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   BOOL_OR/BOOL_AND/EVERY over boolean columns. Other aggregates are computed
   by the driver.
 - `all`: also pushes floating-point, decimal and 64-bit aggregates.
-  RediSearch reports these with 12 significant digits.
+  RediSearch adds doubles in its own order (on a cluster, each shard's
+  rows, then the shards' sums) and reports the result with 12 significant
+  digits; `AVG` is that sum divided by the count. That is the exact sum
+  when it has at most 12 significant digits, such as amounts with two
+  decimals, and RediSearch's rounding errors stay below the 12th digit;
+  otherwise it differs from it after the 12th digit (`SUM` of 1/3 and 1/7
+  is 0.47619047619, not 0.47619047619047616), and sums that cancel can lose
+  their small values (1e16, 1, -1e16, 3, 1e16, 0.5, -1e16 came back as 4,
+  not 4.5).
 - `none`: always aggregates in the driver.
+
+The other modes compute `SUM` and `AVG` of doubles exactly (see
+Aggregates, below), so their results don't depend on the mode, the order of
+the rows, or the server being standalone or a cluster.
 
 In every mode, `DISTINCT`, `FILTER (WHERE …)` and the other aggregates run
 in the driver. RediSearch has reducers that look like some of them, but none
@@ -1180,6 +1192,35 @@ field, even if later rows have it.
   - `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, `COUNT(DISTINCT x)`, and
     `COUNT(DISTINCT a, b, …)` (as in MySQL), which counts the distinct
     combinations of rows where none of them is NULL
+  - `SUM`, `AVG` and the variances and standard deviations add their
+    values exactly, whatever their type, also as window functions: every
+    integer, decimal and double is a fraction whose denominator is a power
+    of 2 times a power of 5, so the driver keeps the sum as such a fraction
+    and rounds the result once, to the nearest double (ties to even), or to
+    the result's decimal places. So the result is the same in any row
+    order: on a cluster, rows come in a different order each time, and
+    summing doubles in that order used to give a different last digit from
+    one run to the next. Postgres also adds doubles one by one, in its plan's
+    order.
+    - `SUM` of integers is `BIGINT` and fails (`integer overflow in SUM`)
+      only if the total doesn't fit, and `SUM` of decimals is exact at
+      their scale. `AVG` (`DOUBLE PRECISION`) is the exact mean, rounded
+      once, also for integers beyond 2^53 and for decimals
+    - Doubles: a NaN, or both infinities, make `SUM` and `AVG` NaN, and one
+      infinity makes them that infinity, as adding them in any order would;
+      the variances are then NaN, as in Postgres. A finite sum beyond the
+      largest double is an infinity, as before (Postgres raises "value out
+      of range: overflow")
+    - Adding a value costs an integer addition, about 25 ns for a double
+      (40 ns with the squares a variance needs), against 3–7 µs to read a
+      row
+    - **Upgrading:** results of v0.0.7 and earlier can differ in their last
+      digits: `SUM`, `AVG` and the variances of doubles, `AVG` of decimals,
+      and `AVG` of integers whose sum is beyond 2^53. The new value is the
+      correctly rounded one. `SUM` of integers no longer fails when a running
+      total overflows and the final one fits, and a decimal `SUM` whose
+      values include integers (`SUM(CASE WHEN … THEN 1 ELSE 2.5 END)`) no
+      longer leaves the integers out
   - `STRING_AGG(x, sep [ORDER BY …])`, and `LISTAGG(x [, sep]) [WITHIN GROUP
     (ORDER BY …)]` (Snowflake, Oracle; `sep` defaults to `''`);
     `STRING_AGG(x, sep) WITHIN GROUP (ORDER BY …)` also works (SQL Server).
@@ -1190,10 +1231,10 @@ field, even if later rows have it.
     non-NULL value of the group)
   - `VAR_SAMP` / `VARIANCE`, `VAR_POP`, `STDDEV_SAMP` / `STDDEV`,
     `STDDEV_POP` return `DOUBLE PRECISION` (PostgreSQL returns `numeric` for
-    integer and numeric inputs). Integers and decimals are summed exactly, so
-    the result is the correctly rounded double whatever the values' size;
-    doubles use Welford's algorithm. The sample versions are NULL for one
-    value, the population ones 0
+    integer and numeric inputs). The values and their squares are summed
+    exactly, so the result is the correctly rounded double whatever the
+    values' type and size. The sample versions are NULL for one value, the
+    population ones 0
   - Ordered-set aggregates: `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)`
     interpolates (numbers as doubles, and intervals), `PERCENTILE_DISC(f)
     WITHIN GROUP (ORDER BY x)` returns the first value at or past fraction
@@ -1284,21 +1325,40 @@ field, even if later rows have it.
   the text to `n` characters, and `CHAR(n)` pads it (see String lengths)
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
   negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD` / `%`,
-  `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
-  `EXP`, `SIGN`, `ABS`, `RANDOM()`
+  `POWER` / `POW`, `SQRT`, `CBRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`,
+  `LOG10`, `EXP`, `SIGN`, `ABS`, `PI()`, `RANDOM()`
   - `ROUND` rounds half away from zero: exactly on `NUMERIC`, and on
     `DOUBLE PRECISION` too, by the value as written (`ROUND(2.675e0, 2)` is
     2.68). Postgres rounds doubles half to even
   - Integers and doubles keep their type. `ROUND(NUMERIC(p,s), n)` has scale
     `n` (at most `s`); `ROUND(x)`, `TRUNC(x)`, `FLOOR` and `CEIL` scale 0.
     `MOD` and `%` have their arguments' common type (`NUMERIC` stays
-    exact); `SQRT`, `LN`, `LOG`, `EXP`,
-    `POWER` and `RANDOM` return `DOUBLE PRECISION`
+    exact); `SQRT`, `CBRT`, `LN`, `LOG`, `EXP`, `POWER`, `PI` and `RANDOM`
+    return `DOUBLE PRECISION`
   - Errors as in Postgres for the square root of a negative number, the
     logarithm of zero or of a negative number, `MOD` / `%` by zero (of any
     numeric type), zero to a negative power, and overflow. `EXP` of a double
     that underflows is an error too ("value out of range: underflow"); `EXP`
     of a `NUMERIC` then returns 0, as Postgres's `exp(numeric)` does
+- Trigonometric functions, as in Postgres, all `DOUBLE PRECISION`:
+  - In radians: `SIN`, `COS`, `TAN`, `COT`, `ASIN`, `ACOS`, `ATAN`,
+    `ATAN2(y, x)`; `RADIANS(degrees)` and `DEGREES(radians)` convert
+  - In degrees: `SIND`, `COSD`, `TAND`, `COTD`, `ASIND`, `ACOSD`, `ATAND`,
+    `ATAN2D(y, x)`. With Postgres's algorithm, they are exact where the
+    result is a simple number: `SIND(30)` is 0.5, `COSD(60)` 0.5, `TAND(45)`
+    1, `ASIND(0.5)` 30, `ATAN2D(1, 1)` 45, and `TAND(90)` and `COTD(0)` are
+    Infinity
+  - Arguments are numbers (or text that converts); a NULL argument gives
+    NULL and a NaN gives NaN. Errors as in Postgres: `ASIN: input is out of
+    range` for an argument beyond [-1, 1] of `ASIN`, `ACOS`, `ASIND` and
+    `ACOSD`, and for an infinite one of the sines, cosines, tangents and
+    cotangents; `DEGREES` can overflow and `RADIANS` underflow ("value out of
+    range: …")
+  - The radian functions are Go's `math` package. Postgres uses the
+    platform's C library, which can differ in the last bit: `TAN(1)` is
+    1.557407724654902 here and 1.5574077246549023 with glibc
+  - So dbt_utils' `haversine_distance` works, in its default form (with
+    `radians`) and in its BigQuery form (with `acos(-1)`)
 - String functions; positions are 1-based and count characters, not bytes:
   - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`
     (with text arguments, the pattern forms below),
