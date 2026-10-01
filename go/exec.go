@@ -522,6 +522,9 @@ type selectPlan struct {
 	// of each key in ORDER BY order (see runDistinct).
 	distinct   bool
 	distinctOn []planItem
+	// grouping is set for a query with grouping sets (or GROUPING()): it
+	// runs over the combined groups of its sets (see grouping.go).
+	grouping *groupingPlan
 }
 
 // windowed reports whether the query computes window functions (or
@@ -756,6 +759,9 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			return nil, err
 		}
 	}
+	if sel.GroupingSets != nil || usesGrouping(sel) {
+		return e.planGroupingSets(plan, types)
+	}
 	return plan, nil
 }
 
@@ -797,7 +803,7 @@ func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) (
 // distinctAsGroupBy rewrites SELECT DISTINCT over plain expressions (no
 // aggregates, windows, stars, subqueries or RANDOM()) as GROUP BY them.
 func distinctAsGroupBy(sel *SelectStmt) (*SelectStmt, bool) {
-	if !sel.Distinct || len(sel.DistinctOn) > 0 || len(sel.GroupBy) > 0 || sel.Having != nil ||
+	if !sel.Distinct || len(sel.DistinctOn) > 0 || len(sel.GroupBy) > 0 || sel.GroupingSets != nil || sel.Having != nil ||
 		len(sel.Windows) > 0 || sel.Qualify != nil {
 		return nil, false
 	}

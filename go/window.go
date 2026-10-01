@@ -635,6 +635,17 @@ func exprEqual(a, b Expr) bool {
 			}
 		}
 		return true
+	case *Case:
+		y, ok := b.(*Case)
+		if !ok || len(x.Whens) != len(y.Whens) || !exprEqual(x.Operand, y.Operand) || !exprEqual(x.Else, y.Else) {
+			return false
+		}
+		for i, w := range x.Whens {
+			if !exprEqual(w.When, y.Whens[i].When) || !exprEqual(w.Then, y.Whens[i].Then) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
