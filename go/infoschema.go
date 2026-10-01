@@ -24,6 +24,10 @@ package redis
 //	          ordinal_position, data_type, is_nullable, numeric_precision,
 //	          numeric_scale, datetime_precision, is_indexed)
 //	views    (table_catalog, table_schema, table_name, view_definition)
+//
+// The connection's own temporary tables and views are included under schema
+// pg_temp (temporary tables with table_type LOCAL TEMPORARY, as in
+// Postgres); other connections' temporary objects are not.
 
 import (
 	"context"
@@ -123,33 +127,48 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 	if err != nil {
 		return nil, err
 	}
+	// Each schema is listed under its own name, except the connection's
+	// temporary schema (stored as pg_temp_<id>), which is listed as pg_temp.
+	type space struct{ name, stored string }
+	spaces := make([]space, 0, len(schemas)+1)
+	for _, s := range schemas {
+		spaces = append(spaces, space{s, s})
+	}
+	if e.store.hasTempObjects() {
+		spaces = append(spaces, space{tempAlias, e.store.tempSchema()})
+	}
 	var rows [][]Value
 	if key == "schemata" {
-		for _, s := range append(schemas, infoSchema) {
-			rows = append(rows, []Value{stringValue(catalogName), stringValue(s)})
+		for _, s := range append(spaces, space{name: infoSchema}) {
+			rows = append(rows, []Value{stringValue(catalogName), stringValue(s.name)})
 		}
 		return memTable(key, cols, rows, nil)
 	}
-	for _, schema := range schemas {
-		tables, err := e.store.listTables(ctx, schema)
+	for _, sp := range spaces {
+		schema, stored := sp.name, sp.stored
+		tableType := "BASE TABLE"
+		if isTempSchema(stored) {
+			tableType = "LOCAL TEMPORARY"
+		}
+		tables, err := e.store.listTables(ctx, stored)
 		if err != nil {
 			return nil, err
 		}
-		views, err := e.store.listViews(ctx, schema)
+		views, err := e.store.listViews(ctx, stored)
 		if err != nil {
 			return nil, err
 		}
 		switch key {
 		case "tables":
 			for _, t := range tables {
-				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(t), stringValue("BASE TABLE")})
+				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(t), stringValue(tableType)})
 			}
 			for _, v := range views {
 				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(v), stringValue("VIEW")})
 			}
 		case "columns":
 			for _, t := range tables {
-				meta, err := e.store.getTable(ctx, schema, t)
+				meta, err := e.store.getTable(ctx, stored, t)
 				if err != nil {
 					continue // dropped meanwhile
 				}
@@ -158,7 +177,7 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 				}
 			}
 			for _, v := range views {
-				vm, err := e.store.getView(ctx, schema, v)
+				vm, err := e.store.getView(ctx, stored, v)
 				if err != nil {
 					continue
 				}
@@ -168,7 +187,7 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 			}
 		case "views":
 			for _, v := range views {
-				vm, err := e.store.getView(ctx, schema, v)
+				vm, err := e.store.getView(ctx, stored, v)
 				if err != nil {
 					continue
 				}

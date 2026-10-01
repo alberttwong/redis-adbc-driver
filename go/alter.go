@@ -57,7 +57,7 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 	if isView {
 		// As in Postgres, ALTER TABLE … RENAME TO also renames a view.
 		if st.Action != AlterRenameTable {
-			return errorf(adbc.StatusInvalidArgument, "%q.%q is a view; ALTER TABLE on a view supports only RENAME TO", schema, name)
+			return errorf(adbc.StatusInvalidArgument, "%q.%q is a view; ALTER TABLE on a view supports only RENAME TO", displaySchema(schema), name)
 		}
 		return e.store.renameView(ctx, schema, name, st.NewTable)
 	}
@@ -75,7 +75,7 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 		return err
 	}
 	if st.View {
-		return errorf(adbc.StatusInvalidArgument, "%q.%q is a table, not a view; use ALTER TABLE", schema, name)
+		return errorf(adbc.StatusInvalidArgument, "%q.%q is a table, not a view; use ALTER TABLE", displaySchema(schema), name)
 	}
 	switch st.Action {
 	case AlterRenameTable:
@@ -104,7 +104,8 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 	if to.Catalog != "" && to.Catalog != catalogName {
 		return errorf(adbc.StatusInvalidArgument, "catalog %q does not exist", to.Catalog)
 	}
-	if to.Schema != "" && to.Schema != meta.Schema {
+	sameSchema := to.Schema == "" || to.Schema == meta.Schema || (isTempAlias(to.Schema) && isTempSchema(meta.Schema))
+	if !sameSchema {
 		return errorf(adbc.StatusNotImplemented, "RENAME TO cannot move a table to another schema")
 	}
 	newName := to.Name
@@ -114,7 +115,7 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 	if exists, err := e.store.viewExists(ctx, meta.Schema, newName); err != nil {
 		return err
 	} else if exists {
-		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", meta.Schema, newName)
+		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", displaySchema(meta.Schema), newName)
 	}
 	s := e.store
 	oldKey, newKey := metaKey(meta.Schema, meta.Name), metaKey(meta.Schema, newName)
@@ -130,7 +131,7 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {
 				return err
 			} else if n > 0 {
-				return errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", meta.Schema, newName)
+				return errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", displaySchema(meta.Schema), newName)
 			}
 			seq, err := tx.Get(ctx, oldSeq).Result()
 			if err != nil && err != goredis.Nil {
@@ -166,9 +167,13 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 		if err == goredis.TxFailedErr {
 			continue
 		}
+		if err == nil {
+			s.trackTemp(meta.Schema, meta.Name, false)
+			s.trackTemp(meta.Schema, newName, true)
+		}
 		return wrapRedis(err, "failed to rename table")
 	}
-	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", meta.Schema, meta.Name)
+	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", displaySchema(meta.Schema), meta.Name)
 }
 
 func (e *executor) renameColumn(ctx context.Context, meta *tableMeta, from, to string) error {

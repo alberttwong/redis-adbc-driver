@@ -41,6 +41,9 @@ func (c *connectionImpl) executor() *executor {
 
 func (c *connectionImpl) Close(ctx context.Context) error {
 	if c.store != nil && c.store.client != nil {
+		// Best effort: whatever can't be dropped now is swept by a later
+		// connection (see temp.go).
+		_ = c.store.dropTempSchema(ctx)
 		err := c.store.client.Close()
 		c.store.client = nil
 		return err
@@ -119,12 +122,17 @@ func (c *connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 }
 
 func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
-	schema := c.schema
-	if dbSchema != nil && *dbSchema != "" {
-		schema = *dbSchema
+	name := TableName{Name: tableName}
+	if catalog != nil {
+		name.Catalog = *catalog
 	}
-	if catalog != nil && *catalog != "" && *catalog != catalogName {
-		return nil, tableNotFound(schema, tableName)
+	if dbSchema != nil {
+		name.Schema = *dbSchema
+	}
+	// Without a schema, a temporary table or view comes first.
+	schema, _, err := c.executor().resolveTable(name)
+	if err != nil {
+		return nil, err
 	}
 	meta, err := c.store.getTable(ctx, schema, tableName)
 	if err != nil {
@@ -181,6 +189,11 @@ func (c *connectionImpl) GetDBSchemasForCatalog(ctx context.Context, catalog str
 	if err != nil {
 		return nil, err
 	}
+	// The connection's own temporary objects are listed under pg_temp.
+	if c.store.hasTempObjects() {
+		all = append(all, tempAlias)
+		slices.Sort(all)
+	}
 	var out []string
 	for _, s := range all {
 		if matchPattern(s, schemaFilter) {
@@ -193,6 +206,11 @@ func (c *connectionImpl) GetDBSchemasForCatalog(ctx context.Context, catalog str
 func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog string, schema string, tableFilter *string, columnFilter *string, includeColumns bool) ([]driverbase.TableInfo, error) {
 	if catalog != catalogName {
 		return nil, nil
+	}
+	if isTempAlias(schema) {
+		schema = c.store.tempSchema()
+	} else if isTempSchema(schema) {
+		return []driverbase.TableInfo{}, nil
 	}
 	tables, err := c.store.listTables(ctx, schema)
 	if err != nil {

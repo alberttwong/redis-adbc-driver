@@ -79,6 +79,8 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		_ = client.Close()
 		return nil, err
 	}
+	// Drop temporary objects of connections that exited without closing.
+	st.sweepTemp(ctx)
 	conn := &connectionImpl{
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 		store:              st,
@@ -180,6 +182,9 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 	case OptionStringDefaultSchema:
 		if value == "" {
 			return errorf(adbc.StatusInvalidArgument, "%s must not be empty", key)
+		}
+		if reservedSchema(value) {
+			return errorf(adbc.StatusInvalidArgument, "%s: schema name %q is reserved for temporary tables and views", key, value)
 		}
 		d.schema = value
 	case OptionStringAggregatePushdown:

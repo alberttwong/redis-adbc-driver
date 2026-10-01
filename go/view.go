@@ -31,6 +31,13 @@ package redis
 //     terms of the base table and pushed into the base table's index scan
 //     together with the view's own WHERE.
 //   - Any other view is computed once per statement, like a derived table.
+//
+// A temporary view (CREATE TEMP VIEW) lives in the connection's temporary
+// schema (see temp.go). Unqualified names in its query resolve like they do
+// in the connection's own statements: temporary objects first, then the
+// schema that was current when the view was created. A permanent view can't
+// refer to temporary objects, and temporary objects never shadow the names
+// used inside a permanent view.
 
 import (
 	"context"
@@ -48,13 +55,16 @@ type viewMeta struct {
 	Name    string       `json:"name"`
 	SQL     string       `json:"sql"`
 	Columns []columnMeta `json:"columns"`
+	// DefaultSchema is where a temporary view's unqualified names resolve
+	// (after temporary objects). Permanent views use their own schema.
+	DefaultSchema string `json:"default_schema,omitempty"`
 }
 
 func viewKey(schema, name string) string { return metaPrefix + "view:" + tableKeySuffix(schema, name) }
 func viewsKey(schema string) string      { return metaPrefix + "views:" + escapeKeyPart(schema) }
 
 func viewNotFound(schema, name string) error {
-	return errorf(adbc.StatusNotFound, "view %q.%q does not exist", schema, name)
+	return errorf(adbc.StatusNotFound, "view %q.%q does not exist", displaySchema(schema), name)
 }
 
 func (s *store) getView(ctx context.Context, schema, name string) (*viewMeta, error) {
@@ -81,8 +91,8 @@ func (s *store) viewExists(ctx context.Context, schema, name string) (bool, erro
 }
 
 func (s *store) putView(ctx context.Context, v *viewMeta) error {
-	if isInfoSchema(v.Schema) {
-		return infoSchemaReadOnly()
+	if err := s.checkWritableSchema(v.Schema); err != nil {
+		return err
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -91,10 +101,13 @@ func (s *store) putView(ctx context.Context, v *viewMeta) error {
 	pipe := s.client.TxPipeline()
 	pipe.Set(ctx, viewKey(v.Schema, v.Name), raw, 0)
 	pipe.SAdd(ctx, viewsKey(v.Schema), v.Name)
-	pipe.SAdd(ctx, schemasKey, v.Schema)
+	if !isTempSchema(v.Schema) {
+		pipe.SAdd(ctx, schemasKey, v.Schema)
+	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return wrapRedis(err, "failed to create view")
 	}
+	s.trackTemp(v.Schema, v.Name, true)
 	return nil
 }
 
@@ -115,6 +128,7 @@ func (s *store) dropView(ctx context.Context, schema, name string, ifExists bool
 	if _, err := pipe.Exec(ctx); err != nil {
 		return wrapRedis(err, "failed to drop view")
 	}
+	s.trackTemp(schema, name, false)
 	return nil
 }
 
@@ -126,7 +140,7 @@ func (s *store) renameView(ctx context.Context, schema, name string, to TableNam
 	if to.Catalog != "" && to.Catalog != catalogName {
 		return errorf(adbc.StatusInvalidArgument, "catalog %q does not exist", to.Catalog)
 	}
-	if to.Schema != "" && to.Schema != schema {
+	if to.Schema != "" && to.Schema != schema && !(isTempAlias(to.Schema) && isTempSchema(schema)) {
 		return errorf(adbc.StatusNotImplemented, "RENAME TO cannot move a view to another schema")
 	}
 	newName := to.Name
@@ -150,12 +164,12 @@ func (s *store) renameView(ctx context.Context, schema, name string, to TableNam
 			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {
 				return err
 			} else if n > 0 {
-				return errorf(adbc.StatusAlreadyExists, "view %q.%q already exists", schema, newName)
+				return errorf(adbc.StatusAlreadyExists, "view %q.%q already exists", displaySchema(schema), newName)
 			}
 			if n, err := tx.Exists(ctx, tableKey).Result(); err != nil {
 				return err
 			} else if n > 0 {
-				return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a table", schema, newName)
+				return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a table", displaySchema(schema), newName)
 			}
 			v.Name = newName
 			out, err := json.Marshal(&v)
@@ -174,9 +188,13 @@ func (s *store) renameView(ctx context.Context, schema, name string, to TableNam
 		if errors.Is(err, goredis.TxFailedErr) {
 			continue // concurrent change: retry
 		}
+		if err == nil {
+			s.trackTemp(schema, name, false)
+			s.trackTemp(schema, newName, true)
+		}
 		return wrapRedis(err, "failed to rename view")
 	}
-	return errorf(adbc.StatusIO, "view %q.%q is being changed concurrently; try again", schema, name)
+	return errorf(adbc.StatusIO, "view %q.%q is being changed concurrently; try again", displaySchema(schema), name)
 }
 
 func (s *store) listViews(ctx context.Context, schema string) ([]string, error) {
@@ -191,34 +209,37 @@ func (s *store) listViews(ctx context.Context, schema string) ([]string, error) 
 // ---- executor ----
 
 // isolated runs fn as if at the top level of a statement in schema: no
-// enclosing scopes or CTEs are visible (used for view bodies).
-func (e *executor) isolated(schema string, fn func() error) error {
+// enclosing scopes or CTEs are visible (used for view bodies). Unqualified
+// names resolve to temporary objects only if temp is set.
+func (e *executor) isolated(schema string, temp bool, fn func() error) error {
 	saved := struct {
 		scopes []*scope
 		sq     *Subquery
 		ctes   []map[string]*CTE
 		schema string
 		outer  *evalEnv
-	}{e.scopes, e.pendingSq, e.ctes, e.schema, e.outer}
-	e.scopes, e.pendingSq, e.ctes, e.schema, e.outer = nil, nil, nil, schema, nil
+		noTemp bool
+	}{e.scopes, e.pendingSq, e.ctes, e.schema, e.outer, e.noTemp}
+	e.scopes, e.pendingSq, e.ctes, e.schema, e.outer, e.noTemp = nil, nil, nil, schema, nil, !temp
 	defer func() {
-		e.scopes, e.pendingSq, e.ctes, e.schema, e.outer = saved.scopes, saved.sq, saved.ctes, saved.schema, saved.outer
+		e.scopes, e.pendingSq, e.ctes, e.schema, e.outer, e.noTemp = saved.scopes, saved.sq, saved.ctes, saved.schema, saved.outer, saved.noTemp
 	}()
 	return fn()
 }
 
 func (e *executor) runCreateView(ctx context.Context, st *CreateViewStmt, numParams int) error {
-	schema, name, err := e.resolveTable(st.Name)
-	if err != nil {
-		return err
-	}
 	if numParams > 0 {
 		return errorf(adbc.StatusInvalidArgument, "views cannot contain parameters")
 	}
+	schema, name, err := e.resolveCreate(ctx, st.Name, st.Temporary)
+	if err != nil {
+		return err
+	}
+	temp := isTempSchema(schema)
 	if exists, err := e.store.tableExists(ctx, schema, name); err != nil {
 		return err
 	} else if exists {
-		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a table", schema, name)
+		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a table", displaySchema(schema), name)
 	}
 	if exists, err := e.store.viewExists(ctx, schema, name); err != nil {
 		return err
@@ -226,15 +247,21 @@ func (e *executor) runCreateView(ctx context.Context, st *CreateViewStmt, numPar
 		if st.IfNotExists {
 			return nil
 		}
-		return errorf(adbc.StatusAlreadyExists, "view %q.%q already exists", schema, name)
+		return errorf(adbc.StatusAlreadyExists, "view %q.%q already exists", displaySchema(schema), name)
 	}
 	// Plan the body now, both to reject invalid views and to record the
-	// view's column names and types.
+	// view's column names and types. A temporary view's unqualified names
+	// resolve in the current schema.
+	home := schema
+	if temp {
+		home = e.schema
+	}
 	var cols []resultColumn
 	key := "view:" + schema + "." + name
 	e.cache.materializing[key] = true
 	defer delete(e.cache.materializing, key)
-	err = e.isolated(schema, func() error {
+	e.cache.usedTemp = false
+	err = e.isolated(home, true, func() error {
 		plan, err := e.planSelect(ctx, st.Select, nil)
 		if err != nil {
 			return err
@@ -245,10 +272,16 @@ func (e *executor) runCreateView(ctx context.Context, st *CreateViewStmt, numPar
 	if err != nil {
 		return err
 	}
+	if !temp && e.cache.usedTemp {
+		return errorf(adbc.StatusInvalidArgument, "view %q refers to a temporary table or view; use CREATE TEMP VIEW", name)
+	}
 	if st.Columns != nil && len(st.Columns) != len(cols) {
 		return errorf(adbc.StatusInvalidArgument, "view has %d columns but %d column names were given", len(cols), len(st.Columns))
 	}
 	v := &viewMeta{Schema: schema, Name: name, SQL: st.Text}
+	if temp {
+		v.DefaultSchema = home
+	}
 	seen := map[string]bool{}
 	for i, c := range cols {
 		n := c.Name
@@ -296,8 +329,12 @@ func (e *executor) viewRelation(ctx context.Context, v *viewMeta, alias string) 
 	for i, c := range v.Columns {
 		names[i] = c.Name
 	}
+	home, temp := v.Schema, isTempSchema(v.Schema)
+	if temp && v.DefaultSchema != "" {
+		home = v.DefaultSchema
+	}
 	var out *tableMeta
-	err = e.isolated(v.Schema, func() error {
+	err = e.isolated(home, temp, func() error {
 		plan, err := e.planSelect(ctx, sel, nil)
 		if err != nil {
 			return errorf(adbc.StatusInvalidArgument, "view %q is no longer valid: %v", v.Name, err)

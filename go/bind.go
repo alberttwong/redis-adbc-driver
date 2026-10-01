@@ -58,6 +58,8 @@ type execCache struct {
 	ctes          map[*CTE]*tableMeta
 	derived       map[*SelectStmt]*tableMeta
 	materializing map[any]bool
+	// usedTemp is set when a name resolves to a temporary object.
+	usedTemp bool
 }
 
 func newExecCache() *execCache {

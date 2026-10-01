@@ -23,21 +23,23 @@ It supports SQL queries and Arrow bulk ingestion.
 
 ## Tested with
 
-The full validation suite (322 passed, 0 failed) has been run against:
+The full validation suite (324 passed, 0 failed) has been run against:
 
 | Server | Version | Connection |
 |-|-|-|
 | Redis Open Source (`redis:8.4` Docker image) | 8.4.4, Search 8.4.10 | `redis://` |
 | Redis Open Source cluster, 3 shards (OSS Cluster API) | 8.4.4, Search 8.4.10 | `redis://` |
-| Redis Cloud, single shard | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`)* |
-| Redis Cloud Pro, 2 shards, through the proxy endpoint | 8.6.2 | `redis://` |
-| Redis Cloud Pro, 2 shards, OSS Cluster API enabled | 8.6.2 | `redis://` |
+| Redis Cloud, single shard | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`)*† |
+| Redis Cloud Pro, 2 shards, through the proxy endpoint | 8.6.2 | `redis://`† |
+| Redis Cloud Pro, 2 shards, OSS Cluster API enabled | 8.6.2 | `redis://`† |
 
 \* Run before cluster support was added; not re-run since.
+† Run before the two temporary-table ingest tests were enabled (322
+passed, 0 failed); not re-run since.
 
-The remaining 12 skipped tests and 1 expected failure are features the
-driver doesn't offer: constraints, statistics, a second catalog, temporary
-tables, transactions, and parameter-type introspection.
+The remaining 10 skipped tests and 1 expected failure are features the
+driver doesn't offer: constraints, statistics, a second catalog,
+transactions, and parameter-type introspection.
 
 ## Server requirements
 
@@ -63,10 +65,10 @@ requirement is the Query Engine.
   on standalone servers only database 0 has been tested.
 - **ACL permissions** (if ACLs are enabled):
   - commands: `FT.*`, `HSET/HMGET/HDEL/DEL`, `GET/SET/SETNX/EXISTS/INCRBY`,
-    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC`, `INFO`, `PING`, `HELLO`,
+    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC/WATCH`, `INFO`, `PING`, `HELLO`,
     plus `CLUSTER` on an OSS Cluster API endpoint (to discover the shards)
   - keys: `adbc:*`, plus the row prefix of each schema you use (`public:*`
-    by default)
+    by default, and `pg_temp_*` for temporary tables)
 
 **What the driver does for you**
 
@@ -238,6 +240,13 @@ SELECT order_id, customer_id, country, product, quantity FROM sales WHERE status
 SELECT COUNT(*) FROM shipped_sales WHERE country = 'JPN' AND quantity >= 15;
 DROP VIEW shipped_sales;
 
+-- Temporary tables and views belong to this connection: other connections
+-- don't see them, and they are dropped when it closes
+CREATE TEMP TABLE big_jpn AS
+SELECT order_id, customer_id, quantity FROM sales WHERE country = 'JPN' AND quantity >= 18;
+SELECT c.name, COUNT(*) AS orders FROM big_jpn b JOIN customers c ON c.customer_id = b.customer_id
+GROUP BY c.name ORDER BY orders DESC, c.name LIMIT 3;
+
 -- Set operations: each branch runs in its own index; the driver combines them
 SELECT country FROM customers WHERE customer_id <= 10
 UNION
@@ -348,6 +357,17 @@ Stop Redis with `docker compose down`.
   `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
+- **Temporary tables and views** use the same layout in a private schema
+  per connection, `pg_temp_<id>` (rows `pg_temp_<id>:<table>:<rowid>`, index
+  `idx:pg_temp_<id>:<table>`), which is never added to
+  `adbc:{meta}:schemas`. The connection id comes from the counter
+  `adbc:{meta}:temp:next` when the connection creates its first temporary
+  object. `adbc:{meta}:temp:owners` lists the connections that have a
+  temporary schema, and `adbc:{meta}:temp:alive:<id>` shows that the owner
+  is still open: it has a 2-minute TTL that the connection refreshes every
+  30 seconds. Closing the connection drops its temporary objects and these
+  keys. A new connection drops the temporary objects of any owner whose
+  alive key has expired, re-checking the key before each object.
 
 How SQL is executed:
 
@@ -361,6 +381,7 @@ How SQL is executed:
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
 | Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
@@ -405,6 +426,39 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   renames a view, as in Postgres; other `ALTER TABLE` actions on a view are
   rejected). Renaming changes metadata only; views that read the object by
   its old name stop working, as they do after a table rename
+- `CREATE {TEMP | TEMPORARY} TABLE [IF NOT EXISTS] t (…)`,
+  `CREATE TEMP TABLE [IF NOT EXISTS] t AS [(]SELECT …[)]`,
+  `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v [(cols)] AS SELECT …`, and
+  bulk ingest with `adbc.ingest.temporary`. Temporary tables and views work
+  like permanent ones in every statement (joins with permanent tables, CTEs,
+  `ALTER`, `TRUNCATE`, `DROP`, …), with these differences:
+  - **Scope:** only the ADBC connection that created them sees them, so two
+    connections can each have a temporary table with the same name.
+  - **Lifetime:** they are dropped when the connection is closed
+    (`AdbcConnectionRelease`). If the process exits without closing it, the
+    next connection to open after the 2-minute heartbeat TTL has expired
+    drops them. A connection that can't reach Redis for longer than that may
+    lose its temporary objects.
+  - **Names:** an unqualified name means a temporary table or view first, so
+    it shadows a permanent one of the same name, as in Postgres. `schema.t`
+    always means a permanent table, and `pg_temp.t` the temporary one
+    (`CREATE TABLE pg_temp.t` creates a temporary table). Without `TEMP`,
+    `CREATE TABLE` / `CREATE VIEW` create permanent objects, and bulk ingest
+    without `adbc.ingest.temporary` targets the permanent table. The schema
+    names `pg_temp` and `pg_temp_<digits>` are reserved.
+  - **Metadata:** `GetObjects` and `information_schema` list them under the
+    schema `pg_temp`, only for the connection that owns them and only while
+    it has any. `information_schema.tables` reports temporary tables as
+    `LOCAL TEMPORARY`, as Postgres does.
+  - **Views:** a temporary view may read temporary and permanent tables. Its
+    unqualified names resolve like the connection's own statements:
+    temporary objects first, then the schema that was current when the view
+    was created. A permanent view can't refer to a temporary table or view
+    (`CREATE VIEW` fails; use `CREATE TEMP VIEW`), and temporary objects
+    never shadow the names inside a permanent view. A view keeps only its
+    SQL text, so a temporary table created later with the name of a
+    permanent table that a temporary view reads takes that table's place in
+    the view.
 - `DROP SCHEMA [IF EXISTS] s [CASCADE | RESTRICT]`: `RESTRICT` (the default)
   refuses a schema that still has tables or views; `CASCADE` drops its views,
   then its tables (indexes and rows), then the schema. Dependencies between
@@ -526,8 +580,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     interval and duration values can be bound and ingested
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
-  queried): `schemata`, `tables` (`BASE TABLE` / `VIEW`), `columns`
-  (`ordinal_position`, `data_type`, `is_nullable`, `numeric_precision`,
+  queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`),
+  `columns` (`ordinal_position`, `data_type`, `is_nullable`, `numeric_precision`,
   `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
   (`view_definition`). Any SQL works on them, including joins
 - `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
@@ -562,8 +616,9 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)
 
-Tables can be qualified as `schema.table` or `redis.schema.table`. Schemas
-are key namespaces (default `public`). There are no transactions (autocommit
+Tables can be qualified as `schema.table` or `redis.schema.table`, and
+`pg_temp.table` is the connection's temporary table. Schemas are key
+namespaces (default `public`). There are no transactions (autocommit
 only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
 every change first (new values and casts, `NOT NULL`, MERGE's
 one-change-per-row rule), so such an error leaves the table untouched. Then
