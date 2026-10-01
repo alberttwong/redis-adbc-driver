@@ -1083,7 +1083,7 @@ var reservedAfterExpr = map[string]bool{
 	"INTERSECT": true, "EXCEPT": true, "MINUS": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
-	"WINDOW": true, "QUALIFY": true, "RETURNING": true,
+	"WINDOW": true, "QUALIFY": true, "RETURNING": true, "FETCH": true,
 }
 
 // isQueryStart reports whether the next token begins a (sub)query.
@@ -1290,6 +1290,34 @@ func (p *parser) parseSelectBody(with []CTE) (Stmt, error) {
 		sel.OrderBy = items
 	}
 	for {
+		if (p.isKeyword("LIMIT") || p.isKeyword("FETCH")) && sel.Limit != nil {
+			return nil, &sqlError{msg: "multiple LIMIT clauses not allowed"}
+		}
+		if p.acceptKeyword("FETCH") {
+			// FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY is LIMIT n (1 if
+			// n is left out).
+			if !p.acceptKeyword("FIRST") && !p.acceptKeyword("NEXT") {
+				return nil, syntaxErr("expected FIRST or NEXT after FETCH near %q", p.peek().text)
+			}
+			n := int64(1)
+			if p.peek().kind == tokNumber {
+				var err error
+				if n, err = p.parseCount(); err != nil {
+					return nil, err
+				}
+			}
+			if !p.acceptKeyword("ROWS") && !p.acceptKeyword("ROW") {
+				return nil, syntaxErr("expected ROW or ROWS near %q", p.peek().text)
+			}
+			if p.isKeyword("WITH") {
+				return nil, &sqlError{msg: "FETCH … WITH TIES is not supported"}
+			}
+			if err := p.expectKeyword("ONLY"); err != nil {
+				return nil, err
+			}
+			sel.Limit = &n
+			continue
+		}
 		if p.acceptKeyword("LIMIT") {
 			n, err := p.parseCount()
 			if err != nil {
@@ -1312,7 +1340,9 @@ func (p *parser) parseSelectBody(with []CTE) (Stmt, error) {
 				return nil, err
 			}
 			sel.Offset = &n
-			p.acceptKeyword("ROWS")
+			if !p.acceptKeyword("ROWS") {
+				p.acceptKeyword("ROW")
+			}
 			continue
 		}
 		break

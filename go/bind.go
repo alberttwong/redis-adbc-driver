@@ -302,7 +302,9 @@ func memTable(name string, cols []resultColumn, rows [][]Value, rename []string)
 	return meta, nil
 }
 
-// materialize runs a query that has no access to enclosing scopes.
+// materialize runs a query that has no access to enclosing scopes. While
+// only planning, it plans the query and returns an empty relation with its
+// columns (see empty.go).
 func (e *executor) materialize(ctx context.Context, key any, name string, sel *SelectStmt, rename []string) (*tableMeta, error) {
 	if e.cache.materializing[key] {
 		if def, ok := key.(*CTE); ok && def.Recursive {
@@ -318,6 +320,9 @@ func (e *executor) materialize(ctx context.Context, key any, name string, sel *S
 	plan, err := e.planSelect(ctx, sel, e.paramTypes)
 	if err != nil {
 		return nil, err
+	}
+	if e.planOnly {
+		return memTable(name, plan.columns(), nil, rename)
 	}
 	rows, err := e.runSelect(ctx, plan, e.params)
 	if err != nil {
@@ -371,7 +376,10 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 		if err != nil {
 			return nil, "", err
 		}
-		e.cache.derived[sub] = m
+		if !e.planOnly {
+			// An empty stand-in isn't kept: another reference may read it.
+			e.cache.derived[sub] = m
+		}
 		return m, alias, nil
 	case table != nil:
 		if alias == "" {
@@ -394,7 +402,9 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 				if err != nil {
 					return nil, "", err
 				}
-				e.cache.ctes[def] = m
+				if !e.planOnly {
+					e.cache.ctes[def] = m
+				}
 				return m, alias, nil
 			}
 		}

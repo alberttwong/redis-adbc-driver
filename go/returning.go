@@ -221,6 +221,9 @@ func hasReturning(st Stmt) bool {
 // resultColumns plans the result columns of a statement without running it:
 // a query's, or the RETURNING list's. ok is false if it has no result set.
 func (e *executor) resultColumns(ctx context.Context, st Stmt, paramTypes []ColType) (cols []resultColumn, ok bool, err error) {
+	// The statement is only planned: no derived table, CTE or view is run
+	// (see empty.go).
+	defer e.planningOnly(true)()
 	if sel, isSelect := st.(*SelectStmt); isSelect {
 		plan, err := e.planSelect(ctx, sel, paramTypes)
 		if err != nil {

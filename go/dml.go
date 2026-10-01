@@ -100,7 +100,8 @@ func (e *executor) planDMLJoin(ctx context.Context, table TableName, alias strin
 // in the join's scope). need lists the columns the statement reads.
 func (dj *dmlJoin) rows(ctx context.Context, e *executor, where Expr, need map[string]bool, params []Value) ([]map[string]Value, error) {
 	dj.jp.planPushdown(where)
-	_, rows, err := e.scan(ctx, scanRequest{meta: dj.joined, where: wherePlan{residual: where}, need: need}, params)
+	wp := wherePlan{residual: where, none: e.neverTrue(ctx, where)}
+	_, rows, err := e.scan(ctx, scanRequest{meta: dj.joined, where: wp, need: need}, params)
 	return rows, err
 }
 
@@ -124,6 +125,8 @@ func (e *executor) bindWhere(ctx context.Context, where Expr) error {
 // then uses one of the matches, without saying which; here the matches must
 // agree on the new values, and it is an error if they don't.
 func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []Value) (int64, error) {
+	// With a WHERE that is never true, nothing is read (see empty.go).
+	defer e.planningOnly(e.neverTrue(ctx, st.Where))()
 	dj, err := e.planDMLJoin(ctx, st.Table, st.Alias, st.From, "CROSS", nil)
 	if err != nil {
 		return 0, err
@@ -204,6 +207,8 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 // runDeleteUsing implements DELETE FROM t USING items [WHERE …]. A target
 // row that matches several USING rows is deleted once.
 func (e *executor) runDeleteUsing(ctx context.Context, st *DeleteStmt, params []Value) (int64, error) {
+	// With a WHERE that is never true, nothing is read (see empty.go).
+	defer e.planningOnly(e.neverTrue(ctx, st.Where))()
 	dj, err := e.planDMLJoin(ctx, st.Table, st.Alias, st.Using, "CROSS", nil)
 	if err != nil {
 		return 0, err

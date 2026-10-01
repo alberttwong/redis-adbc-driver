@@ -462,7 +462,7 @@ func (e *executor) semiJoinState(ctx context.Context, sq *Subquery) *semiResult 
 		return r
 	}
 	n := int64(len(wp.keys))
-	if wp.keys == nil {
+	if wp.keys == nil && !wp.none {
 		if n, err = e.store.countMatches(ctx, plan.meta.index(), wp.query); err != nil {
 			r.failed = true
 			return r
@@ -602,7 +602,7 @@ func (e *executor) semiJoinTerm(ctx context.Context, sq *Subquery, meta *tableMe
 		return "", false
 	}
 	if r.rows == 0 {
-		return "@" + rowIDField + ":[-1 -1]", true
+		return noMatchQuery, true
 	}
 	for i, ref := range sq.semi.outer {
 		cm, ok := meta.column(ref.name)

@@ -51,6 +51,9 @@ type wherePlan struct {
 	// keys is set for a direct lookup (WHERE __rowid = N): the rows are read
 	// straight from their HASHes without consulting the index.
 	keys []string
+	// none is set when no row can match (a WHERE that is never true, or
+	// IN over a subquery without rows): the rows aren't read at all.
+	none bool
 }
 
 func conjuncts(e Expr, out []Expr) []Expr {
@@ -148,6 +151,12 @@ func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
 	wp := wherePlan{query: "*"}
 	if where == nil {
+		return wp, nil
+	}
+	if e.neverTrue(ctx, where) {
+		// Before anything else: its subqueries were only planned (see
+		// empty.go).
+		wp.none, wp.residual = true, where
 		return wp, nil
 	}
 	if meta.isMem {
@@ -306,6 +315,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		wp.query = strings.Join(terms, " ")
 	}
 	wp.residual = andAll(residual)
+	wp.none = slices.Contains(terms, noMatchQuery)
 	return wp, nil
 }
 
@@ -367,6 +377,9 @@ type scanRequest struct {
 // the index are read by the FT.AGGREGATE pipeline itself, a cursor page at a
 // time, rather than with one HMGET per row.
 func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
+	if req.where.none {
+		return nil, nil, nil
+	}
 	meta := req.meta
 	if meta.isMem {
 		return e.scanMem(ctx, req, params)
@@ -525,6 +538,11 @@ func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value)
 // ---- SELECT ----
 
 func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	if plan.noRows && !plan.withoutFrom() {
+		// LIMIT 0, or a HAVING or QUALIFY that is never true (see empty.go).
+		// A query without FROM still reports aggregates as unsupported.
+		return nil, nil
+	}
 	if plan.distinct {
 		return e.runDistinct(ctx, plan, params)
 	}
@@ -810,7 +828,7 @@ var indexReducers = map[string]string{
 // exactly by the index; the caller then aggregates in the driver.
 func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wherePlan, aggs []*Func) ([]aggGroup, bool, error) {
 	meta := plan.meta
-	if e.pushdown == PushdownNone || wp.residual != nil || wp.keys != nil || meta.isMem || len(plan.extraNeed) > 0 {
+	if e.pushdown == PushdownNone || wp.residual != nil || wp.keys != nil || wp.none || meta.isMem || len(plan.extraNeed) > 0 {
 		return nil, false, nil
 	}
 	groupCols := make([]columnMeta, 0, len(plan.sel.GroupBy))
@@ -1218,8 +1236,7 @@ func unionQuery(cm columnMeta, values []Value) (string, bool) {
 		}
 	}
 	if len(parts) == 0 {
-		// Nothing can match; __rowid is never negative.
-		return "@" + rowIDField + ":[-1 -1]", true
+		return noMatchQuery, true
 	}
 	q := "(" + strings.Join(parts, " | ") + ")"
 	if cm.Type.Kind == KindString {
