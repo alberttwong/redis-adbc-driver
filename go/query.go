@@ -71,7 +71,8 @@ func isConstant(e Expr) bool {
 				constant = false
 			}
 		case *Func:
-			if aggregateFuncs[f.Name] {
+			// RANDOM() differs per row, so it is not computed once.
+			if aggregateFuncs[f.Name] || volatileFuncs[f.Name] {
 				constant = false
 			}
 		case *Subquery:

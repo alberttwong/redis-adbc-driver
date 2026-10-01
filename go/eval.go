@@ -275,6 +275,12 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 		return Value{}, fmt.Errorf("aggregate %s is not allowed here", f.Name)
 	}
+	if err := checkArity(f); err != nil {
+		return Value{}, err
+	}
+	if f.Name == "IIF" {
+		return env.evalIIF(f)
+	}
 	args := make([]Value, len(f.Args))
 	for i, a := range f.Args {
 		v, err := env.eval(a)
@@ -291,15 +297,16 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 	}
 	switch f.Name {
 	case "COALESCE", "IFNULL", "NVL":
+		// The result has the arguments' common type.
+		t := unifiedType(f, argTypes(args))
 		for _, a := range args {
 			if !a.Null {
-				return a, nil
+				return Coerce(a, t)
 			}
 		}
-		if len(args) > 0 {
-			return args[len(args)-1], nil
-		}
-		return nullValue(typeNull), nil
+		return nullValue(t), nil
+	case "NULLIF", "GREATEST", "LEAST":
+		return evalConditional(f, args)
 	}
 	for _, a := range args {
 		if a.Null {
@@ -307,6 +314,9 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 	}
 	if v, ok, err := env.evalDateTimeFunc(f, args); ok {
+		return v, err
+	}
+	if v, ok, err := evalScalarFunc(f, args); ok {
 		return v, err
 	}
 	switch f.Name {
@@ -581,6 +591,9 @@ func inferFuncType(f *Func, args []ColType) ColType {
 	if t, ok := dateTimeFuncType(f, args); ok {
 		return t
 	}
+	if t, ok := scalarFuncType(f, args); ok {
+		return t
+	}
 	switch f.Name {
 	case "COUNT", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LEN":
 		return typeInt64
@@ -607,12 +620,7 @@ func inferFuncType(f *Func, args []ColType) ColType {
 			return args[0]
 		}
 	case "COALESCE", "IFNULL", "NVL":
-		for _, a := range args {
-			if a.Kind != KindNull {
-				return a
-			}
-		}
-		return typeNull
+		return unifiedType(f, args)
 	}
 	return typeNull
 }
@@ -661,6 +669,9 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 		}
 		return arithmeticType(x.Op, l, r)
 	case *Func:
+		if err := checkArity(x); err != nil {
+			return ColType{}, err
+		}
 		args := make([]ColType, len(x.Args))
 		for i, a := range x.Args {
 			t, err := inferType(a, cols, params)
@@ -697,7 +708,7 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 }
 
 // commonType is the type that can hold values of both a and b (used for
-// the branches of CASE).
+// the branches of CASE and the arguments of COALESCE, GREATEST and LEAST).
 func commonType(a, b ColType) ColType {
 	switch {
 	case a.Kind == KindNull:
@@ -724,6 +735,10 @@ func commonType(a, b ColType) ColType {
 		if unitsPerSecond[b.Unit] > unitsPerSecond[a.Unit] {
 			return b
 		}
+		return a
+	case a.Kind == KindDate && b.Kind == KindTimestamp:
+		return b
+	case a.Kind == KindTimestamp && b.Kind == KindDate:
 		return a
 	case a.Kind == b.Kind:
 		return a

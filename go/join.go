@@ -174,7 +174,8 @@ func (e *executor) bindJoin(ctx context.Context, sel *SelectStmt, jp *joinPlan) 
 
 // itemsOf returns the indexes of the join items an expression reads, and
 // whether it can be moved (it has no correlated subquery, whose references
-// would be invisible here).
+// would be invisible here, and no volatile function, which would be
+// evaluated again on the joined rows).
 func (jp *joinPlan) itemsOf(expr Expr) ([]int, bool) {
 	movable := true
 	refs := map[string]bool{}
@@ -186,6 +187,10 @@ func (jp *joinPlan) itemsOf(expr Expr) ([]int, bool) {
 			}
 		case *Subquery:
 			if v.correlated {
+				movable = false
+			}
+		case *Func:
+			if volatileFuncs[v.Name] {
 				movable = false
 			}
 		}

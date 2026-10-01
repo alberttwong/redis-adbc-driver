@@ -1423,3 +1423,229 @@ func TestSQLAlterViewRename(t *testing.T) {
 	h.expectError("ALTER SEQUENCE s RENAME TO t", "expected ALTER TABLE or ALTER VIEW")
 	h.expectRows("SELECT id FROM it_av_m ORDER BY id", "2", "3")
 }
+
+// planOf plans a SELECT the way the driver runs it and reports the index
+// query, whether a residual predicate is left for the driver to evaluate on
+// fetched rows, and whether the aggregates run inside FT.AGGREGATE.
+func (h *sqlHarness) planOf(sql string) (query string, residual, indexAgg bool) {
+	h.t.Helper()
+	parsed, err := ParseScript(sql)
+	if err != nil {
+		h.t.Fatalf("%s: %v", sql, err)
+	}
+	e := &executor{store: &store{client: h.rawClient()}, schema: "public", pushdown: PushdownExact, now: time.Now().UTC()}
+	e.cache = newExecCache()
+	plan, err := e.planSelect(h.ctx, parsed[0].Stmt.(*SelectStmt), nil)
+	if err != nil {
+		h.t.Fatalf("%s: %v", sql, err)
+	}
+	wp, err := e.planWhere(h.ctx, plan.sel.Where, plan.meta, nil)
+	if err != nil {
+		h.t.Fatalf("%s: %v", sql, err)
+	}
+	if plan.aggregate {
+		var aggs []*Func
+		for _, it := range plan.items {
+			collectAggregates(it.expr, &aggs)
+		}
+		if _, indexAgg, err = e.indexAggregate(h.ctx, plan, wp, aggs); err != nil {
+			h.t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	return wp.query, wp.residual != nil, indexAgg
+}
+
+func TestSQLScalarFunctions(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP VIEW IF EXISTS it_fn_rand")
+	h.exec("DROP TABLE IF EXISTS it_fn")
+	h.exec("DROP TABLE IF EXISTS it_fn_ctas")
+	h.exec(`CREATE TABLE it_fn (id INTEGER, amt NUMERIC(10,3), x DOUBLE, n BIGINT, s VARCHAR, code VARCHAR, d DATE, ts TIMESTAMP(6))`)
+	h.exec(`INSERT INTO it_fn VALUES
+		(1, 2.345, 2.5, 1250, '  Hello World  ', 'ab-12-x', DATE '2024-02-29', TIMESTAMP '2024-03-01 10:00:00'),
+		(2, -2.345, -2.675, -1249, 'héllo wörld', 'cd-345-y', DATE '2024-01-01', TIMESTAMP '2023-12-31 23:00:00'),
+		(3, 9.995, 0.5, 7, '', 'ef--z', DATE '2023-06-15', NULL),
+		(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+	t.Cleanup(func() {
+		h.exec("DROP VIEW IF EXISTS it_fn_rand")
+		h.exec("DROP TABLE IF EXISTS it_fn")
+		h.exec("DROP TABLE IF EXISTS it_fn_ctas")
+	})
+
+	// Math on NUMERIC: exact, half away from zero; NULL in, NULL out.
+	h.expectRows(`SELECT id, ROUND(amt, 2), ROUND(amt), TRUNC(amt, 1), FLOOR(amt), CEIL(amt), SIGN(amt) FROM it_fn ORDER BY id`,
+		"1|2.35|2|2.3|2|3|1", "2|-2.35|-2|-2.3|-3|-2|-1", "3|10.00|10|9.9|9|10|1", "4|NULL|NULL|NULL|NULL|NULL|NULL")
+	// On DOUBLE, also half away from zero (Postgres would round half to
+	// even), and on the decimal value as written (-2.675 is -2.67499… in binary).
+	h.expectRows(`SELECT id, ROUND(x), ROUND(x, 2), TRUNC(x), FLOOR(x), CEILING(x) FROM it_fn ORDER BY id`,
+		"1|3|2.5|2|2|3", "2|-3|-2.68|-2|-3|-2", "3|1|0.5|0|0|1", "4|NULL|NULL|NULL|NULL|NULL")
+	h.expectRows(`SELECT id, ROUND(n, -2), TRUNC(n, -2), MOD(n, 7), SIGN(n), ABS(n) FROM it_fn ORDER BY id`,
+		"1|1300|1200|4|1|1250", "2|-1200|-1200|-3|-1|1249", "3|0|0|0|1|7", "4|NULL|NULL|NULL|NULL|NULL")
+	h.expectRows(`SELECT id, POWER(id, 2), SQRT(id * id), LOG(10, POWER(10, id)), LOG10(POWER(10, id)), EXP(0 * id), LN(1) FROM it_fn ORDER BY id`,
+		"1|1|1|1|1|1|0", "2|4|2|2|2|1|0", "3|9|3|3|3|1|0", "4|16|4|4|4|1|0")
+	got, _ := h.query(`SELECT RANDOM(), RANDOM() FROM it_fn`)
+	if len(got) != 4 || got[0] == got[1] {
+		t.Errorf("RANDOM() per row = %q, want 4 rows of distinct values", got)
+	}
+
+	// Strings: positions count characters.
+	h.expectRows(`SELECT id, TRIM(s), LENGTH(TRIM(s)), UPPER(LEFT(TRIM(s), 3)), RIGHT(TRIM(s), 3),
+			SUBSTRING(TRIM(s) FROM 2 FOR 4), POSITION('o' IN s), REVERSE(TRIM(s)), INITCAP(s)
+		FROM it_fn ORDER BY id`,
+		"1|Hello World|11|HEL|rld|ello|7|dlroW olleH|  Hello World  ",
+		"2|héllo wörld|11|HÉL|rld|éllo|5|dlröw olléh|Héllo Wörld",
+		"3||0||||0||",
+		"4|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL")
+	h.expectRows(`SELECT id, SPLIT_PART(code, '-', 2), SPLIT_PART(code, '-', -1), REPLACE(code, '-', '/'),
+			LPAD(SPLIT_PART(code, '-', 2), 5, '0'), RPAD(code, 4, '.'), REGEXP_REPLACE(code, '[0-9]+', '#'),
+			REGEXP_REPLACE(code, '[a-z]', '_', 'g'), STARTS_WITH(code, 'cd')
+		FROM it_fn ORDER BY id`,
+		"1|12|x|ab/12/x|00012|ab-1|ab-#-x|__-12-_|false",
+		"2|345|y|cd/345/y|00345|cd-3|cd-#-y|__-345-_|true",
+		"3||z|ef//z|00000|ef--|ef--z|__--_|false",
+		"4|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL")
+	h.expectRows(`SELECT TRIM(BOTH ' Hd' FROM s), TRIM(LEADING FROM s), TRIM(TRAILING 'd ' FROM s) FROM it_fn WHERE id = 1`,
+		"ello Worl|Hello World  |  Hello Worl")
+	// dbt's cross-database macros: hash, split_part, right, replace, position.
+	h.expectRows(`SELECT MD5(CAST(id AS VARCHAR)), MD5(code) FROM it_fn WHERE id = 1`,
+		"c4ca4238a0b923820dcc509a6f75849b|e4aa4b61e84ad0745c42ee87571c749b")
+
+	// Conditional functions: GREATEST / LEAST ignore NULLs and widen.
+	schema := h.expectRows(`SELECT id, NULLIF(code, 'ef--z'), GREATEST(amt, x, n), LEAST(amt, x), COALESCE(amt, x, 0),
+			IIF(n > 0, 'pos', 'neg')
+		FROM it_fn ORDER BY id`,
+		"1|ab-12-x|1250|2.345|2.345|pos", "2|cd-345-y|-2.345|-2.675|-2.345|neg",
+		"3|NULL|9.995|0.5|9.995|pos", "4|NULL|NULL|NULL|0|neg")
+	for _, i := range []int{2, 3, 4} {
+		if dt := schema.Field(i).Type; dt.ID() != arrow.FLOAT64 {
+			t.Errorf("column %d type = %s, want double", i, dt)
+		}
+	}
+	h.expectRows(`SELECT id, CAST(GREATEST(d, ts) AS VARCHAR), LEAST(d, DATE '2024-01-15'), LEAST(d, '2024-01-15') FROM it_fn ORDER BY id`,
+		"1|2024-03-01 10:00:00.000000|2024-01-15|2024-01-15", "2|2024-01-01 00:00:00.000000|2024-01-01|2024-01-01",
+		"3|2023-06-15 00:00:00.000000|2023-06-15|2023-06-15", "4|NULL|2024-01-15|2024-01-15")
+	// IIF only evaluates the branch it returns (row 3 would divide by zero);
+	// a NULL condition picks the second branch.
+	h.expectRows(`SELECT id, IIF(n = 7, -1, 10000 / (n - 7)) FROM it_fn ORDER BY id`, "1|8", "2|-7", "3|-1", "4|NULL")
+
+	// Result types: CTAS columns and information_schema.
+	h.exec(`CREATE TABLE it_fn_ctas AS SELECT id, ROUND(amt, 2) AS r2, ROUND(x) AS rx, FLOOR(id) AS fl, SUBSTRING(s, 1, 3) AS sub,
+		POSITION('o' IN s) AS pos, STARTS_WITH(code, 'ab') AS sw, GREATEST(id, n) AS g, COALESCE(amt, 0) AS c,
+		MOD(n, 7) AS m, SQRT(id) AS sq, NULLIF(id, 1) AS ni, IIF(id > 2, amt, 0) AS ii FROM it_fn`)
+	h.expectRows(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'it_fn_ctas' ORDER BY ordinal_position`,
+		"id|INTEGER", "r2|NUMERIC(10,2)", "rx|DOUBLE PRECISION", "fl|INTEGER", "sub|VARCHAR", "pos|BIGINT", "sw|BOOLEAN",
+		"g|BIGINT", "c|NUMERIC(10,3)", "m|BIGINT", "sq|DOUBLE PRECISION", "ni|INTEGER", "ii|NUMERIC(38,3)")
+	h.expectRows(`SELECT id, r2, rx, sub, pos, sw, g, c, m, ni, ii FROM it_fn_ctas ORDER BY id`,
+		"1|2.35|3|  H|7|true|1250|2.345|4|NULL|0.000",
+		"2|-2.35|-3|hél|5|false|2|-2.345|-3|2|0.000",
+		"3|10.00|1||0|false|7|9.995|0|3|9.995",
+		"4|NULL|NULL|NULL|NULL|NULL|4|0.000|NULL|4|NULL")
+	h.expectRows(`SELECT id FROM it_fn_ctas WHERE r2 > 0 ORDER BY id`, "1", "3")
+
+	// Pushdown: functions of constants are computed once and stay index
+	// queries; functions over columns are residuals evaluated by the driver.
+	for _, c := range []struct {
+		sql, query string
+		residual   bool
+		rows       []string
+	}{
+		{`SELECT id FROM it_fn WHERE n > ROUND(1000.4) ORDER BY id`, "@n:[(1000 +inf]", false, []string{"1"}},
+		{`SELECT id FROM it_fn WHERE code = LOWER('AB-12-X') ORDER BY id`, `@code:{ab\-12\-x}`, false, []string{"1"}},
+		{`SELECT id FROM it_fn WHERE amt BETWEEN LEAST(-3, 0) AND ABS(-3) ORDER BY id`, "@amt:[-3.000 +inf] @amt:[-inf 3.000]", false, []string{"1", "2"}},
+		{`SELECT id FROM it_fn WHERE ROUND(amt) = 2 ORDER BY id`, "*", true, []string{"1"}},
+		{`SELECT id FROM it_fn WHERE STARTS_WITH(code, 'cd') ORDER BY id`, "*", true, []string{"2"}},
+		{`SELECT id FROM it_fn WHERE id < 3 AND SPLIT_PART(code, '-', 3) = 'y' ORDER BY id`, "@id:[-inf (3]", true, []string{"2"}},
+		{`SELECT id FROM it_fn WHERE n < RANDOM() ORDER BY id`, "*", true, []string{"2"}},
+	} {
+		if q, residual, _ := h.planOf(c.sql); q != c.query || residual != c.residual {
+			t.Errorf("%s: index query %q, residual %v; want %q, residual %v", c.sql, q, residual, c.query, c.residual)
+		}
+		h.expectRows(c.sql, c.rows...)
+	}
+	// Functions applied to aggregates or GROUP BY columns keep the
+	// aggregation in the index; grouping by a function runs in the driver.
+	for _, c := range []struct {
+		sql      string
+		indexAgg bool
+		rows     []string
+	}{
+		{`SELECT ROUND(AVG(id), 1), MAX(id) * 2, SIGN(MIN(id) - 2), GREATEST(COUNT(*), 10) FROM it_fn`, true, []string{"2.5|8|-1|10"}},
+		{`SELECT LPAD(CAST(id AS VARCHAR), 3, '0'), COUNT(*) FROM it_fn GROUP BY id ORDER BY id`, true, []string{"001|1", "002|1", "003|1", "004|1"}},
+		{`SELECT SPLIT_PART(code, '-', 1) AS prefix, COUNT(*) FROM it_fn GROUP BY prefix ORDER BY prefix`, false, []string{"ab|1", "cd|1", "ef|1", "NULL|1"}},
+		{`SELECT SUM(ROUND(amt)), MAX(LENGTH(s)) FROM it_fn`, false, []string{"10|15"}},
+	} {
+		if _, _, indexAgg := h.planOf(c.sql); indexAgg != c.indexAgg {
+			t.Errorf("%s: aggregated in the index = %v, want %v", c.sql, indexAgg, c.indexAgg)
+		}
+		h.expectRows(c.sql, c.rows...)
+	}
+	// RANDOM() in a view is not rewritten into the base table's filter
+	// (where it would be computed a second time).
+	h.exec(`CREATE VIEW it_fn_rand AS SELECT id, RANDOM() AS r FROM it_fn`)
+	h.expectRows(`SELECT COUNT(*) FROM it_fn_rand WHERE r = r AND r >= 0 AND r < 1`, "4")
+	h.expectRows(`SELECT COUNT(*) FROM (SELECT id FROM it_fn ORDER BY RANDOM() LIMIT 2) AS sample`, "2")
+
+	// In INSERT and UPDATE; the updated column is still indexed.
+	h.exec(`INSERT INTO it_fn (id, amt, s, code) VALUES (5, ROUND(7.777, 1), INITCAP(REPEAT('ab ', 2)), LPAD('9', 3, '0'))`)
+	h.exec(`UPDATE it_fn SET s = TRIM(s), code = UPPER(SPLIT_PART(code, '-', 1)) WHERE id IN (1, 5)`)
+	h.expectRows(`SELECT id, amt, s, code FROM it_fn WHERE id IN (1, 5) ORDER BY id`, "1|2.345|Hello World|AB", "5|7.800|Ab Ab|009")
+	h.expectRows(`SELECT id FROM it_fn WHERE code = 'AB'`, "1")
+	h.exec(`DELETE FROM it_fn WHERE id = 5`)
+	h.exec(`UPDATE it_fn SET s = '  Hello World  ', code = 'ab-12-x' WHERE id = 1`)
+
+	// Errors on table data, and argument counts checked when planning.
+	h.expectError(`SELECT SQRT(n) FROM it_fn`, "SQRT: cannot take square root of a negative number")
+	h.expectError(`SELECT LN(n - 7) FROM it_fn WHERE id = 3`, "LN: cannot take logarithm of zero")
+	h.expectError(`SELECT MOD(id, id - id) FROM it_fn`, "MOD: division by zero")
+	h.expectError(`SELECT SUBSTRING(s, 1, -1) FROM it_fn`, "negative substring length not allowed")
+	h.expectError(`SELECT SPLIT_PART(code, '-', 0) FROM it_fn`, "field position must not be zero")
+	h.expectError(`SELECT ROUND(s) FROM it_fn WHERE id = 1`, "cannot convert")
+	h.expectError(`SELECT LEFT(s) FROM it_fn WHERE id > 100`, "LEFT expects 2 argument(s)")
+	h.expectError(`SELECT GREATEST(d, id) FROM it_fn`, "GREATEST types DATE and INTEGER cannot be matched")
+}
+
+// Bound parameters inside the special syntaxes are numbered in order.
+func TestSQLScalarFunctionBind(t *testing.T) {
+	h := newSQLHarness(t)
+	st, err := h.conn.NewStatement(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(h.ctx)
+	if err := st.SetSqlQuery(h.ctx, `SELECT ROUND(?, 2), SUBSTRING(? FROM 2 FOR ?), POSITION(? IN 'hello'), TRIM(BOTH ? FROM 'xxhixx')`); err != nil {
+		t.Fatal(err)
+	}
+	mem := memory.DefaultAllocator
+	fb := array.NewFloat64Builder(mem)
+	fb.Append(2.675)
+	sb := array.NewStringBuilder(mem)
+	sb.Append("abcdef")
+	ib := array.NewInt64Builder(mem)
+	ib.Append(3)
+	pb := array.NewStringBuilder(mem)
+	pb.Append("ll")
+	cb := array.NewStringBuilder(mem)
+	cb.Append("x")
+	rec := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{
+		{Name: "f", Type: arrow.PrimitiveTypes.Float64}, {Name: "s", Type: arrow.BinaryTypes.String},
+		{Name: "n", Type: arrow.PrimitiveTypes.Int64}, {Name: "p", Type: arrow.BinaryTypes.String},
+		{Name: "c", Type: arrow.BinaryTypes.String},
+	}, nil), []arrow.Array{fb.NewArray(), sb.NewArray(), ib.NewArray(), pb.NewArray(), cb.NewArray()}, 1)
+	if err := st.Bind(h.ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	rdr, _, err := st.ExecuteQuery(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Release()
+	rdr.Next()
+	r := rdr.RecordBatch()
+	var cells []string
+	for i := 0; i < int(r.NumCols()); i++ {
+		cells = append(cells, r.Column(i).ValueStr(0))
+	}
+	if got, want := strings.Join(cells, "|"), "2.68|bcd|3|hi"; got != want {
+		t.Errorf("bound parameters: got %q, want %q", got, want)
+	}
+}

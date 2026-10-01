@@ -258,6 +258,15 @@ SELECT COUNT(*) AS last_week FROM sales
 WHERE ordered_at >= TIMESTAMP '2025-12-31 00:00:00' - INTERVAL '7 days';
 SELECT MAX(ordered_at) - MIN(ordered_at) AS span, AGE(MAX(ordered_at), MIN(ordered_at)) AS age FROM sales;
 
+-- Math, string and conditional functions. The index still answers the WHERE
+-- clause; functions over columns run in the driver on the matching rows
+SELECT INITCAP(product) AS product, ROUND(AVG(unit_price), 2) AS avg_price,
+       ROUND(SUM(quantity * unit_price * (1 - COALESCE(discount, 0))), 2) AS net
+FROM sales WHERE status = 'shipped' GROUP BY product ORDER BY net DESC;
+SELECT LPAD(CAST(customer_id AS VARCHAR), 4, '0') AS id, SPLIT_PART(email, '@', 2) AS domain,
+       SUBSTRING(name FROM 10) AS num, IIF(country IN ('USA', 'CAN', 'MEX'), 'americas', 'other') AS region
+FROM customers WHERE customer_id <= 3 ORDER BY customer_id;
+
 -- information_schema: which columns of sales are indexed?
 SELECT column_name, data_type, is_nullable, is_indexed
 FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position;
@@ -440,6 +449,46 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
+- Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
+  negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD`,
+  `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
+  `EXP`, `SIGN`, `ABS`, `RANDOM()`
+  - `ROUND` rounds half away from zero: exactly on `NUMERIC`, and on
+    `DOUBLE PRECISION` too, by the value as written (`ROUND(2.675e0, 2)` is
+    2.68). Postgres rounds doubles half to even
+  - Integers and doubles keep their type. `ROUND(NUMERIC(p,s), n)` has scale
+    `n` (at most `s`); `ROUND(x)`, `TRUNC(x)`, `FLOOR` and `CEIL` scale 0.
+    `MOD` has its arguments' common type; `SQRT`, `LN`, `LOG`, `EXP`,
+    `POWER` and `RANDOM` return `DOUBLE PRECISION`
+  - Errors as in Postgres for the square root of a negative number, the
+    logarithm of zero or of a negative number, `MOD` by zero, zero to a
+    negative power, and overflow
+- String functions; positions are 1-based and count characters, not bytes:
+  - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`,
+    `SUBSTR`, `LEFT(s, n)` / `RIGHT(s, n)` (a negative `n` drops characters
+    from the other end), `POSITION(sub IN s)`, `STRPOS(s, sub)`
+  - `TRIM([BOTH | LEADING | TRAILING] [chars] FROM s)`, `TRIM(s [, chars])`,
+    `LTRIM`, `RTRIM`, `BTRIM` (spaces by default), `LPAD` / `RPAD(s, len
+    [, fill])`, `REPLACE`, `REVERSE`, `REPEAT`, `INITCAP`, `MD5`,
+    `STARTS_WITH`, `SPLIT_PART(s, delim, n)` (a negative `n` counts from
+    the end)
+  - `REGEXP_REPLACE(s, pattern, replacement [, flags])` replaces the first
+    match, or all of them with flag `g`; flags `i`, `n`, `p`, `w`, `q`
+    (literal pattern) work as in Postgres, and `\1` … `\9` and `\&` in the
+    replacement insert groups and the match. Patterns use Go's RE2 syntax,
+    so backreferences and lookaround are not available
+- Conditional functions: `NULLIF(a, b)`, `GREATEST(…)` / `LEAST(…)` (NULL
+  arguments are ignored), and `IIF(cond, a, b)` (like `CASE`, only the chosen
+  branch is evaluated). `COALESCE`, `GREATEST` and `LEAST` widen their
+  arguments to a common type (`COALESCE(int_col, 2.5)` is `NUMERIC`); a
+  string literal, or a number that type holds exactly, takes the other
+  arguments' type (`COALESCE(int_col, 0)` stays `INTEGER`,
+  `GREATEST(d, '2024-01-01')` is a `DATE`)
+- Functions return NULL for a NULL argument, except `COALESCE`, `NULLIF`,
+  `GREATEST`, `LEAST` and `IIF`. Functions of constants are computed once,
+  so `WHERE n > ROUND(?)` is still an index query; functions over columns are
+  evaluated by the driver on the rows the index returns. `RANDOM()` is
+  computed for every row and never pushed down
 - Date/time functions, all in UTC (the current time is fixed once per
   statement):
   - `CURRENT_DATE`, `CURRENT_TIMESTAMP` / `NOW()`, `CURRENT_TIME`,

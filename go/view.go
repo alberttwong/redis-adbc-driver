@@ -333,8 +333,9 @@ func isSimpleView(plan *selectPlan) bool {
 }
 
 // substitute rewrites column references (of the current scope) using repl;
-// ok is false if a column has no replacement or the expression contains a
-// subquery (whose references cannot be rewritten).
+// ok is false if a column has no replacement, the replacement is volatile
+// (RANDOM() would be computed again), or the expression contains a subquery
+// (whose references cannot be rewritten).
 func substitute(e Expr, repl map[string]Expr) (Expr, bool) {
 	switch x := e.(type) {
 	case *ColumnRef:
@@ -342,6 +343,9 @@ func substitute(e Expr, repl map[string]Expr) (Expr, bool) {
 			return x, true
 		}
 		r, ok := repl[x.Name]
+		if ok && hasVolatile(r) {
+			return nil, false
+		}
 		return r, ok
 	case *Literal, *Param:
 		return x, true
