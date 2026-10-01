@@ -372,14 +372,15 @@ Stop Redis with `docker compose down`.
 ```
 
 - **Rows** are flat HASHes `<schema>:<table>:<rowid>` holding every column
-  (NULL = field absent; a hidden `__rowid` field keeps all-NULL rows alive).
+  (NULL = field absent, except for missing values, below; a hidden `__rowid`
+  field keeps all-NULL rows alive).
 - **Selective index**: `FT.CREATE idx:<schema>:<table> ON HASH PREFIX 1
   <schema>:<table>:` covering only filterable columns: numeric, boolean,
   decimal, date/time and timestamp columns as `NUMERIC SORTABLE`, strings as
   `TAG CASESENSITIVE INDEXEMPTY SORTABLE UNF`. Binary columns and columns
   declared `NOINDEX` are stored in the HASH only.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
-  (column types as JSON), `adbc:{meta}:seq:*` (row ids),
+  (column types, defaults and missing values as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
   `adbc:{meta}:view:<schema>:<view>` (the SELECT text and its columns) and
   `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
@@ -389,6 +390,23 @@ Stop Redis with `docker compose down`.
   `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
+- **Missing values**: `ALTER TABLE … ADD COLUMN c … DEFAULT v` doesn't
+  rewrite the existing rows. As with Postgres's "missing value", the
+  column's metadata records `v` and the row id high-water mark (the
+  `adbc:{meta}:seq:*` value, read in the transaction that adds the column),
+  and a row with `__rowid` up to the mark and no `c` field reads `v`. Rows
+  inserted later have higher ids, so for them an absent field is NULL as
+  usual. To keep that true:
+  - A statement that read the metadata before the `ALTER` allocates its row
+    ids in one `MULTI` with a read of the metadata, sees the new column, and
+    writes `v` for it.
+  - Setting an old row's `c` to NULL (`UPDATE`, `MERGE`) also writes a
+    hidden marker field, `__null_<field>`, which setting a value removes.
+  - The index has no entry for an old row's absent field, so a filter on `c`
+    that `v` satisfies is widened to `(@c:[…] | @__rowid:[-inf mark])` and
+    re-checked by the driver (one that `v` doesn't satisfy stays an exact
+    index query), and `ORDER BY` and aggregates on `c` run in the driver.
+  - `TRUNCATE` drops the missing values with the rows.
 - **Temporary tables and views** use the same layout in a private schema
   per connection, `pg_temp_<id>` (rows `pg_temp_<id>:<table>:<rowid>`, index
   `idx:pg_temp_<id>:<table>`), which is never added to
@@ -417,7 +435,7 @@ How SQL is executed:
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row). A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
-| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
+| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows |
 | Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
@@ -452,7 +470,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 
 ## Supported SQL
 
-- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [NOINDEX], …)`,
+- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [DEFAULT expr] [NOINDEX], …)`,
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
   `DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]`,
@@ -508,21 +526,48 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   prefix, index). Row ids continue unless `RESTART IDENTITY` is given. All
   names are checked before any table is emptied
 - `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
-  `RENAME [COLUMN] a TO b`, `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOINDEX]`,
-  `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`. All of them only change metadata, so they
+  `RENAME [COLUMN] a TO b`,
+  `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOT NULL] [DEFAULT expr] [NOINDEX]`,
+  `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`,
+  `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`. All of them only change metadata, so they
   take the same time at any table size:
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
     was created), so no row is touched.
   - `RENAME COLUMN` keeps the column's HASH field; only its SQL name changes.
   - `ADD COLUMN` adds the column to the index with `FT.ALTER`; existing rows
-    read it as NULL. `NOT NULL` and `DEFAULT` are not supported here.
+    read it as NULL, or as its `DEFAULT`, which is computed once (so
+    `DEFAULT CURRENT_TIMESTAMP` gives them all the time of the `ALTER`) and
+    recorded as the column's missing value rather than written to them (see
+    the architecture section). A volatile default (`RANDOM()`) is not
+    supported here, and `NOT NULL` needs a non-NULL `DEFAULT`.
   - `DROP COLUMN` hides the column immediately and removes its field from
     existing rows in the background (resumed by the next connection if the
     process exits first). A dropped column's values never reappear, even if
     a column with the same name is added later.
-- `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
-  parameters, and `INSERT INTO t [(cols)] SELECT …` (the query may be
-  parenthesized: `INSERT INTO t (SELECT …)`)
+  - `ALTER COLUMN … SET DEFAULT` / `DROP DEFAULT` only change what rows
+    inserted later get; existing rows keep their values.
+- `INSERT INTO t [(cols)] VALUES (…), (…)` with literals, `?` / `$n`
+  parameters or `DEFAULT`, `INSERT INTO t DEFAULT VALUES`, and
+  `INSERT INTO t [(cols)] SELECT …` (the query may be parenthesized:
+  `INSERT INTO t (SELECT …)`)
+- Column defaults (`DEFAULT expr`), as in Postgres:
+  - A row gets a column's default when it is inserted without a value for
+    it: a column left out of the column list of `INSERT … VALUES`,
+    `INSERT … SELECT` or MERGE's `INSERT`, `DEFAULT` in place of a value,
+    `INSERT … DEFAULT VALUES`, and columns missing from the Arrow data of a
+    bulk ingest. An explicit NULL stays NULL (and fails on a `NOT NULL`
+    column). `UPDATE … SET col = DEFAULT` is not supported.
+  - The default is checked when it is defined: it may not read columns or
+    use subqueries, parameters, aggregates or window functions, and it must
+    convert to the column's type (`INTEGER DEFAULT 'abc'` is an error then).
+    `DEFAULT NULL` is the same as no default.
+  - It is computed once per statement (or bulk ingest), so all the rows of
+    a statement get the same `CURRENT_TIMESTAMP` / `NOW()` /
+    `CURRENT_DATE`, the statement's time. A volatile default (`RANDOM()`)
+    is computed for every row.
+  - `information_schema.columns.column_default` and `GetObjects`'
+    `xdbc_column_def` show the default as written. `CREATE TABLE … AS`
+    copies values, not defaults
 - `[WITH name [(cols)] AS (SELECT …), …] SELECT [ALL | DISTINCT | DISTINCT ON (…)] … FROM item {, item |
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item}
   [WHERE …] [GROUP BY …] [HAVING …] [WINDOW w AS (…), …] [QUALIFY …]
@@ -682,7 +727,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`),
-  `columns` (`ordinal_position`, `data_type`, `is_nullable`, `numeric_precision`,
+  `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
   `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
   (`view_definition`). Any SQL works on them, including joins
 - `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
@@ -709,8 +754,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   source row is an error ("MERGE command cannot affect row a second time");
   matching more than one is fine if only one match changes it. NULL keys
   never match. The result is the number of rows inserted, updated and
-  deleted. `INSERT DEFAULT VALUES` inserts NULLs (column defaults aren't
-  stored)
+  deleted. `INSERT` gives the columns it leaves out (or sets to `DEFAULT`)
+  their defaults, and `INSERT DEFAULT VALUES` inserts a row of defaults
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
   comparisons
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,

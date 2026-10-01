@@ -25,12 +25,16 @@ package redis
 //     only its SQL name changes.
 //   - ADD COLUMN: the column gets a HASH field no current or dropped column
 //     has used, and is added to the index with FT.ALTER. Existing rows read
-//     it as NULL.
+//     it as NULL, or with DEFAULT as its default, which is recorded as the
+//     column's missing value instead of being written to them (see
+//     defaults.go).
 //   - DROP COLUMN: the column disappears immediately. Its field is retired
 //     (never reused) and removed from existing rows by a background task;
 //     the task is recorded in the metadata and resumed by later connections
 //     if the process exits first. RediSearch cannot drop an attribute, so an
 //     indexed column's attribute stays in the index, unused.
+//   - ALTER COLUMN … SET / DROP DEFAULT: only rows inserted later see the
+//     change.
 
 import (
 	"context"
@@ -86,6 +90,8 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 		return e.addColumn(ctx, meta, st.Def, st.IfColumnNotExists)
 	case AlterDropColumn:
 		return e.dropColumn(ctx, meta, st.Column, st.IfColumnExists)
+	case AlterSetDefault, AlterDropDefault:
+		return e.setDefault(ctx, meta, st.Column, st.Def)
 	}
 	return errorf(adbc.StatusNotImplemented, "unsupported ALTER TABLE action")
 }
@@ -218,19 +224,32 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 	if err := checkColumnName(def.Name); err != nil {
 		return err
 	}
-	if def.NotNull {
-		return errorf(adbc.StatusNotImplemented, "cannot add a NOT NULL column: existing rows would have no value")
-	}
-	if def.HasDefault {
-		return errorf(adbc.StatusNotImplemented, "column defaults are not supported")
-	}
 	if _, ok := meta.resolve(def.Name); ok {
 		if ifNotExists {
 			return nil
 		}
 		return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", def.Name, meta.Name)
 	}
-	col := columnMeta{Name: def.Name, Type: def.Type, Nullable: true}
+	col := columnMeta{Name: def.Name, Type: def.Type, Nullable: !def.NotNull}
+	missing := false
+	if def.Default != nil {
+		// Existing rows read the default as it is now, so it must be the
+		// same for all of them.
+		if hasVolatile(def.Default) {
+			return errorf(adbc.StatusNotImplemented, "ADD COLUMN with a volatile DEFAULT is not supported: existing rows would each need their own value")
+		}
+		text, v, err := e.checkDefault(ctx, def)
+		if err != nil {
+			return err
+		}
+		col.Default = text
+		if !v.Null {
+			col.Missing, missing = encodeStored(v), true
+		}
+	}
+	if def.NotNull && !missing {
+		return errorf(adbc.StatusNotImplemented, "cannot add a NOT NULL column without a non-NULL DEFAULT: existing rows would have no value")
+	}
 	if f := freeField(meta, def.Name); f != def.Name {
 		col.Field = f
 	}
@@ -249,7 +268,7 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 			return wrapRedis(err, "failed to add the column to the search index")
 		}
 	}
-	return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
+	add := func(m *tableMeta, lastRowID int64) error {
 		if _, ok := m.resolve(def.Name); ok {
 			if ifNotExists {
 				return nil
@@ -259,7 +278,48 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 		if freeField(m, col.field()) != col.field() {
 			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
 		}
-		m.Columns = append(m.Columns, col)
+		c := col
+		if lastRowID == 0 {
+			c.Missing = ""
+		} else {
+			c.MissingThrough = lastRowID
+		}
+		m.Columns = append(m.Columns, c)
+		return nil
+	}
+	if !missing {
+		return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error { return add(m, 0) }, nil)
+	}
+	// The rows that exist when the column is added, those with ids up to the
+	// last one allocated, read its missing value.
+	return e.store.updateTableAtRowID(ctx, meta.Schema, meta.Name, add)
+}
+
+// setDefault implements ALTER COLUMN … SET DEFAULT and, with no default in
+// def, DROP DEFAULT. Existing rows keep their values (and missing values).
+func (e *executor) setDefault(ctx context.Context, meta *tableMeta, column string, def ColumnDef) error {
+	i, ok := meta.resolve(column)
+	if !ok {
+		return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", column, meta.Name)
+	}
+	col := meta.Columns[i]
+	text := ""
+	if def.Default != nil {
+		def.Name, def.Type = col.Name, col.Type
+		var err error
+		if text, _, err = e.checkDefault(ctx, def); err != nil {
+			return err
+		}
+	}
+	return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
+		i, ok := m.resolve(column)
+		if !ok {
+			return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", column, m.Name)
+		}
+		if m.Columns[i].field() != col.field() || m.Columns[i].Type != col.Type {
+			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
+		}
+		m.Columns[i].Default = text
 		return nil
 	}, nil)
 }
@@ -277,6 +337,9 @@ func (e *executor) dropColumn(ctx context.Context, meta *tableMeta, name string,
 			return errorf(adbc.StatusInvalidArgument, "cannot drop the only column of table %q", m.Name)
 		}
 		f := m.Columns[i].field()
+		if m.Columns[i].MissingThrough > 0 {
+			m.PendingCleanup = append(m.PendingCleanup, nullMarker(f))
+		}
 		m.Columns = slices.Delete(m.Columns, i, i+1)
 		m.RetiredFields = append(m.RetiredFields, f)
 		m.PendingCleanup = append(m.PendingCleanup, f)

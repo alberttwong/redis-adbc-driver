@@ -292,7 +292,16 @@ type InsertStmt struct {
 	Rows    [][]Expr
 	// Select is set for INSERT INTO … SELECT.
 	Select *SelectStmt
+	// DefaultValues is set for INSERT INTO … DEFAULT VALUES (one row of
+	// column defaults).
+	DefaultValues bool
 }
+
+// DefaultValue is the DEFAULT keyword written in place of a value in INSERT
+// … VALUES or MERGE's INSERT VALUES: the column's default.
+type DefaultValue struct{}
+
+func (*DefaultValue) exprNode() {}
 
 type ColumnDef struct {
 	Name    string
@@ -301,9 +310,10 @@ type ColumnDef struct {
 	// NoIndex keeps the column out of the RediSearch index (it is still
 	// stored in the row HASH).
 	NoIndex bool
-	// HasDefault is set when a DEFAULT clause was given (defaults are not
-	// applied; ADD COLUMN rejects them).
-	HasDefault bool
+	// Default is the DEFAULT expression (nil without one), and DefaultText
+	// its source text, which is what the table metadata stores.
+	Default     Expr
+	DefaultText string
 }
 
 type AlterAction int
@@ -313,6 +323,8 @@ const (
 	AlterRenameColumn
 	AlterAddColumn
 	AlterDropColumn
+	AlterSetDefault
+	AlterDropDefault
 )
 
 type AlterTableStmt struct {
@@ -322,9 +334,9 @@ type AlterTableStmt struct {
 	View              bool
 	Action            AlterAction
 	NewTable          TableName // RENAME TO
-	Column            string    // RENAME COLUMN (old) / DROP COLUMN
+	Column            string    // RENAME COLUMN (old) / DROP COLUMN / ALTER COLUMN
 	NewColumn         string    // RENAME COLUMN (new)
-	Def               ColumnDef // ADD COLUMN
+	Def               ColumnDef // ADD COLUMN; SET DEFAULT (only the default)
 	IfColumnExists    bool
 	IfColumnNotExists bool
 }
@@ -1346,6 +1358,10 @@ func (p *parser) parseInsert() (Stmt, error) {
 		return nil, err
 	}
 	ins := &InsertStmt{Table: t}
+	if p.acceptKeyword("DEFAULT", "VALUES") {
+		ins.DefaultValues = true
+		return ins, nil
+	}
 	// `INSERT INTO t (SELECT …)`: a parenthesized query, not a column list.
 	if !p.isParenQueryStart() {
 		if ins.Columns, err = p.parseColumnList(); err != nil {
@@ -1369,7 +1385,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 		}
 		var row []Expr
 		for {
-			e, err := p.parseExpr()
+			e, err := p.parseValue()
 			if err != nil {
 				return nil, err
 			}
@@ -1387,6 +1403,45 @@ func (p *parser) parseInsert() (Stmt, error) {
 		}
 	}
 	return ins, nil
+}
+
+// parseValue parses one value of a VALUES list, where DEFAULT on its own
+// stands for the column's default.
+func (p *parser) parseValue() (Expr, error) {
+	if next := p.peekAt(1); p.isKeyword("DEFAULT") && next.kind == tokOp && (next.text == "," || next.text == ")") {
+		p.pos++
+		return &DefaultValue{}, nil
+	}
+	return p.parseExpr()
+}
+
+// parseDefault parses the expression of a DEFAULT clause and returns it with
+// its source text.
+func (p *parser) parseDefault() (Expr, string, error) {
+	start := p.peek().pos
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, "", err
+	}
+	return e, strings.TrimSpace(p.src[start:p.toks[p.pos-1].end]), nil
+}
+
+// parseExprText parses a standalone expression: a column default stored in
+// the table metadata.
+func parseExprText(src string) (Expr, error) {
+	toks, err := lex(src)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{src: src, toks: toks}
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if p.peek().kind != tokEOF {
+		return nil, syntaxErr("unexpected %q", p.peek().text)
+	}
+	return e, nil
 }
 
 func (p *parser) parseCreate() (Stmt, error) {
@@ -1520,10 +1575,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			col.NoIndex = true
 		case p.acceptKeyword("INDEX"):
 		case p.acceptKeyword("DEFAULT"):
-			if _, err := p.parseExpr(); err != nil {
+			if col.Default != nil {
+				return ColumnDef{}, &sqlError{msg: fmt.Sprintf("multiple default values specified for column %q", name)}
+			}
+			if col.Default, col.DefaultText, err = p.parseDefault(); err != nil {
 				return ColumnDef{}, err
 			}
-			col.HasDefault = true
 		default:
 			return col, nil
 		}
@@ -1532,7 +1589,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 
 // parseAlter parses ALTER TABLE [IF EXISTS] t followed by one of
 // RENAME TO u | RENAME [COLUMN] a TO b | ADD [COLUMN] [IF NOT EXISTS] def |
-// DROP [COLUMN] [IF EXISTS] c.
+// DROP [COLUMN] [IF EXISTS] c | ALTER [COLUMN] c {SET DEFAULT expr | DROP
+// DEFAULT}.
 func (p *parser) parseAlter() (Stmt, error) {
 	if err := p.expectKeyword("ALTER"); err != nil {
 		return nil, err
@@ -1583,11 +1641,27 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		p.parseDropBehavior()
 		st.Action = AlterDropColumn
+	case p.acceptKeyword("ALTER"):
+		p.acceptKeyword("COLUMN")
+		if st.Column, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		switch {
+		case p.acceptKeyword("SET", "DEFAULT"):
+			if st.Def.Default, st.Def.DefaultText, err = p.parseDefault(); err != nil {
+				return nil, err
+			}
+			st.Action = AlterSetDefault
+		case p.acceptKeyword("DROP", "DEFAULT"):
+			st.Action = AlterDropDefault
+		default:
+			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER COLUMN action near %q (supported: SET DEFAULT, DROP DEFAULT)", p.peek().text)}
+		}
 	default:
 		if st.View {
 			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER VIEW action near %q (supported: RENAME TO)", p.peek().text)}
 		}
-		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN)", p.peek().text)}
+		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN, ALTER COLUMN)", p.peek().text)}
 	}
 	if st.View && st.Action != AlterRenameTable {
 		return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
@@ -1864,7 +1938,7 @@ func (p *parser) parseMerge() (*MergeStmt, error) {
 				return nil, err
 			}
 			for {
-				e, err := p.parseExpr()
+				e, err := p.parseValue()
 				if err != nil {
 					return nil, err
 				}

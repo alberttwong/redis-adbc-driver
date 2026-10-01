@@ -138,7 +138,8 @@ func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 // planWhere pushes down every predicate the index can answer: ranges on
 // NUMERIC columns and equality on TAG (string) columns. Predicates the index
 // may answer inexactly (double rounding of large integers) are pushed down
-// inclusively and also kept in the residual.
+// inclusively and also kept in the residual, as are predicates widened to
+// the rows that read a column's missing value (widenMissing).
 func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
 	wp := wherePlan{query: "*"}
 	if where == nil {
@@ -212,6 +213,20 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			addResidual(c)
 			continue
 		}
+		// push adds the index term for c; recheck also keeps c in the
+		// residual, as does widening the term to rows that read the
+		// column's missing value.
+		push := func(term string, recheck bool) {
+			term, widened := widenMissing(term, col, func(m Value) bool {
+				r, err := binaryOp(op, m, cv)
+				b, ok := truthy(r)
+				return err != nil || (ok && b)
+			})
+			if recheck || widened {
+				addResidual(c)
+			}
+			terms = append(terms, term)
+		}
 		ct := col.Type
 		field := "@" + col.field()
 		switch {
@@ -253,9 +268,8 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			}
 			if !exact {
 				lo, hi = strings.TrimPrefix(lo, "("), strings.TrimPrefix(hi, "(")
-				addResidual(c)
 			}
-			terms = append(terms, fmt.Sprintf("%s:[%s %s]", field, lo, hi))
+			push(fmt.Sprintf("%s:[%s %s]", field, lo, hi), !exact)
 		case ct.Kind == KindString && op == "=":
 			v, err := Coerce(cv, ct)
 			if err != nil {
@@ -268,10 +282,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 				addResidual(c)
 				continue
 			}
-			terms = append(terms, fmt.Sprintf("%s:{%s}", field, escapeTag(v.S)))
-			if strings.Contains(v.S, tagSeparator) {
-				addResidual(c)
-			}
+			push(fmt.Sprintf("%s:{%s}", field, escapeTag(v.S)), strings.Contains(v.S, tagSeparator))
 		default:
 			addResidual(c)
 		}
@@ -311,7 +322,11 @@ func decodeRow(meta *tableMeta, row aggRow, only map[string]bool) (map[string]Va
 		}
 		raw, ok := row[c.field()]
 		if !ok {
-			out[c.Name] = nullValue(c.Type)
+			v, err := c.missingValue(row)
+			if err != nil {
+				return nil, errorf(adbc.StatusInternal, "column %q: %v", c.Name, err)
+			}
+			out[c.Name] = v
 			continue
 		}
 		v, err := decodeStored(raw, c.Type)
@@ -354,6 +369,9 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 		if need[c.Name] {
 			fields = append(fields, c.field())
 			exact = exact && loadsExactly(c)
+			if c.MissingThrough > 0 {
+				fields = append(fields, nullMarker(c.field()))
+			}
 		}
 	}
 	keys := req.where.keys
@@ -528,7 +546,8 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 			break
 		}
 		col, ok := meta.column(c.Name)
-		if !ok || !col.Indexed {
+		// Rows that read a missing value have no index entry to sort on.
+		if !ok || !col.Indexed || col.MissingThrough > 0 {
 			indexSort = false
 			break
 		}
@@ -770,7 +789,8 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		col, ok := meta.column(c.Name)
-		if !ok || !col.Indexed || !simpleName(col.field()) {
+		// The index doesn't see the missing values of rows without a field.
+		if !ok || !col.Indexed || !simpleName(col.field()) || col.MissingThrough > 0 {
 			return nil, false, nil
 		}
 		if !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
@@ -825,7 +845,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		col, ok := meta.column(c.Name)
-		if !ok || !col.Indexed || !simpleName(col.field()) || col.Name == rowIDField {
+		if !ok || !col.Indexed || !simpleName(col.field()) || col.Name == rowIDField || col.MissingThrough > 0 {
 			return nil, false, nil
 		}
 		if f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown) {
@@ -1168,10 +1188,37 @@ func unionQuery(cm columnMeta, values []Value) (string, bool) {
 		// Nothing can match; __rowid is never negative.
 		return "@" + rowIDField + ":[-1 -1]", true
 	}
+	q := "(" + strings.Join(parts, " | ") + ")"
 	if cm.Type.Kind == KindString {
-		return fmt.Sprintf("@%s:{%s}", cm.field(), strings.Join(parts, " | ")), true
+		q = fmt.Sprintf("@%s:{%s}", cm.field(), strings.Join(parts, " | "))
 	}
-	return "(" + strings.Join(parts, " | ") + ")", true
+	// Callers re-check the predicate on the rows, so the query may be wider.
+	q, _ = widenMissing(q, cm, func(m Value) bool {
+		for _, v := range values {
+			r, err := binaryOp("=", m, v)
+			if b, _ := truthy(r); err != nil || b {
+				return true
+			}
+		}
+		return false
+	})
+	return q, true
+}
+
+// widenMissing widens an index term on a column that has a missing value
+// (see "Missing values" in defaults.go) to every row that may read it, the
+// rows with __rowid <= MissingThrough, which the index can't tell apart from
+// rows with a NULL, if the value satisfies the term's predicate (holds).
+// widened reports whether it did; the predicate must then be re-checked on
+// the rows.
+func widenMissing(term string, col columnMeta, holds func(Value) bool) (string, bool) {
+	if col.MissingThrough == 0 {
+		return term, false
+	}
+	if m, err := decodeStored(col.Missing, col.Type); err == nil && !holds(m) {
+		return term, false
+	}
+	return fmt.Sprintf("(%s | @%s:[-inf %d])", term, rowIDField, col.MissingThrough), true
 }
 
 // likePrefixTerm turns `col LIKE 'abc%'` on an indexed string column into a
@@ -1201,5 +1248,8 @@ func likePrefixTerm(c Expr, meta *tableMeta, env *evalEnv) (string, bool) {
 	if utf8.RuneCountInString(prefix) < 2 || strings.ContainsAny(prefix, "%_") || strings.Contains(prefix, tagSeparator) {
 		return "", false
 	}
-	return fmt.Sprintf("@%s:{%s*}", col.field(), escapeTag(prefix)), true
+	term, _ := widenMissing(fmt.Sprintf("@%s:{%s*}", col.field(), escapeTag(prefix)), col, func(m Value) bool {
+		return strings.HasPrefix(m.S, prefix)
+	})
+	return term, true
 }

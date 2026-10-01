@@ -21,8 +21,9 @@ package redis
 //	schemata (catalog_name, schema_name)
 //	tables   (table_catalog, table_schema, table_name, table_type)
 //	columns  (table_catalog, table_schema, table_name, column_name,
-//	          ordinal_position, data_type, is_nullable, numeric_precision,
-//	          numeric_scale, datetime_precision, is_indexed)
+//	          ordinal_position, column_default, data_type, is_nullable,
+//	          numeric_precision, numeric_scale, datetime_precision,
+//	          is_indexed)
 //	views    (table_catalog, table_schema, table_name, view_definition)
 //
 // The connection's own temporary tables and views are included under schema
@@ -57,6 +58,7 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "table_name", Type: typeString},
 		{Name: "column_name", Type: typeString},
 		{Name: "ordinal_position", Type: typeInt32},
+		{Name: "column_default", Type: typeString},
 		{Name: "data_type", Type: typeString},
 		{Name: "is_nullable", Type: typeString},
 		{Name: "numeric_precision", Type: typeInt32},
@@ -109,9 +111,13 @@ func columnRow(schema, table string, pos int, c columnMeta) []Value {
 	case KindTime, KindTimestamp:
 		dtPrec = optInt(int32(precisionForUnit(t.Unit)), true)
 	}
+	def := nullValue(typeString)
+	if c.Default != "" {
+		def = stringValue(c.Default)
+	}
 	return []Value{
 		stringValue(catalogName), stringValue(schema), stringValue(table),
-		stringValue(c.Name), intValue(typeInt32, int64(pos)), stringValue(t.SQLName()),
+		stringValue(c.Name), intValue(typeInt32, int64(pos)), def, stringValue(t.SQLName()),
 		yesNo(c.Nullable), prec, scale, dtPrec, yesNo(c.Indexed),
 	}
 }

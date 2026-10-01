@@ -112,15 +112,18 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 		return -1, errorf(adbc.StatusInvalidArgument, "unknown ingest mode %q", opts.Mode)
 	}
 
-	// Map each Arrow field onto a table column.
+	// Map each Arrow field onto a table column; the other columns get their
+	// defaults, with the whole ingest as one statement.
 	mapping := make([]int, arrowSchema.NumFields())
+	given := make([]bool, len(meta.Columns))
 	for i, f := range arrowSchema.Fields() {
 		idx, ok := meta.resolve(f.Name)
 		if !ok {
 			return -1, errorf(adbc.StatusAlreadyExists, "column %q does not exist in table %q", f.Name, meta.Name)
 		}
-		mapping[i] = idx
+		mapping[i], given[idx] = idx, true
 	}
+	defs := s.executor().columnDefaults(ctx, meta)
 
 	var total int64
 	for s.params.Next() {
@@ -129,8 +132,8 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 		rows := make([][]Value, n)
 		for r := 0; r < n; r++ {
 			row := make([]Value, len(meta.Columns))
-			for i, c := range meta.Columns {
-				row[i] = nullValue(c.Type)
+			if err := defs.fill(row, given); err != nil {
+				return -1, err
 			}
 			rows[r] = row
 		}

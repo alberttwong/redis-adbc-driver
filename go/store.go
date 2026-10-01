@@ -25,6 +25,10 @@ package redis
 //
 //	<schema>:<table>:<rowid>        HASH   __rowid, col1, col2, ... colN
 //
+// A column added by ADD COLUMN … DEFAULT is the exception: rows that existed
+// then read the default without a field (see "Missing values" in
+// defaults.go).
+//
 // Secondary index: a RediSearch index over the row prefix that only covers the
 // columns used for filtering, sorting and aggregation. Numeric-like columns
 // are NUMERIC SORTABLE and strings are TAG SORTABLE UNF; binary columns and
@@ -94,6 +98,15 @@ type columnMeta struct {
 	// after RENAME COLUMN (the data keeps its original field), and in join
 	// views (which name columns alias.column).
 	Field string `json:"field,omitempty"`
+	// Default is the SQL text of the column's DEFAULT expression, evaluated
+	// for inserted rows that give the column no value.
+	Default string `json:"default,omitempty"`
+	// Missing is the value, encoded as in the HASHes, of a column added by
+	// ADD COLUMN … DEFAULT for the rows that existed then: rows with __rowid
+	// up to MissingThrough that have no field for it (see "Missing values"
+	// in defaults.go). MissingThrough is 0 when there were none.
+	Missing        string `json:"missing,omitempty"`
+	MissingThrough int64  `json:"missing_through,omitempty"`
 }
 
 // field returns the HASH field and index attribute name of the column.
@@ -625,6 +638,9 @@ func (s *store) truncateTable(ctx context.Context, schema, table string, restart
 	if err := s.searchDo(ctx, meta.index(), indexCreateArgs(meta)...).Err(); err != nil {
 		return wrapRedis(err, "failed to recreate search index")
 	}
+	if err := s.dropMissingValues(ctx, meta); err != nil {
+		return err
+	}
 	if restartIdentity {
 		if err := s.client.Del(ctx, seqKey(schema, table)).Err(); err != nil {
 			return wrapRedis(err, "failed to restart the row id sequence")
@@ -785,10 +801,20 @@ func (s *store) insertRows(ctx context.Context, meta *tableMeta, rows [][]Value)
 			}
 		}
 	}
-	last, err := s.client.IncrBy(ctx, seqKey(meta.Schema, meta.Name), int64(len(rows))).Result()
+	// The row ids are allocated in one transaction with a read of the
+	// metadata, which shows columns that ADD COLUMN … DEFAULT added since
+	// meta was read: these rows get their missing values (see defaults.go).
+	tx := s.client.TxPipeline()
+	incr := tx.IncrBy(ctx, seqKey(meta.Schema, meta.Name), int64(len(rows)))
+	cur := tx.Get(ctx, metaKey(meta.Schema, meta.Name))
+	if _, err := tx.Exec(ctx); err != nil && !errors.Is(err, goredis.Nil) {
+		return 0, wrapRedis(err, "failed to allocate row ids")
+	}
+	last, err := incr.Result()
 	if err != nil {
 		return 0, wrapRedis(err, "failed to allocate row ids")
 	}
+	added := addedMissing(meta, cur.Val())
 	first := last - int64(len(rows)) + 1
 	prefix := meta.prefix()
 	for start := 0; start < len(rows); start += pipelineChunk {
@@ -796,13 +822,14 @@ func (s *store) insertRows(ctx context.Context, meta *tableMeta, rows [][]Value)
 		pipe := s.client.Pipeline()
 		for r := start; r < end; r++ {
 			id := strconv.FormatInt(first+int64(r), 10)
-			fields := make([]any, 0, 2+2*len(meta.Columns))
+			fields := make([]any, 0, 2+2*len(meta.Columns)+len(added))
 			fields = append(fields, rowIDField, id)
 			for i, c := range meta.Columns {
 				if v := rows[r][i]; !v.Null {
 					fields = append(fields, c.field(), encodeStored(v))
 				}
 			}
+			fields = append(fields, added...)
 			pipe.HSet(ctx, prefix+id, fields...)
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
