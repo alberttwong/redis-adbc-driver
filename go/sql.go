@@ -45,7 +45,9 @@ type ColumnRef struct {
 }
 
 // Subquery is a SELECT used as an expression: a scalar subquery
-// `(SELECT …)`, `EXISTS (SELECT …)`, or `X [NOT] IN (SELECT …)`.
+// `(SELECT …)`, `EXISTS (SELECT …)`, `X [NOT] IN (SELECT …)`, or
+// `X op ANY | SOME | ALL (SELECT …)`. `= ANY` is parsed as IN and `<> ALL`
+// as NOT IN.
 type Subquery struct {
 	Select *SelectStmt
 	Kind   SubqueryKind
@@ -54,6 +56,8 @@ type Subquery struct {
 	// Width is set for a scalar subquery assigned to a column list (UPDATE
 	// … SET (a, b) = (SELECT …)): the number of columns it must return.
 	Width int
+	// Op is the comparison operator of ANY / ALL (X is their operand).
+	Op string
 
 	// Set while binding.
 	plan       *selectPlan
@@ -74,6 +78,11 @@ const (
 	SubqueryScalar SubqueryKind = iota
 	SubqueryExists
 	SubqueryIn
+	SubqueryAny
+	SubqueryAll
+	// SubqueryLateral is a LATERAL subquery in FROM (see lateral.go); it is
+	// never part of an expression.
+	SubqueryLateral
 )
 
 type outerRef struct {
@@ -293,6 +302,28 @@ type CTE struct {
 	Name    string
 	Columns []string
 	Select  *SelectStmt
+	// Recursive is set for the CTEs of a WITH RECURSIVE list; those that
+	// refer to themselves are evaluated by iteration (see recursive.go).
+	Recursive bool
+	// Search and Cycle are a recursive CTE's SEARCH and CYCLE clauses.
+	Search *SearchClause
+	Cycle  *CycleClause
+}
+
+// SearchClause is `SEARCH {BREADTH | DEPTH} FIRST BY col, … SET seq`.
+type SearchClause struct {
+	Breadth bool
+	By      []string
+	Set     string
+}
+
+// CycleClause is `CYCLE col, … SET mark [TO value DEFAULT value] USING
+// path`; To and Default are nil for TRUE and FALSE.
+type CycleClause struct {
+	Columns     []string
+	Set         string
+	To, Default Expr
+	Using       string
 }
 
 // JoinClause is one `[kind] JOIN item [ON … | USING (…)]` (or `, item`) of
@@ -304,6 +335,13 @@ type JoinClause struct {
 	Alias  string
 	On     Expr
 	Using  []string
+	// Func is a table function item (instead of Table or Select), Lateral
+	// marks a LATERAL item, Columns are column aliases (`AS a(x, y)`), and
+	// Natural is NATURAL JOIN (USING over the columns both sides have).
+	Func    *Func
+	Lateral bool
+	Columns []string
+	Natural bool
 }
 
 type SelectStmt struct {
@@ -335,6 +373,12 @@ type SelectStmt struct {
 	OrderBy    []OrderItem
 	Limit      *int64
 	Offset     *int64
+	// FromFunc is a table function as the first FROM item, FromLateral
+	// marks it LATERAL, and FromColumns are its column aliases
+	// (`AS a(x, y)`); see JoinClause.
+	FromFunc    *Func
+	FromLateral bool
+	FromColumns []string
 }
 
 type InsertStmt struct {
@@ -1006,16 +1050,14 @@ func (p *parser) parseWith() ([]CTE, error) {
 	if !p.acceptKeyword("WITH") {
 		return nil, nil
 	}
-	if p.acceptKeyword("RECURSIVE") {
-		return nil, &sqlError{msg: "WITH RECURSIVE is not supported"}
-	}
+	recursive := p.acceptKeyword("RECURSIVE")
 	var with []CTE
 	for {
 		name, err := p.parseIdent()
 		if err != nil {
 			return nil, err
 		}
-		cte := CTE{Name: name}
+		cte := CTE{Name: name, Recursive: recursive}
 		if p.acceptOp("(") {
 			for {
 				c, err := p.parseIdent()
@@ -1042,11 +1084,85 @@ func (p *parser) parseWith() ([]CTE, error) {
 			return nil, err
 		}
 		cte.Select = body
+		if err := p.parseSearchCycle(&cte); err != nil {
+			return nil, err
+		}
 		with = append(with, cte)
 		if !p.acceptOp(",") {
 			return with, nil
 		}
 	}
+}
+
+// parseSearchCycle parses a CTE's optional
+// `SEARCH {BREADTH | DEPTH} FIRST BY col, … SET seq` and
+// `CYCLE col, … SET mark [TO value DEFAULT value] USING path` clauses.
+func (p *parser) parseSearchCycle(cte *CTE) error {
+	idents := func() ([]string, error) {
+		var out []string
+		for {
+			c, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, c)
+			if !p.acceptOp(",") {
+				return out, nil
+			}
+		}
+	}
+	var err error
+	if p.acceptKeyword("SEARCH") {
+		s := &SearchClause{}
+		switch {
+		case p.acceptKeyword("BREADTH", "FIRST", "BY"):
+			s.Breadth = true
+		case p.acceptKeyword("DEPTH", "FIRST", "BY"):
+		default:
+			return syntaxErr("expected BREADTH FIRST BY or DEPTH FIRST BY near %q", p.peek().text)
+		}
+		if s.By, err = idents(); err != nil {
+			return err
+		}
+		if err := p.expectKeyword("SET"); err != nil {
+			return err
+		}
+		if s.Set, err = p.parseIdent(); err != nil {
+			return err
+		}
+		cte.Search = s
+	}
+	if p.acceptKeyword("CYCLE") {
+		c := &CycleClause{}
+		if c.Columns, err = idents(); err != nil {
+			return err
+		}
+		if err := p.expectKeyword("SET"); err != nil {
+			return err
+		}
+		if c.Set, err = p.parseIdent(); err != nil {
+			return err
+		}
+		if p.acceptKeyword("TO") {
+			if c.To, err = p.parseAdditive(); err != nil {
+				return err
+			}
+			if err := p.expectKeyword("DEFAULT"); err != nil {
+				return err
+			}
+			if c.Default, err = p.parseAdditive(); err != nil {
+				return err
+			}
+		}
+		if err := p.expectKeyword("USING"); err != nil {
+			return err
+		}
+		if c.Using, err = p.parseIdent(); err != nil {
+			return err
+		}
+		cte.Cycle = c
+	}
+	return nil
 }
 
 // parseSelectBody parses a query after its WITH list.
@@ -1289,6 +1405,7 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 			return nil, err
 		}
 		sel.From, sel.FromSelect, sel.FromAlias = items[0].Table, items[0].Select, items[0].Alias
+		sel.FromFunc, sel.FromLateral, sel.FromColumns = items[0].Func, items[0].Lateral, items[0].Columns
 		sel.Joins = items[1:]
 	}
 	if p.acceptKeyword("WHERE") {
@@ -1340,18 +1457,61 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 	return sel, nil
 }
 
-// parseFromList parses the items of a FROM clause: the first item (with an
-// empty Kind), then any number of `, item`, `CROSS JOIN item` and
-// `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…)`.
-func (p *parser) parseFromList() ([]JoinClause, error) {
-	var first JoinClause
+// parseFromEntry parses one FROM item: `[LATERAL] (SELECT …) [AS] alias`,
+// `[LATERAL] function(args) [[AS] alias]` or `table [[AS] alias]`, each
+// alias optionally followed by column aliases `(x, y, …)`.
+func (p *parser) parseFromEntry() (JoinClause, error) {
+	jc := JoinClause{Lateral: p.acceptKeyword("LATERAL")}
 	var err error
-	if first.Table, first.Select, first.Alias, err = p.parseFromItem(); err != nil {
+	if t := p.peek(); (t.kind == tokIdent || t.kind == tokQuotedIdent) && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+		// A table function call (a table name is never followed by "(").
+		p.pos += 2
+		jc.Func = &Func{Name: strings.ToUpper(t.text)}
+		for !p.isOp(")") {
+			a, err := p.parseExpr()
+			if err != nil {
+				return jc, err
+			}
+			jc.Func.Args = append(jc.Func.Args, a)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return jc, err
+		}
+		if jc.Alias, err = p.parseAlias(); err != nil {
+			return jc, err
+		}
+	} else {
+		if jc.Lateral && !p.isParenQueryStart() {
+			return jc, syntaxErr("LATERAL must be followed by a subquery or a function call near %q", p.peek().text)
+		}
+		if jc.Table, jc.Select, jc.Alias, err = p.parseFromItem(); err != nil {
+			return jc, err
+		}
+	}
+	if jc.Alias != "" && p.isOp("(") {
+		if jc.Columns, err = p.parseColumnList(); err != nil {
+			return jc, err
+		}
+	}
+	return jc, nil
+}
+
+// parseFromList parses the items of a FROM clause: the first item (with an
+// empty Kind), then any number of `, item`, `CROSS JOIN item`,
+// `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…)` and
+// `NATURAL [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item`.
+func (p *parser) parseFromList() ([]JoinClause, error) {
+	first, err := p.parseFromEntry()
+	if err != nil {
 		return nil, err
 	}
 	items := []JoinClause{first}
 	for {
 		kind := ""
+		natural := false
 		switch {
 		case p.acceptOp(","):
 			kind = "CROSS"
@@ -1365,17 +1525,34 @@ func (p *parser) parseFromList() ([]JoinClause, error) {
 			kind = "RIGHT"
 		case p.acceptKeyword("FULL", "OUTER", "JOIN"), p.acceptKeyword("FULL", "JOIN"):
 			kind = "FULL"
-		case p.isKeyword("NATURAL"):
-			return nil, &sqlError{msg: "NATURAL JOIN is not supported; use USING or ON"}
+		case p.acceptKeyword("NATURAL"):
+			natural = true
+			switch {
+			case p.acceptKeyword("INNER", "JOIN"), p.acceptKeyword("JOIN"):
+				kind = "INNER"
+			case p.acceptKeyword("LEFT", "OUTER", "JOIN"), p.acceptKeyword("LEFT", "JOIN"):
+				kind = "LEFT"
+			case p.acceptKeyword("RIGHT", "OUTER", "JOIN"), p.acceptKeyword("RIGHT", "JOIN"):
+				kind = "RIGHT"
+			case p.acceptKeyword("FULL", "OUTER", "JOIN"), p.acceptKeyword("FULL", "JOIN"):
+				kind = "FULL"
+			default:
+				return nil, syntaxErr("expected [INNER | LEFT | RIGHT | FULL] JOIN after NATURAL near %q", p.peek().text)
+			}
 		}
 		if kind == "" {
 			return items, nil
 		}
-		jc := JoinClause{Kind: kind}
-		if jc.Table, jc.Select, jc.Alias, err = p.parseFromItem(); err != nil {
+		jc, err := p.parseFromEntry()
+		if err != nil {
 			return nil, err
 		}
-		if kind != "CROSS" {
+		jc.Kind, jc.Natural = kind, natural
+		if natural {
+			if p.isKeyword("ON") || p.isKeyword("USING") {
+				return nil, syntaxErr("NATURAL JOIN cannot have an ON or USING clause")
+			}
+		} else if kind != "CROSS" {
 			switch {
 			case p.acceptKeyword("ON"):
 				if jc.On, err = p.parseExpr(); err != nil {
@@ -2420,16 +2597,22 @@ func (p *parser) parseComparison() (Expr, error) {
 			switch t.text {
 			case "=", "==", "<>", "!=", "<", "<=", ">", ">=":
 				p.pos++
-				r, err := p.parseOtherOp()
-				if err != nil {
-					return nil, err
-				}
 				op := t.text
 				switch op {
 				case "==":
 					op = "="
 				case "!=":
 					op = "<>"
+				}
+				if q, ok, err := p.parseQuantified(l, op); err != nil {
+					return nil, err
+				} else if ok {
+					l = q
+					continue
+				}
+				r, err := p.parseOtherOp()
+				if err != nil {
+					return nil, err
 				}
 				l = &Binary{Op: op, L: l, R: r}
 				continue
@@ -2604,6 +2787,34 @@ func (p *parser) parseOtherOp() (Expr, error) {
 			}
 		}
 	}
+}
+
+// parseQuantified parses `ANY | SOME | ALL (SELECT …)` after the comparison
+// operator op (ok is false if they don't follow). `= ANY` is IN and `<> ALL`
+// is NOT IN, so that they share IN's index unions, hash sets and semi-joins.
+func (p *parser) parseQuantified(x Expr, op string) (Expr, bool, error) {
+	all := p.isKeyword("ALL")
+	if !(all || p.isKeyword("ANY") || p.isKeyword("SOME")) || !(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(") {
+		return nil, false, nil
+	}
+	word := strings.ToUpper(p.peek().text)
+	p.pos += 2
+	if !p.isQueryStart() && !p.isParenQueryStart() {
+		return nil, false, syntaxErr("%s (…) needs a subquery near %q", word, p.peek().text)
+	}
+	sub, err := p.parseSubquery()
+	if err != nil {
+		return nil, false, err
+	}
+	switch {
+	case op == "=" && !all:
+		return &Subquery{Select: sub, Kind: SubqueryIn, X: x}, true, nil
+	case op == "<>" && all:
+		return &Subquery{Select: sub, Kind: SubqueryIn, X: x, Not: true}, true, nil
+	case all:
+		return &Subquery{Select: sub, Kind: SubqueryAll, X: x, Op: op}, true, nil
+	}
+	return &Subquery{Select: sub, Kind: SubqueryAny, X: x, Op: op}, true, nil
 }
 
 func (p *parser) parseAdditive() (Expr, error) {

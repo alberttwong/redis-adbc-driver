@@ -120,16 +120,17 @@ func simpleName(name string) bool {
 	return true
 }
 
-// comparison splits `col op const` (in either order) into its parts.
+// comparison splits `col op const` (in either order) into its parts. The
+// column is one of this query's: an outer reference is itself a constant.
 func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 	b, ok := c.(*Binary)
 	if !ok || flipOp[b.Op] == "" {
 		return nil, "", nil, false
 	}
-	if col, ok := b.L.(*ColumnRef); ok && isConstant(b.R) {
+	if col, ok := b.L.(*ColumnRef); ok && col.Outer == 0 && isConstant(b.R) {
 		return col, b.Op, b.R, true
 	}
-	if col, ok := b.R.(*ColumnRef); ok && isConstant(b.L) {
+	if col, ok := b.R.(*ColumnRef); ok && col.Outer == 0 && isConstant(b.L) {
 		return col, flipOp[b.Op], b.L, true
 	}
 	return nil, "", nil, false

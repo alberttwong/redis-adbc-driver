@@ -81,7 +81,7 @@ func (e *executor) planDMLJoin(ctx context.Context, table TableName, alias strin
 	}
 	jp := &joinPlan{}
 	for _, jc := range from {
-		if err := e.addJoinItem(ctx, jp, jc.Kind, jc.Table, jc.Select, jc.Alias); err != nil {
+		if err := e.addFromItem(ctx, jp, jc); err != nil {
 			return nil, err
 		}
 	}
