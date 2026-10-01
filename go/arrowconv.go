@@ -17,6 +17,7 @@ package redis
 import (
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -84,12 +85,16 @@ func valueAt(arr arrow.Array, i int) (Value, error) {
 		return decimalValue(a.Value(i).BigInt(), ct.Precision, ct.Scale), nil
 	case *array.Decimal256:
 		return decimalValue(a.Value(i).BigInt(), ct.Precision, ct.Scale), nil
+	// Value(i) of a string array points into the Arrow buffer, which the
+	// caller may free once the batch is released (bound parameters are read
+	// before the statement runs, and stream batches are released as the
+	// next one is read). Copy, as the binary cases do via string([]byte).
 	case *array.String:
-		return stringValue(a.Value(i)), nil
+		return stringValue(strings.Clone(a.Value(i))), nil
 	case *array.LargeString:
-		return stringValue(a.Value(i)), nil
+		return stringValue(strings.Clone(a.Value(i))), nil
 	case *array.StringView:
-		return stringValue(a.Value(i)), nil
+		return stringValue(strings.Clone(a.Value(i))), nil
 	case *array.Binary:
 		return binaryValue(string(a.Value(i))), nil
 	case *array.LargeBinary:
