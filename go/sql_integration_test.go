@@ -2032,3 +2032,24 @@ func TestSQLCastShorthand(t *testing.T) {
 	h.expectError(`SELECT 'x'::integer`, "invalid")
 	h.expectError(`SELECT 1::nosuchtype`, "unsupported SQL type NOSUCHTYPE")
 }
+
+func TestSQLConcatNulls(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP TABLE IF EXISTS it_concat_out")
+		h.exec("DROP TABLE IF EXISTS it_concat")
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_concat (id INTEGER, first VARCHAR, last VARCHAR)")
+	h.exec("INSERT INTO it_concat VALUES (1, 'Ada', 'Lovelace'), (2, 'Bo', NULL), (3, NULL, NULL)")
+
+	// dbt's default concat macro emits CONCAT(…); a NULL part is skipped.
+	h.expectRows("SELECT id, CONCAT(first, ' ', last), CONCAT_WS(' ', first, last), first || ' ' || last FROM it_concat ORDER BY id",
+		"1|Ada Lovelace|Ada Lovelace|Ada Lovelace", "2|Bo |Bo|NULL", "3| ||NULL")
+	h.expectRows("SELECT id FROM it_concat WHERE CONCAT(first, last) = 'Bo'", "2")
+	h.exec("CREATE TABLE it_concat_out AS SELECT id, CONCAT_WS('-', id, first, last) AS label FROM it_concat")
+	h.expectRows("SELECT label FROM it_concat_out ORDER BY id", "1-Ada-Lovelace", "2-Bo", "3")
+	h.expectRows("SELECT data_type FROM information_schema.columns WHERE table_name = 'it_concat_out' AND column_name = 'label'", "VARCHAR")
+	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects a separator")
+}
