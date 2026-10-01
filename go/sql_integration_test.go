@@ -2951,3 +2951,31 @@ func TestSQLQualifiedStar(t *testing.T) {
 	h.expectError("SELECT other.it_qs_a.* FROM it_qs_a", `missing FROM-clause entry for table "other.it_qs_a"`)
 	h.expectError("SELECT a.*", "requires a FROM clause")
 }
+
+// A correlated subquery with DISTINCT ON keeps one row per key after the
+// correlation filter, so it must not run as a semi-join (which drops the
+// subquery's DISTINCT ON and would test every row).
+func TestSQLDistinctOnInCorrelatedSubquery(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP TABLE IF EXISTS it_dson_o")
+		h.exec("DROP TABLE IF EXISTS it_dson_i")
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_dson_i (k INTEGER, g VARCHAR, ts INTEGER, v INTEGER)")
+	h.exec("INSERT INTO it_dson_i VALUES (1, 'a', 1, 10), (1, 'a', 2, 20), (1, 'b', 1, 30), (2, 'a', 1, 20)")
+	h.exec("CREATE TABLE it_dson_o (id INTEGER, k INTEGER, x INTEGER)")
+	h.exec("INSERT INTO it_dson_o VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 2, 20), (5, 3, 10)")
+
+	// For k = 1 the first row per g (by ts) has v 10 (a) and 30 (b), not 20.
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x IN (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "1", "3", "4")
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x NOT IN (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "2", "5")
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE EXISTS (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "1", "2", "3", "4")
+	// Plain DISTINCT doesn't change which values exist.
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x IN (SELECT DISTINCT v FROM it_dson_i i WHERE i.k = o.k) ORDER BY o.id`, "1", "2", "3", "4")
+}
