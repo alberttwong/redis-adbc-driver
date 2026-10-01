@@ -982,26 +982,12 @@ func jsonText(v Value) string {
 		case math.IsInf(v.F, -1):
 			return "-Infinity"
 		}
-	case KindTime:
-		return trimFraction(formatTime(v.I, v.T.Unit))
 	case KindTimestamp:
-		s := strings.Replace(trimFraction(formatTimestamp(v.I, v.T.Unit, "")), " ", "T", 1)
-		if v.T.TZ != "" {
-			s += "+00:00"
-		}
-		return s
+		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", 0, true)
 	case KindBinary:
 		return `\x` + hex.EncodeToString([]byte(v.S))
 	}
 	return v.Text()
-}
-
-// trimFraction drops the trailing zeros of a time's fractional seconds.
-func trimFraction(s string) string {
-	if strings.IndexByte(s, '.') < 0 {
-		return s
-	}
-	return strings.TrimSuffix(strings.TrimRight(s, "0"), ".")
 }
 
 // writeJSONValue writes a SQL value as JSON, as Postgres's to_json does:

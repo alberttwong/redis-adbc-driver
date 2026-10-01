@@ -47,6 +47,15 @@ func TestFormatInterval(t *testing.T) {
 		{iv(0, 0, math.MinInt64), "-2562047:47:16.854775808"},
 		{iv(14, 3, math.MinInt64), "1 year 2 mons 3 days -2562047:47:16.854775808"},
 		{iv(-14, -3, 0), "-1 years -2 mons -3 days"},
+		// A positive field after a negative one has a "+", as in Postgres.
+		{iv(0, -1, 2*nsPerHour), "-1 days +02:00:00"},
+		{iv(-12, 3, 0), "-1 years +3 days"},
+		{iv(-11, 0, 0), "-11 mons"},
+		{iv(-13, 0, 0), "-1 years -1 mons"},
+		{iv(-10, 0, 0), "-10 mons"},
+		{iv(-1, 2, -3*nsPerHour), "-1 mons +2 days -03:00:00"},
+		{iv(14, -2, nsPerSecond/2), "1 year 2 mons -2 days +00:00:00.5"},
+		{iv(0, 1, -nsPerHour), "1 day -01:00:00"},
 	}
 	for _, c := range cases {
 		if got := formatInterval(c.v); got != c.want {
@@ -57,6 +66,10 @@ func TestFormatInterval(t *testing.T) {
 	runScalarCases(t, []scalarCase{
 		{"CAST(INTERVAL '-9223372036.854775808 seconds' AS VARCHAR)", "-2562047:47:16.854775808", "VARCHAR"},
 		{"CAST(INTERVAL '-1 day -9223372036.854775808 seconds' AS VARCHAR)", "-1 days -2562047:47:16.854775808", "VARCHAR"},
+		{"CAST(INTERVAL '-1 day 2 hours' AS VARCHAR)", "-1 days +02:00:00", "VARCHAR"},
+		// The text reads back as the same interval.
+		{"CAST(CAST(INTERVAL '-1 year 2 mons -3 days 4 hours' AS VARCHAR) AS INTERVAL) = INTERVAL '-1 year 2 mons -3 days 4 hours'", "true", "BOOLEAN"},
+		{"CAST(CAST(INTERVAL '-1 year 2 mons -3 days 4 hours' AS VARCHAR) AS INTERVAL)", "-10 mons -3 days +04:00:00", "INTERVAL"},
 	})
 }
 
@@ -80,7 +93,7 @@ func TestIntervalRange(t *testing.T) {
 		// Days and months have their own fields.
 		{"CAST(INTERVAL '2562047 hours' + INTERVAL '1000000 days' AS VARCHAR)", "1000000 days 2562047:00:00", "VARCHAR"},
 		// time ± interval wraps around midnight, whatever the interval's size.
-		{"CAST(TIME '23:00:00' + INTERVAL '2562047 hours' AS VARCHAR)", "22:00:00.000000", "VARCHAR"},
+		{"CAST(TIME '23:00:00' + INTERVAL '2562047 hours' AS VARCHAR)", "22:00:00", "VARCHAR"},
 		{"CAST(TIME '01:00:00' - INTERVAL '-9223372036.854775808 seconds' AS VARCHAR)", "00:47:16.854775", "VARCHAR"},
 		{"CAST(TIMESTAMP '2000-01-01 00:00:00' + INTERVAL '-9223372036.854775808 seconds' AS VARCHAR)", "1707-09-22 00:12:43.145224", "VARCHAR"},
 	})

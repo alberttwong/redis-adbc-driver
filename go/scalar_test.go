@@ -347,7 +347,7 @@ func TestScalarConditional(t *testing.T) {
 		{"GREATEST('apple', 'banana', 'cherry')", "cherry", "VARCHAR"},
 		{"LEAST('b', 'B', 'a')", "B", "VARCHAR"},
 		{"GREATEST(DATE '2024-01-01', '2024-06-01')", "2024-06-01", "DATE"},
-		{"GREATEST(DATE '2024-01-01', TIMESTAMP '2023-06-01 12:00:00')", "2024-01-01 00:00:00.000000", "TIMESTAMP(6)"},
+		{"GREATEST(DATE '2024-01-01', TIMESTAMP '2023-06-01 12:00:00')", "2024-01-01 00:00:00", "TIMESTAMP(6)"},
 		{"GREATEST(5)", "5", "BIGINT"},
 
 		// IIF is CASE WHEN: only the chosen branch is evaluated.

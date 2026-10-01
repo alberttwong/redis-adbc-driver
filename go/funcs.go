@@ -40,7 +40,8 @@ package redis
 //     TRIM([BOTH | LEADING | TRAILING] [c] FROM s) and TRIM(s [, c]) are
 //     BTRIM / LTRIM / RTRIM(s [, c]), POSITION(a IN b) is POSITION(a, b),
 //     DATE_ADD(x, INTERVAL n part) is DATE_ADD('part', n, x), x % y is
-//     MOD(x, y) and x LIKE p is LIKE(x, p). Operators and the other forms
+//     MOD(x, y), x LIKE p is LIKE(x, p), x AT TIME ZONE z is TIMEZONE(z, x)
+//     and x AT LOCAL is TIMEZONE(x). Operators and the other forms
 //     are calls of internal functions, named after the operator or starting
 //     with "__", which a call can't name: x ~ p, x SIMILAR TO p, the JSON
 //     operators ->, ->>, #> and #>>, INTERVAL n unit (__INTERVAL), x::json
@@ -276,6 +277,10 @@ var funcDefs = []funcDef{
 	{name: "TO_TIMESTAMP", min: 1, max: 2, impl: implDateTime}, // (epoch seconds) or (text, format)
 	{name: "TO_DATE", min: 2, max: 2, impl: implDateTime},
 	{name: "TO_CHAR", min: 2, max: 2, impl: implDateTime},
+	// TIMEZONE(z, x) is also x AT TIME ZONE z, and TIMEZONE(x) x AT LOCAL
+	// (timezone.go).
+	{name: "TIMEZONE", min: 1, max: 2, impl: implDateTime},
+	{name: "CONVERT_TIMEZONE", min: 2, max: 3, impl: implDateTime},           // ([source,] target, x)
 	{name: "__INTERVAL", min: 2, max: 2, impl: implDateTime, internal: true}, // INTERVAL 'n' unit, INTERVAL n unit
 
 	// ---- JSON (json.go, jsonpath.go) ----

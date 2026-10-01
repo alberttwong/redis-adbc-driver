@@ -250,27 +250,72 @@ func parseClock(s string) (sec int64, nanos int64, digits int, err error) {
 	return hms[0]*3600 + hms[1]*60 + hms[2], nanos, digits, nil
 }
 
-func parseDateDays(s string) (int64, error) {
-	t, err := time.Parse("2006-01-02", strings.TrimSpace(s))
-	if err != nil {
-		return 0, fmt.Errorf("invalid date %q", s)
+// splitEra removes a trailing era, " BC" or " AD" in any case, from date or
+// timestamp text, as Postgres writes years before 1 AD (0044-03-15 BC).
+func splitEra(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if n := len(s); n > 3 && (s[n-3] == ' ' || s[n-3] == '\t') {
+		switch strings.ToUpper(s[n-2:]) {
+		case "BC":
+			return strings.TrimSpace(s[:n-2]), true
+		case "AD":
+			return strings.TrimSpace(s[:n-2]), false
+		}
 	}
-	return floorDiv(t.Unix(), 86400), nil
+	return s, false
 }
 
-// parseTimestamp parses "YYYY-MM-DD[ T]HH:MM:SS[.fffffffff][Z|±HH[:MM]]".
-// It returns seconds and nanoseconds since the Unix epoch (UTC), the number of
-// fractional digits, and whether an explicit offset was present.
+// parseDatePrefix parses the YYYY-MM-DD that s starts with (four to seven
+// year digits; bc: a BC year, so 0001 is astronomical year 0) and returns
+// its days since the epoch and the text after it. As in Postgres there is no
+// year 0.
+func parseDatePrefix(s string, bc bool) (int64, string, bool) {
+	isDigit := func(i int) bool { return i < len(s) && s[i] >= '0' && s[i] <= '9' }
+	n := 0
+	for isDigit(n) {
+		n++
+	}
+	if n < 4 || n > 7 || len(s) < n+6 || s[n] != '-' || !isDigit(n+1) || !isDigit(n+2) || s[n+3] != '-' ||
+		!isDigit(n+4) || !isDigit(n+5) {
+		return 0, "", false
+	}
+	y, _ := strconv.Atoi(s[:n])
+	m, _ := strconv.Atoi(s[n+1 : n+3])
+	d, _ := strconv.Atoi(s[n+4 : n+6])
+	if y == 0 {
+		return 0, "", false
+	}
+	if bc {
+		y = 1 - y
+	}
+	tm := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if tm.Year() != y || int(tm.Month()) != m || tm.Day() != d {
+		return 0, "", false
+	}
+	return floorDiv(tm.Unix(), 86400), s[n+6:], true
+}
+
+func parseDateDays(s string) (int64, error) {
+	t, bc := splitEra(s)
+	days, rest, ok := parseDatePrefix(t, bc)
+	if !ok || rest != "" {
+		return 0, fmt.Errorf("invalid date %q", s)
+	}
+	return days, nil
+}
+
+// parseTimestamp parses "YYYY-MM-DD[ T]HH:MM:SS[.fffffffff][Z|±HH[:MM]|zone]
+// [BC]". It returns seconds and nanoseconds since the Unix epoch (UTC), the
+// number of fractional digits, and whether an explicit offset was present.
+// A zone name is read as by AT TIME ZONE (timezone.go).
 func parseTimestamp(s string) (sec, nanos int64, digits int, hasTZ bool, err error) {
 	s = strings.TrimSpace(s)
-	if len(s) < 10 {
+	t, bc := splitEra(s)
+	days, rest, ok := parseDatePrefix(t, bc)
+	if !ok {
 		return 0, 0, 0, false, fmt.Errorf("invalid timestamp %q", s)
 	}
-	days, err := parseDateDays(s[:10])
-	if err != nil {
-		return 0, 0, 0, false, fmt.Errorf("invalid timestamp %q", s)
-	}
-	rest := strings.TrimLeft(s[10:], " T")
+	rest = strings.TrimLeft(rest, " T")
 	offset := int64(0)
 	if rest != "" {
 		clockEnd := len(rest)
@@ -309,21 +354,22 @@ func parseTimestamp(s string) (sec, nanos int64, digits int, hasTZ bool, err err
 			}
 			offset = sign * (h*3600 + m*60)
 		default:
-			loc, lerr := time.LoadLocation(tz)
-			if lerr != nil {
+			z, zerr := resolveZone(tz)
+			if zerr != nil {
 				return 0, 0, 0, false, fmt.Errorf("invalid timestamp %q", s)
 			}
 			hasTZ = true
-			_ = loc
-			// Resolve the zone offset at that local wall time.
-			clockSec, _, _, cerr := parseClock(rest)
-			if cerr != nil {
-				return 0, 0, 0, false, cerr
+			// The zone's offset at that local time, with DST gaps and
+			// overlaps resolved as for AT TIME ZONE.
+			var clockSec int64
+			if rest != "" {
+				var cerr error
+				if clockSec, _, _, cerr = parseClock(rest); cerr != nil {
+					return 0, 0, 0, false, fmt.Errorf("invalid timestamp %q", s)
+				}
 			}
-			wall := time.Unix(days*86400+clockSec, 0).UTC()
-			local := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), wall.Second(), 0, loc)
-			_, off := local.Zone()
-			offset = int64(off)
+			local := days*86400 + clockSec
+			offset = local - z.localToUTC(local)
 		}
 	}
 	var clockSec int64
@@ -411,38 +457,97 @@ func numberLiteral(text string) (Value, error) {
 }
 
 // ---- formatting ----
+//
+// Dates, times and timestamps are written as Postgres writes them with
+// DateStyle ISO, whatever the declared precision: seconds always, then the
+// fraction without trailing zeros (and no "." when it is zero), so
+// 2024-01-10 10:00:00 and 2024-01-10 10:00:00.5. A timestamp with time zone
+// has its offset (+00: the session time zone is UTC). A year before 1 AD is
+// written as its BC year (astronomical year 0 is 0001-01-01 BC), and a year
+// past 9999 with all its digits.
 
-func formatTimestamp(v int64, unit arrow.TimeUnit, tz string) string {
+// splitUnits splits v units since the epoch (or midnight) into whole
+// seconds and nanoseconds.
+func splitUnits(v int64, unit arrow.TimeUnit) (int64, int64) {
 	per := unitsPerSecond[unit]
 	sec := floorDiv(v, per)
-	frac := v - sec*per
-	t := time.Unix(sec, frac*(1_000_000_000/per)).UTC()
-	layout := "2006-01-02 15:04:05"
-	switch unit {
-	case arrow.Millisecond:
-		layout += ".000"
-	case arrow.Microsecond:
-		layout += ".000000"
-	case arrow.Nanosecond:
-		layout += ".000000000"
+	return sec, (v - sec*per) * (1_000_000_000 / per)
+}
+
+// fractionText is the fractional seconds of nanos without trailing zeros
+// (".5", ".05", ".123456"), or "" when they are zero.
+func fractionText(nanos int64) string {
+	if nanos == 0 {
+		return ""
 	}
-	out := t.Format(layout)
-	if tz != "" {
-		out += "+00"
+	return strings.TrimRight(fmt.Sprintf(".%09d", nanos), "0")
+}
+
+// dateText is tm's date as YYYY-MM-DD, with at least four year digits; bc
+// reports a year before 1 AD, which is written as its BC year.
+func dateText(tm time.Time) (string, bool) {
+	y, m, d := tm.Date()
+	bc := y <= 0
+	if bc {
+		y = 1 - y
+	}
+	return fmt.Sprintf("%04d-%02d-%02d", y, int(m), d), bc
+}
+
+// formatOffset writes a UTC offset in seconds east as Postgres does: +00,
+// +05:30, -08, +05:30:15. xsd is the ISO 8601 form of JSON, which always
+// has the minutes (+00:00).
+func formatOffset(secs int, xsd bool) string {
+	sign := byte('+')
+	if secs < 0 {
+		sign, secs = '-', -secs
+	}
+	h, m, s := secs/3600, secs/60%60, secs%60
+	switch {
+	case s != 0:
+		return fmt.Sprintf("%c%02d:%02d:%02d", sign, h, m, s)
+	case m != 0 || xsd:
+		return fmt.Sprintf("%c%02d:%02d", sign, h, m)
+	}
+	return fmt.Sprintf("%c%02d", sign, h)
+}
+
+// formatDate renders days since the epoch: 2024-01-10, 0044-03-15 BC.
+func formatDate(days int64) string {
+	s, bc := dateText(time.Unix(days*86400, 0).UTC())
+	if bc {
+		s += " BC"
+	}
+	return s
+}
+
+// formatTimestamp renders v units since the epoch, 2024-01-10 10:00:00.5,
+// and with withTZ the offset off (seconds east of UTC) after the time:
+// 2024-01-10 10:00:00+00. xsd is the ISO 8601 form of JSON, with a T
+// between the date and the time and the offset as +00:00. A BC year ends
+// with " BC", after the offset, in both forms.
+func formatTimestamp(v int64, unit arrow.TimeUnit, withTZ bool, off int, xsd bool) string {
+	sec, nanos := splitUnits(v, unit)
+	tm := time.Unix(sec+int64(off), nanos).UTC()
+	date, bc := dateText(tm)
+	sep := " "
+	if xsd {
+		sep = "T"
+	}
+	out := date + sep + fmt.Sprintf("%02d:%02d:%02d", tm.Hour(), tm.Minute(), tm.Second()) + fractionText(nanos)
+	if withTZ {
+		out += formatOffset(off, xsd)
+	}
+	if bc {
+		out += " BC"
 	}
 	return out
 }
 
+// formatTime renders v units since midnight: 10:00:00, 10:00:00.5.
 func formatTime(v int64, unit arrow.TimeUnit) string {
-	per := unitsPerSecond[unit]
-	sec := floorDiv(v, per)
-	frac := v - sec*per
-	out := fmt.Sprintf("%02d:%02d:%02d", sec/3600, (sec%3600)/60, sec%60)
-	if unit != arrow.Second {
-		width := precisionForUnit(unit)
-		out += fmt.Sprintf(".%0*d", width, frac)
-	}
-	return out
+	sec, nanos := splitUnits(v, unit)
+	return fmt.Sprintf("%02d:%02d:%02d", sec/3600, (sec%3600)/60, sec%60) + fractionText(nanos)
 }
 
 // Text renders a value the way CAST(x AS VARCHAR) would.
@@ -469,11 +574,11 @@ func (v Value) Text() string {
 	case KindBinary:
 		return v.S
 	case KindDate:
-		return time.Unix(v.I*86400, 0).UTC().Format("2006-01-02")
+		return formatDate(v.I)
 	case KindTime:
 		return formatTime(v.I, v.T.Unit)
 	case KindTimestamp:
-		return formatTimestamp(v.I, v.T.Unit, v.T.TZ)
+		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", 0, false)
 	case KindInterval:
 		return formatInterval(v)
 	}

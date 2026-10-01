@@ -1138,7 +1138,7 @@ func TestSQLDateTimeFunctions(t *testing.T) {
 			CAST(DATE_TRUNC('hour', ts) AS VARCHAR), DATE_TRUNC('week', d), DATE_TRUNC('year', d),
 			CAST(DATE_TRUNC('day', tz) AS VARCHAR)
 		FROM it_dt WHERE id = 1`,
-		"2024-02-01 00:00:00.000000|2024-01-01 00:00:00.000000|2024-02-29 13:00:00.000000|2024-02-26|2024-01-01|2024-02-29 00:00:00.000+00")
+		"2024-02-01 00:00:00|2024-01-01 00:00:00|2024-02-29 13:00:00|2024-02-26|2024-01-01|2024-02-29 00:00:00+00")
 	h.expectRows(`SELECT DATE_TRUNC('year', ts) AS y, COUNT(*) FROM it_dt WHERE ts IS NOT NULL GROUP BY y ORDER BY y`,
 		"2000-01-01T00:00:00|1", "2024-01-01T00:00:00|1")
 
@@ -1154,14 +1154,14 @@ func TestSQLDateTimeFunctions(t *testing.T) {
 	// Construction and conversion.
 	h.expectRows(`SELECT MAKE_DATE(2024, 2, 29), CAST(MAKE_TIMESTAMP(2024, 1, 2, 3, 4, 5.25) AS VARCHAR),
 			CAST(MAKE_TIME(13, 45, 30.5) AS VARCHAR), LAST_DAY(DATE '2024-02-10'), LAST_DAY(DATE '2023-02-10')`,
-		"2024-02-29|2024-01-02 03:04:05.250000|13:45:30.500000|2024-02-29|2023-02-28")
+		"2024-02-29|2024-01-02 03:04:05.25|13:45:30.5|2024-02-29|2023-02-28")
 	h.expectError(`SELECT MAKE_DATE(2023, 2, 29)`, "out of range")
 	h.expectRows(`SELECT CAST(TO_TIMESTAMP(0) AS VARCHAR), CAST(TO_TIMESTAMP(1700000000.5) AS VARCHAR)`,
-		"1970-01-01 00:00:00.000000+00|2023-11-14 22:13:20.500000+00")
+		"1970-01-01 00:00:00+00|2023-11-14 22:13:20.5+00")
 	h.expectRows(`SELECT CAST(TO_TIMESTAMP('2024-03-15 14:30', 'YYYY-MM-DD HH24:MI') AS VARCHAR),
 			TO_DATE('15 Mar 2024', 'DD Mon YYYY'), TO_DATE('March 5, 2024', 'Month DD, YYYY'),
 			CAST(TO_TIMESTAMP('03/15/2024 2:30 PM', 'MM/DD/YYYY HH12:MI AM') AS VARCHAR)`,
-		"2024-03-15 14:30:00.000000+00|2024-03-15|2024-03-05|2024-03-15 14:30:00.000000+00")
+		"2024-03-15 14:30:00+00|2024-03-15|2024-03-05|2024-03-15 14:30:00+00")
 	h.expectError(`SELECT TO_DATE('2024-02-30', 'YYYY-MM-DD')`, "out of range")
 	h.expectError(`SELECT TO_DATE('2024/02', 'YYYY-MM-DD')`, "does not match format")
 	h.expectError(`SELECT TO_DATE('2024-xx-01', 'YYYY-MM-DD')`, "expected digits")
@@ -1224,13 +1224,13 @@ func TestSQLIntervals(t *testing.T) {
 		str(`TIMESTAMP '2024-03-01 00:00:00' - INTERVAL '1 year'`),
 		str(`DATE '2024-02-29' + INTERVAL '1 year'`),
 		str(`DATE '2024-02-28' + 2`), str(`DATE '2024-03-01' - 1`)}, ", "),
-		"2024-02-29 10:00:00.000000|2023-02-28 10:00:00.000000|2024-03-01 01:00:00.000000|2023-03-01 00:00:00.000000|"+
-			"2025-02-28 00:00:00.000000|2024-03-01|2024-02-29")
+		"2024-02-29 10:00:00|2023-02-28 10:00:00|2024-03-01 01:00:00|2023-03-01 00:00:00|"+
+			"2025-02-28 00:00:00|2024-03-01|2024-02-29")
 	h.expectRows(`SELECT DATE '2024-03-01' - DATE '2024-02-01', `+
 		str(`TIMESTAMP '2024-03-01 00:00:00' - TIMESTAMP '2024-02-28 12:00:00'`)+`, `+
 		str(`TIMESTAMP '2024-02-28 12:00:00' - TIMESTAMP '2024-03-01 00:00:00'`)+`, `+
 		str(`TIME '23:30:00' + INTERVAL '45 minutes'`)+`, `+str(`TIME '10:00:00' - TIME '08:30:00'`),
-		"29|1 day 12:00:00|-1 days -12:00:00|00:15:00.000000|01:30:00")
+		"29|1 day 12:00:00|-1 days -12:00:00|00:15:00|01:30:00")
 
 	// Interval arithmetic and comparison.
 	h.expectRows(`SELECT `+str(`INTERVAL '1 day' * 2.5`)+`, `+str(`INTERVAL '1 hour' / 4`)+`, `+str(`-INTERVAL '1 day'`)+`, `+
@@ -1308,7 +1308,7 @@ func TestSQLIntervalBind(t *testing.T) {
 	r := rdr.RecordBatch()
 	got := r.Column(0).ValueStr(0) + "|" + r.Column(1).ValueStr(0)
 	// Jan 31 + 1 month = Feb 29 (leap year), + 1 day = Mar 1, + 1 hour.
-	if want := "2024-03-01 01:00:00.000000|00:01:30"; got != want {
+	if want := "2024-03-01 01:00:00|00:01:30"; got != want {
 		t.Errorf("bound intervals: got %q, want %q", got, want)
 	}
 }
@@ -1334,14 +1334,14 @@ func TestSQLScanReadsExactValues(t *testing.T) {
 	row1 := `1|9007199254740993|0.30000000000000004|1234567890123456789012345678.0123456789|` +
 		`2999-12-31 23:59:59.999999|23:59:59.999999|a|b "q" {x}|true|2024-02-29|n1`
 	row2 := `2|9223372036854775807|-1.2345678901234568e-300|-0.0000000001|` +
-		`1970-01-01 00:00:00.000001|00:00:00.000000|` + `|false|1900-01-01|NULL`
+		`1970-01-01 00:00:00.000001|00:00:00|` + `|false|1900-01-01|NULL`
 	row3 := `2147483647|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL`
 	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE id >= 1 ORDER BY id`, row1, row2, row3)
 	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE big > 0 ORDER BY big LIMIT 2`, row1, row2)
 	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE note LIKE 'n%' OR note IS NULL ORDER BY id`, row1, row2, row3)
 	h.expectRows(`SELECT id, CAST(t AS VARCHAR), s, ok, day, note FROM it_exact WHERE id >= 1 ORDER BY id`,
 		`1|23:59:59.999999|a|b "q" {x}|true|2024-02-29|n1`,
-		`2|00:00:00.000000||false|1900-01-01|NULL`,
+		`2|00:00:00||false|1900-01-01|NULL`,
 		`2147483647|NULL|NULL|NULL|NULL|NULL`)
 
 	// UPDATE and DELETE find their rows the same way.
@@ -1771,8 +1771,8 @@ func TestSQLScalarFunctions(t *testing.T) {
 		}
 	}
 	h.expectRows(`SELECT id, CAST(GREATEST(d, ts) AS VARCHAR), LEAST(d, DATE '2024-01-15'), LEAST(d, '2024-01-15') FROM it_fn ORDER BY id`,
-		"1|2024-03-01 10:00:00.000000|2024-01-15|2024-01-15", "2|2024-01-01 00:00:00.000000|2024-01-01|2024-01-01",
-		"3|2023-06-15 00:00:00.000000|2023-06-15|2023-06-15", "4|NULL|2024-01-15|2024-01-15")
+		"1|2024-03-01 10:00:00|2024-01-15|2024-01-15", "2|2024-01-01 00:00:00|2024-01-01|2024-01-01",
+		"3|2023-06-15 00:00:00|2023-06-15|2023-06-15", "4|NULL|2024-01-15|2024-01-15")
 	// IIF only evaluates the branch it returns (row 3 would divide by zero);
 	// a NULL condition picks the second branch.
 	h.expectRows(`SELECT id, IIF(n = 7, -1, 10000 / (n - 7)) FROM it_fn ORDER BY id`, "1|8", "2|-7", "3|-1", "4|NULL")
@@ -2644,7 +2644,7 @@ func TestSQLWindowQueries(t *testing.T) {
 	// Snapshot-style validity ranges with LEAD.
 	h.expectRows(`SELECT payload, CAST(LEAD(ts) OVER (PARTITION BY k ORDER BY ts) AS VARCHAR) AS valid_to
 		FROM it_events WHERE k = 'a' ORDER BY ts`,
-		"a1|2024-01-02 12:00:00.000000", "a2|2024-01-03 09:00:00.000000", "a3|NULL")
+		"a1|2024-01-02 12:00:00", "a2|2024-01-03 09:00:00", "a3|NULL")
 
 	// A view with a window function is computed before the outer filter:
 	// pushing `payload <> 'a3'` below the window would renumber the rows.

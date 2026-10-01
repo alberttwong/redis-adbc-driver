@@ -79,7 +79,9 @@ var funcSamples = map[string]string{
 	"MAKE_TIME": "MAKE_TIME(1, 2, 3)", "MAKE_TIMESTAMP": "MAKE_TIMESTAMP(2024, 1, 2, 3, 4, 5)",
 	"MAKE_TIMESTAMPTZ": "MAKE_TIMESTAMPTZ(2024, 1, 2, 3, 4, 5.5)", "TO_TIMESTAMP": "TO_TIMESTAMP(0)",
 	"TO_DATE": "TO_DATE('2024-01-02', 'YYYY-MM-DD')", "TO_CHAR": "TO_CHAR(DATE '2024-01-02', 'YYYY')",
-	"__INTERVAL": "INTERVAL 7 DAY",
+	"TIMEZONE":         "TIMESTAMP '2024-01-02 03:04:05' AT TIME ZONE 'America/New_York'",
+	"CONVERT_TIMEZONE": "CONVERT_TIMEZONE('UTC', 'America/New_York', TIMESTAMP '2024-01-02 03:04:05')",
+	"__INTERVAL":       "INTERVAL 7 DAY",
 	// JSON
 	"->": `'{"a": 1}' -> 'a'`, "->>": `'{"a": 1}' ->> 'a'`, "#>": `'{"a": [1]}' #> '{a,0}'`, "#>>": `'{"a": [1]}' #>> '{a,0}'`,
 	"JSON_EXTRACT_PATH": `JSON_EXTRACT_PATH('{"a": 1}', 'a')`, "JSON_EXTRACT_PATH_TEXT": `JSON_EXTRACT_PATH_TEXT('{"a": 1}', 'a')`,

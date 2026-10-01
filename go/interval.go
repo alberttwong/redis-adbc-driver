@@ -268,9 +268,12 @@ func isoInterval(s string) (Value, error) {
 }
 
 // formatInterval renders an interval like Postgres: "1 year 2 mons 3 days
-// 04:05:06.5"; the zero interval is "00:00:00".
+// 04:05:06.5"; the zero interval is "00:00:00". As in Postgres, a positive
+// field that follows a negative one has a "+": "-1 days +02:00:00",
+// "-1 years +2 mons".
 func formatInterval(v Value) string {
 	var parts []string
+	afterNegative := false
 	unit := func(n int64, one, many string) {
 		if n == 0 {
 			return
@@ -279,7 +282,12 @@ func formatInterval(v Value) string {
 		if n == 1 {
 			name = one
 		}
-		parts = append(parts, fmt.Sprintf("%d %s", n, name))
+		sign := ""
+		if afterNegative && n > 0 {
+			sign = "+"
+		}
+		parts = append(parts, fmt.Sprintf("%s%d %s", sign, n, name))
+		afterNegative = n < 0
 	}
 	years, months := int64(v.Months)/12, int64(v.Months)%12
 	unit(years, "year", "years")
@@ -291,6 +299,8 @@ func formatInterval(v Value) string {
 		sign := ""
 		if v.I < 0 {
 			sign, ns = "-", -ns
+		} else if afterNegative {
+			sign = "+"
 		}
 		h, rem := ns/uint64(nsPerHour), ns%uint64(nsPerHour)
 		m, rem := rem/uint64(nsPerMinute), rem%uint64(nsPerMinute)
