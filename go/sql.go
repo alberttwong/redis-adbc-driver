@@ -208,7 +208,10 @@ type SelectItem struct {
 	Expr  Expr
 	Alias string
 	Star  bool
-	Text  string
+	// StarOf is the qualifier of `rel.*` (or `schema.rel.*`, …); nil for a
+	// plain `*`.
+	StarOf []string
+	Text   string
 }
 
 // NullsOrder is an explicit NULLS FIRST / NULLS LAST.
@@ -269,6 +272,10 @@ type SelectStmt struct {
 	Having     Expr
 	Windows    []NamedWindow // WINDOW clause
 	Qualify    Expr          // filters rows after window functions
+	// Distinct is SELECT DISTINCT; DistinctOn holds the expressions of
+	// Postgres's SELECT DISTINCT ON (…).
+	Distinct   bool
+	DistinctOn []Expr
 	OrderBy    []OrderItem
 	Limit      *int64
 	Offset     *int64
@@ -1106,17 +1113,61 @@ func (p *parser) parseSetPrimary() (*SelectStmt, error) {
 	return p.parseSelectCore()
 }
 
+// parseQualifiedStar parses `rel.*`, `schema.rel.*` or `catalog.schema.rel.*`
+// as a select item; nothing is consumed unless it matches.
+func (p *parser) parseQualifiedStar() ([]string, bool) {
+	var parts []string
+	for i := 0; ; i += 2 {
+		t := p.peekAt(i)
+		if t.kind != tokIdent && t.kind != tokQuotedIdent {
+			return nil, false
+		}
+		if dot := p.peekAt(i + 1); dot.kind != tokOp || dot.text != "." {
+			return nil, false
+		}
+		parts = append(parts, t.text)
+		if star := p.peekAt(i + 2); star.kind == tokOp && star.text == "*" {
+			p.pos += i + 3
+			return parts, true
+		}
+	}
+}
+
 // parseSelectCore parses SELECT … FROM … WHERE … GROUP BY … HAVING ….
 func (p *parser) parseSelectCore() (*SelectStmt, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
 	sel := &SelectStmt{}
-	p.acceptKeyword("ALL")
+	if p.acceptKeyword("DISTINCT") {
+		sel.Distinct = true
+		if p.acceptKeyword("ON") {
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				sel.DistinctOn = append(sel.DistinctOn, e)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		p.acceptKeyword("ALL")
+	}
 	for {
 		start := p.peek().pos
 		if p.acceptOp("*") {
 			sel.Items = append(sel.Items, SelectItem{Star: true, Text: "*"})
+		} else if q, ok := p.parseQualifiedStar(); ok {
+			sel.Items = append(sel.Items, SelectItem{Star: true, StarOf: q, Text: strings.TrimSpace(p.src[start:p.toks[p.pos-1].end])})
 		} else {
 			e, err := p.parseExpr()
 			if err != nil {

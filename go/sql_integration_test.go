@@ -2843,3 +2843,139 @@ func TestSQLWindowAcrossPages(t *testing.T) {
 	h.expectRows(`SELECT id FROM it_win_pages QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY id DESC) = 1 ORDER BY id`,
 		fmt.Sprint(n-2), fmt.Sprint(n-1), fmt.Sprint(n))
 }
+
+func TestSQLSelectDistinct(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_dist_v")
+		h.exec("DROP TABLE IF EXISTS it_dist_out")
+		h.exec("DROP TABLE IF EXISTS it_dist")
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_dist (id INTEGER, g VARCHAR, v INTEGER, s VARCHAR NOINDEX)")
+	h.exec(`INSERT INTO it_dist VALUES (1, 'a', 1, 'x'), (2, 'a', 1, 'x'), (3, 'a', 2, NULL),
+		(4, 'b', NULL, NULL), (5, 'b', NULL, NULL), (6, NULL, 3, 'y')`)
+
+	// Duplicates go; NULLs are equal to each other (and sort last).
+	h.expectRows("SELECT DISTINCT g FROM it_dist ORDER BY g", "a", "b", "NULL")
+	h.expectRows("SELECT DISTINCT g, v FROM it_dist ORDER BY g, v", "a|1", "a|2", "b|NULL", "NULL|3")
+	h.expectRows("SELECT DISTINCT v, s FROM it_dist ORDER BY v", "1|x", "2|NULL", "3|y", "NULL|NULL")
+	h.expectRows("SELECT DISTINCT v * 10 AS x FROM it_dist ORDER BY x", "10", "20", "30", "NULL")
+	h.expectRows("SELECT DISTINCT g FROM it_dist ORDER BY g LIMIT 1 OFFSET 1", "b")
+	h.expectRows("SELECT COUNT(*) FROM (SELECT DISTINCT g, v FROM it_dist) d", "4")
+	h.expectRows("SELECT ALL g FROM it_dist WHERE g = 'b'", "b", "b")
+
+	// Over indexed columns DISTINCT is computed in the index (GROUPBY);
+	// NOINDEX columns, stars and expressions are de-duplicated by the driver.
+	if _, _, indexAgg := h.planOf("SELECT DISTINCT g, v FROM it_dist"); !indexAgg {
+		t.Error("SELECT DISTINCT g, v should run as an index GROUPBY")
+	}
+	if _, _, indexAgg := h.planOf("SELECT DISTINCT g, s FROM it_dist"); indexAgg {
+		t.Error("SELECT DISTINCT over a NOINDEX column can't run in the index")
+	}
+
+	// After GROUP BY and window functions, and with a star.
+	h.expectRows("SELECT DISTINCT COUNT(*) FROM it_dist GROUP BY g ORDER BY 1", "1", "2", "3")
+	h.expectRows("SELECT DISTINCT g, COUNT(*) OVER (PARTITION BY g) AS n FROM it_dist ORDER BY g", "a|3", "b|2", "NULL|1")
+	h.expectRows("SELECT DISTINCT * FROM (SELECT g, v FROM it_dist) d ORDER BY g, v", "a|1", "a|2", "b|NULL", "NULL|3")
+
+	// In views (never expanded in place), subqueries, CTAS and set operations.
+	h.exec("CREATE VIEW it_dist_v AS SELECT DISTINCT g FROM it_dist")
+	h.expectRows("SELECT g FROM it_dist_v WHERE g IS NOT NULL ORDER BY g", "a", "b")
+	h.expectRows("SELECT COUNT(*) FROM it_dist_v", "3")
+	h.expectRows("SELECT id FROM it_dist WHERE v IN (SELECT DISTINCT v FROM it_dist WHERE g = 'a') ORDER BY id", "1", "2", "3")
+	h.exec("CREATE TABLE it_dist_out AS SELECT DISTINCT g, s FROM it_dist")
+	h.expectRows("SELECT COUNT(*) FROM it_dist_out", "4")
+	h.expectRows("SELECT DISTINCT g FROM it_dist WHERE g = 'a' UNION ALL SELECT DISTINCT g FROM it_dist WHERE g = 'a'", "a", "a")
+
+	// ORDER BY must use the select list (Postgres's rule).
+	h.expectError("SELECT DISTINCT g FROM it_dist ORDER BY id", "ORDER BY expressions must appear in select list")
+	h.expectError("SELECT DISTINCT g, s FROM it_dist ORDER BY v", "ORDER BY expressions must appear in select list")
+
+	// DISTINCT ON keeps the first row of each key in ORDER BY order.
+	h.expectRows("SELECT DISTINCT ON (g) g, id, v FROM it_dist ORDER BY g, id DESC", "a|3|2", "b|5|NULL", "NULL|6|3")
+	h.expectRows("SELECT DISTINCT ON (1) g AS grp, id FROM it_dist ORDER BY 1, id", "a|1", "b|4", "NULL|6")
+	h.expectRows("SELECT DISTINCT ON (grp) g AS grp, id FROM it_dist ORDER BY grp, id", "a|1", "b|4", "NULL|6")
+	h.expectRows("SELECT DISTINCT ON (g) id FROM it_dist ORDER BY g, v DESC NULLS LAST, id", "3", "4", "6")
+	h.expectRows("SELECT DISTINCT ON (g, v) g, v, id FROM it_dist ORDER BY v, g, id", "a|1|1", "a|2|3", "NULL|3|6", "b|NULL|4")
+	h.expectRows("SELECT DISTINCT ON (g) g, id FROM it_dist ORDER BY g, id LIMIT 2", "a|1", "b|4")
+	h.expectRows("SELECT COUNT(*) FROM (SELECT DISTINCT ON (g) g, id FROM it_dist) x", "3")
+	h.expectError("SELECT DISTINCT ON (g) g, id FROM it_dist ORDER BY id", "must match initial ORDER BY expressions")
+	h.expectError("SELECT DISTINCT ON (3) g, id FROM it_dist", "DISTINCT ON position 3 is out of range")
+	h.expectError("SELECT DISTINCT ON (ROW_NUMBER() OVER ()) g FROM it_dist", "window functions are not allowed in DISTINCT ON")
+}
+
+func TestSQLQualifiedStar(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_qs_v")
+		h.exec("DROP TABLE IF EXISTS it_qs_a")
+		h.exec("DROP TABLE IF EXISTS it_qs_b")
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_qs_a (id INTEGER, s VARCHAR)")
+	h.exec("INSERT INTO it_qs_a VALUES (1, 'x'), (2, 'y')")
+	h.exec("CREATE TABLE it_qs_b (id INTEGER, n INTEGER)")
+	h.exec("INSERT INTO it_qs_b VALUES (1, 10), (3, 30)")
+
+	// One FROM item: by alias, by table name, schema- and catalog-qualified.
+	schema := h.expectRows("SELECT a.* FROM it_qs_a a WHERE a.id = 2", "2|y")
+	if got := schema.String(); !strings.Contains(got, "id: type=int32") || !strings.Contains(got, "s: type=utf8") {
+		t.Errorf("a.* schema = %s", got)
+	}
+	h.expectRows("SELECT it_qs_a.* FROM it_qs_a ORDER BY id", "1|x", "2|y")
+	h.expectRows("SELECT public.it_qs_a.* FROM it_qs_a ORDER BY id", "1|x", "2|y")
+	h.expectRows("SELECT redis.public.it_qs_a.* FROM public.it_qs_a ORDER BY id", "1|x", "2|y")
+	h.expectRows(`SELECT "a".* FROM it_qs_a "a" ORDER BY id`, "1|x", "2|y")
+
+	// Joins: each star picks its own item's columns, under their own names.
+	h.expectRows("SELECT a.*, b.n FROM it_qs_a a JOIN it_qs_b b ON a.id = b.id", "1|x|10")
+	h.expectRows("SELECT b.*, a.s FROM it_qs_a a LEFT JOIN it_qs_b b ON a.id = b.id ORDER BY a.id", "1|10|x", "NULL|NULL|y")
+	schema = h.expectRows("SELECT a.*, b.* FROM it_qs_a a JOIN it_qs_b b ON a.id = b.id", "1|x|1|10")
+	if got := schema.String(); strings.Count(got, "id: type=int32") != 2 || !strings.Contains(got, "n: type=int32") {
+		t.Errorf("a.*, b.* schema = %s", got)
+	}
+	h.expectRows("SELECT DISTINCT a.* FROM it_qs_a a JOIN (SELECT 1 AS id UNION ALL SELECT 1) d ON d.id = a.id", "1|x")
+
+	// Derived tables and CTEs; dbt's snapshot staging selects source_data.*.
+	h.expectRows("SELECT d.* FROM (SELECT id * 2 AS dbl FROM it_qs_a) d ORDER BY dbl", "2", "4")
+	h.expectRows("WITH c AS (SELECT id FROM it_qs_a) SELECT c.* FROM c ORDER BY id", "1", "2")
+	h.expectRows("SELECT source_data.*, 'k' AS dbt_scd_id FROM (SELECT * FROM it_qs_a) source_data ORDER BY id", "1|x|k", "2|y|k")
+	h.exec("CREATE VIEW it_qs_v AS SELECT a.*, b.n FROM it_qs_a a JOIN it_qs_b b ON a.id = b.id")
+	h.expectRows("SELECT * FROM it_qs_v", "1|x|10")
+
+	h.expectError("SELECT x.* FROM it_qs_a a", `missing FROM-clause entry for table "x"`)
+	h.expectError("SELECT public.a.* FROM it_qs_a a", `missing FROM-clause entry for table "public.a"`)
+	h.expectError("SELECT other.it_qs_a.* FROM it_qs_a", `missing FROM-clause entry for table "other.it_qs_a"`)
+	h.expectError("SELECT a.*", "requires a FROM clause")
+}
+
+// A correlated subquery with DISTINCT ON keeps one row per key after the
+// correlation filter, so it must not run as a semi-join (which drops the
+// subquery's DISTINCT ON and would test every row).
+func TestSQLDistinctOnInCorrelatedSubquery(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP TABLE IF EXISTS it_dson_o")
+		h.exec("DROP TABLE IF EXISTS it_dson_i")
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_dson_i (k INTEGER, g VARCHAR, ts INTEGER, v INTEGER)")
+	h.exec("INSERT INTO it_dson_i VALUES (1, 'a', 1, 10), (1, 'a', 2, 20), (1, 'b', 1, 30), (2, 'a', 1, 20)")
+	h.exec("CREATE TABLE it_dson_o (id INTEGER, k INTEGER, x INTEGER)")
+	h.exec("INSERT INTO it_dson_o VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 2, 20), (5, 3, 10)")
+
+	// For k = 1 the first row per g (by ts) has v 10 (a) and 30 (b), not 20.
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x IN (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "1", "3", "4")
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x NOT IN (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "2", "5")
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE EXISTS (SELECT DISTINCT ON (g) v FROM it_dson_i i WHERE i.k = o.k ORDER BY g, ts) ORDER BY o.id`, "1", "2", "3", "4")
+	// Plain DISTINCT doesn't change which values exist.
+	h.expectRows(`SELECT o.id FROM it_dson_o o
+		WHERE o.x IN (SELECT DISTINCT v FROM it_dson_i i WHERE i.k = o.k) ORDER BY o.id`, "1", "2", "3", "4")
+}

@@ -325,6 +325,11 @@ func (e *executor) planSemiJoin(ctx context.Context, sq *Subquery) {
 	if len(sel.Joins) > 0 || plan.meta.view != nil || plan.meta.join != nil {
 		return
 	}
+	// DISTINCT ON keeps one row per key after the correlation filter; the
+	// semi-join body (which drops it) would see every row.
+	if len(sel.DistinctOn) > 0 {
+		return
+	}
 	// RANDOM() would be drawn once per inner row for all outer rows.
 	if hasVolatile(sel.Where) || (sq.Kind == SubqueryIn && hasVolatile(sel.Items[0].Expr)) {
 		return
