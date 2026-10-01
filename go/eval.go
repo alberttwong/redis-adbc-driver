@@ -407,6 +407,8 @@ func negate(v Value) (Value, error) {
 		return floatValue(v.T, -v.F), nil
 	case v.T.Kind == KindDecimal:
 		return decimalValue(new(big.Int).Neg(v.D), v.T.Precision, v.T.Scale), nil
+	case v.T.Kind == KindInterval:
+		return negateInterval(v)
 	}
 	return Value{}, fmt.Errorf("cannot negate %s", v.T.Kind)
 }
@@ -448,6 +450,15 @@ func binaryOp(op string, l, r Value) (Value, error) {
 			return nullValue(typeString), nil
 		}
 		return stringValue(l.Text() + r.Text()), nil
+	}
+	if rt, ok, err := temporalType(op, l.T, r.T); ok {
+		if err != nil {
+			return Value{}, err
+		}
+		if l.Null || r.Null {
+			return nullValue(rt), nil
+		}
+		return temporalOp(op, l, r, rt)
 	}
 	rt, err := arithmeticType(op, l.T, r.T)
 	if err != nil {
@@ -528,6 +539,9 @@ func binaryOp(op string, l, r Value) (Value, error) {
 
 // arithmeticType returns the result type of an arithmetic operator.
 func arithmeticType(op string, a, b ColType) (ColType, error) {
+	if rt, ok, err := temporalType(op, a, b); ok {
+		return rt, err
+	}
 	if a.Kind == KindNull {
 		a = b
 	}

@@ -295,6 +295,9 @@ func joinKey(v Value) (string, bool) {
 		return "n" + strconv.FormatFloat(v.F, 'f', -1, 64), true
 	case k == KindString || k == KindBinary:
 		return "s" + v.S, true
+	case k == KindInterval:
+		// Equal lengths are equal intervals ('1 day' = '24 hours').
+		return "i" + intervalTotal(v).String(), true
 	case k == KindTimestamp || k == KindTime:
 		// Seconds plus nanoseconds, so different units compare equal.
 		per := unitsPerSecond[v.T.Unit]

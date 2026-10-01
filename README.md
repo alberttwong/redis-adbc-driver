@@ -253,6 +253,11 @@ SELECT TO_CHAR(DATE_TRUNC('month', ordered_at), 'YYYY-MM') AS month, COUNT(*) AS
 FROM sales WHERE EXTRACT(QUARTER FROM ordered_at) = 1
 GROUP BY month ORDER BY month;
 
+-- Timestamp arithmetic: the bound is computed once, then runs as an index range
+SELECT COUNT(*) AS last_week FROM sales
+WHERE ordered_at >= TIMESTAMP '2025-12-31 00:00:00' - INTERVAL '7 days';
+SELECT MAX(ordered_at) - MIN(ordered_at) AS span, AGE(MAX(ordered_at), MIN(ordered_at)) AS age FROM sales;
+
 -- information_schema: which columns of sales are indexed?
 SELECT column_name, data_type, is_nullable, is_indexed
 FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position;
@@ -426,6 +431,22 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     `TO_TIMESTAMP(text, format)` with Postgres patterns (`YYYY`, `MM`,
     `Mon`/`Month`, `DD`, `Day`/`DY`, `HH24`/`HH12`, `MI`, `SS`, `MS`, `US`,
     `AM`/`PM`, `Q`, `IW`, `"text"`, `FM`)
+- Intervals and date/time arithmetic:
+  - `INTERVAL '1 year 2 months 3 days 04:05:06'`, `'1.5 hours'`, `'2 days ago'`,
+    `'3 04:05:06'`, `'1-2'` (years-months), ISO 8601 `'P1Y2M3DT4H'`,
+    `INTERVAL '2' HOUR`, `INTERVAL 7 DAY` / `INTERVAL ? DAY`, and
+    `CAST('7 days' AS INTERVAL)`
+  - `timestamp ± interval`, `date ± interval` (gives a timestamp),
+    `date ± integer` (days), `date - date` (days), `timestamp - timestamp`
+    (an interval of days and time), `time ± interval`, `time - time`,
+    `interval ± interval`, `interval * n`, `interval / n`, `-interval`
+  - Months follow the calendar and clamp to the end of the month
+    (`TIMESTAMP '2024-01-31' + INTERVAL '1 month'` is Feb 29). Comparisons
+    treat a month as 30 days, so `INTERVAL '1 day' = INTERVAL '24 hours'`
+  - `AGE(a, b)` / `AGE(x)` (years, months, days and time), and `EXTRACT`
+    on intervals
+  - Intervals are returned as Arrow `month_day_nano_interval`; Arrow
+    interval and duration values can be bound and ingested
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW`), `columns`
@@ -437,7 +458,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   comparisons, window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
-  [WITH TIME ZONE]`
+  [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)
 
 Tables can be qualified as `schema.table` or `redis.schema.table`. Schemas
 are key namespaces (default `public`). There are no transactions (autocommit

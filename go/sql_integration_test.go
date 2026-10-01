@@ -941,3 +941,124 @@ func TestSQLDateTimeFunctions(t *testing.T) {
 	h.expectRows(`SELECT id FROM it_dt WHERE d < CURRENT_DATE ORDER BY id`, "1", "2")
 	h.expectRows(`SELECT DATE_TRUNC('month', d), YEAR(ts), TO_CHAR(ts, 'YYYY') FROM it_dt WHERE id = 3`, "NULL|NULL|NULL")
 }
+
+func TestSQLIntervals(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP TABLE IF EXISTS it_iv")
+	h.exec("DROP TABLE IF EXISTS it_iv_ctas")
+	h.exec(`CREATE TABLE it_iv (id INTEGER, ts TIMESTAMP(6), d DATE)`)
+	h.exec(`INSERT INTO it_iv VALUES (1, TIMESTAMP '2024-02-28 12:00:00', DATE '2024-02-28'),
+		(2, TIMESTAMP '2024-03-01 00:00:00', DATE '2024-03-01'), (3, TIMESTAMP '2024-03-10 08:30:00', DATE '2024-03-10'),
+		(4, NULL, NULL)`)
+	t.Cleanup(func() {
+		h.exec("DROP TABLE IF EXISTS it_iv")
+		h.exec("DROP TABLE IF EXISTS it_iv_ctas")
+	})
+	str := func(e string) string { return "CAST(" + e + " AS VARCHAR)" }
+
+	// Literals in every accepted form.
+	h.expectRows(`SELECT `+strings.Join([]string{
+		str(`INTERVAL '1 year 2 months 3 days 04:05:06.5'`), str(`INTERVAL '1.5 hours'`), str(`INTERVAL '1.5 days'`),
+		str(`INTERVAL '1.5 months'`), str(`INTERVAL '-2 weeks'`), str(`INTERVAL '2 days ago'`),
+		str(`INTERVAL '3 04:05:06'`), str(`INTERVAL '1-2' YEAR TO MONTH`), str(`INTERVAL 'P1Y2M3DT4H5M6S'`),
+		str(`INTERVAL '2' HOUR`), str(`INTERVAL 90 MINUTE`), str(`INTERVAL '0' DAY`)}, ", "),
+		"1 year 2 mons 3 days 04:05:06.5|01:30:00|1 day 12:00:00|1 mon 15 days|-14 days|-2 days|"+
+			"3 days 04:05:06|1 year 2 mons|1 year 2 mons 3 days 04:05:06|02:00:00|01:30:00|00:00:00")
+	h.expectRows(`SELECT `+str(`CAST('7 days' AS INTERVAL)`)+`, `+str(`CAST('1 hour' AS INTERVAL DAY TO SECOND)`), "7 days|01:00:00")
+
+	// Timestamp / date arithmetic, with calendar-correct months.
+	h.expectRows(`SELECT `+strings.Join([]string{
+		str(`TIMESTAMP '2024-01-31 10:00:00' + INTERVAL '1 month'`),
+		str(`TIMESTAMP '2023-01-31 10:00:00' + INTERVAL '1 month'`),
+		str(`INTERVAL '1 day 2 hours' + TIMESTAMP '2024-02-28 23:00:00'`),
+		str(`TIMESTAMP '2024-03-01 00:00:00' - INTERVAL '1 year'`),
+		str(`DATE '2024-02-29' + INTERVAL '1 year'`),
+		str(`DATE '2024-02-28' + 2`), str(`DATE '2024-03-01' - 1`)}, ", "),
+		"2024-02-29 10:00:00.000000|2023-02-28 10:00:00.000000|2024-03-01 01:00:00.000000|2023-03-01 00:00:00.000000|"+
+			"2025-02-28 00:00:00.000000|2024-03-01|2024-02-29")
+	h.expectRows(`SELECT DATE '2024-03-01' - DATE '2024-02-01', `+
+		str(`TIMESTAMP '2024-03-01 00:00:00' - TIMESTAMP '2024-02-28 12:00:00'`)+`, `+
+		str(`TIMESTAMP '2024-02-28 12:00:00' - TIMESTAMP '2024-03-01 00:00:00'`)+`, `+
+		str(`TIME '23:30:00' + INTERVAL '45 minutes'`)+`, `+str(`TIME '10:00:00' - TIME '08:30:00'`),
+		"29|1 day 12:00:00|-1 days -12:00:00|00:15:00.000000|01:30:00")
+
+	// Interval arithmetic and comparison.
+	h.expectRows(`SELECT `+str(`INTERVAL '1 day' * 2.5`)+`, `+str(`INTERVAL '1 hour' / 4`)+`, `+str(`-INTERVAL '1 day'`)+`, `+
+		str(`INTERVAL '1 day' + INTERVAL '2 hours'`)+`, `+str(`3 * INTERVAL '20 minutes'`)+`,
+		INTERVAL '1 day' = INTERVAL '24 hours', INTERVAL '1 month' > INTERVAL '29 days'`,
+		"2 days 12:00:00|00:15:00|-1 days|1 day 02:00:00|01:00:00|true|true")
+
+	// AGE (the Postgres documentation example) and EXTRACT from intervals.
+	h.expectRows(`SELECT `+str(`AGE(TIMESTAMP '2001-04-10 00:00:00', TIMESTAMP '1957-06-13 00:00:00')`)+`, `+
+		str(`AGE(TIMESTAMP '1957-06-13 00:00:00', TIMESTAMP '2001-04-10 00:00:00')`)+`, `+
+		str(`AGE(TIMESTAMP '2024-03-01 10:00:00', TIMESTAMP '2024-02-28 12:30:00')`),
+		"43 years 9 mons 27 days|-43 years -9 mons -27 days|1 day 21:30:00")
+	h.expectRows(`SELECT EXTRACT(EPOCH FROM INTERVAL '1 day 2 hours'), EXTRACT(HOUR FROM INTERVAL '26 hours'),
+			EXTRACT(DAY FROM INTERVAL '1 month 3 days'), EXTRACT(YEAR FROM INTERVAL '14 months'),
+			EXTRACT(MONTH FROM INTERVAL '14 months'), EXTRACT(SECOND FROM INTERVAL '1 minute 30.5 seconds')`,
+		"93600|26|3|1|2|30.5")
+
+	// On table data: filters push down, NULLs propagate, ORDER BY intervals.
+	h.expectRows(`SELECT id FROM it_iv WHERE ts >= TIMESTAMP '2024-03-01 12:00:00' - INTERVAL '1 day' ORDER BY id`, "2", "3")
+	h.expectRows(`SELECT id FROM it_iv WHERE d + 1 = DATE '2024-02-29'`, "1")
+	h.expectRows(`SELECT id, `+str(`ts - TIMESTAMP '2024-02-28 00:00:00'`)+` FROM it_iv ORDER BY ts - TIMESTAMP '2024-01-01 00:00:00' DESC`,
+		"3|11 days 08:30:00", "2|2 days", "1|12:00:00", "4|NULL")
+	h.expectRows(`SELECT id FROM it_iv WHERE ts - INTERVAL '1 hour' < TIMESTAMP '2024-02-28 12:00:00'`, "1")
+
+	// Interval columns: CTAS stores them; types are reported.
+	h.exec(`CREATE TABLE it_iv_ctas AS SELECT id, ts - TIMESTAMP '2024-02-28 00:00:00' AS since FROM it_iv`)
+	schema := h.expectRows(`SELECT id, `+str(`since`)+`, since > INTERVAL '1 day' FROM it_iv_ctas ORDER BY since`,
+		"1|12:00:00|false", "2|2 days|true", "3|11 days 08:30:00|true", "4|NULL|NULL")
+	_ = schema
+	_, schema = h.query(`SELECT since FROM it_iv_ctas`)
+	if dt := schema.Field(0).Type; dt.ID() != arrow.INTERVAL_MONTH_DAY_NANO {
+		t.Errorf("interval column type = %s", dt)
+	}
+	h.expectRows(`SELECT data_type FROM information_schema.columns WHERE table_name = 'it_iv_ctas' AND column_name = 'since'`, "INTERVAL")
+	_, schema = h.query(`SELECT CURRENT_TIMESTAMP - INTERVAL '7 days', DATE '2024-01-01' + INTERVAL '1 day'`)
+	if s := schema.String(); !strings.Contains(s, "timestamp[us, tz=UTC]") || !strings.Contains(s, "timestamp[us]") {
+		t.Errorf("arithmetic result types = %s", s)
+	}
+
+	// Errors.
+	h.expectError(`SELECT TIMESTAMP '2024-01-01 00:00:00' + 1`, "not supported")
+	h.expectError(`SELECT INTERVAL 'abc'`, "invalid interval")
+	h.expectError(`SELECT INTERVAL 'x' HOUR`, "needs a number")
+	h.expectError(`SELECT INTERVAL '1 day' / 0`, "division by zero")
+}
+
+func TestSQLIntervalBind(t *testing.T) {
+	h := newSQLHarness(t)
+	st, err := h.conn.NewStatement(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(h.ctx)
+	if err := st.SetSqlQuery(h.ctx, `SELECT CAST(TIMESTAMP '2024-01-31 00:00:00' + ? AS VARCHAR), CAST(? AS VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	mem := memory.DefaultAllocator
+	ib := array.NewMonthDayNanoIntervalBuilder(mem)
+	ib.Append(arrow.MonthDayNanoInterval{Months: 1, Days: 1, Nanoseconds: int64(time.Hour)})
+	db := array.NewDurationBuilder(mem, &arrow.DurationType{Unit: arrow.Millisecond})
+	db.Append(arrow.Duration(90_000))
+	rec := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{
+		{Name: "iv", Type: arrow.FixedWidthTypes.MonthDayNanoInterval},
+		{Name: "dur", Type: &arrow.DurationType{Unit: arrow.Millisecond}},
+	}, nil), []arrow.Array{ib.NewArray(), db.NewArray()}, 1)
+	if err := st.Bind(h.ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	rdr, _, err := st.ExecuteQuery(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Release()
+	rdr.Next()
+	r := rdr.RecordBatch()
+	got := r.Column(0).ValueStr(0) + "|" + r.Column(1).ValueStr(0)
+	// Jan 31 + 1 month = Feb 29 (leap year), + 1 day = Mar 1, + 1 hour.
+	if want := "2024-03-01 01:00:00.000000|00:01:30"; got != want {
+		t.Errorf("bound intervals: got %q, want %q", got, want)
+	}
+}
