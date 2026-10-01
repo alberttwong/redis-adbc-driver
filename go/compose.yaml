@@ -14,8 +14,9 @@
 
 services:
   redis:
-    # Redis 8.4 ships the Query Engine (RediSearch) built in.
-    image: redis:8.4
+    # Redis 8.x ships the Query Engine (RediSearch) built in. Local testing
+    # uses the version Redis Cloud runs, so results match Cloud.
+    image: redis:8.6.2
     container_name: redis-adbc-test
     ports:
       - "6379:6379"
@@ -29,7 +30,7 @@ services:
   # announced 127.0.0.1 addresses work from the host. Start it with:
   #   docker compose --profile cluster up --detach --wait redis-cluster
   redis-cluster:
-    image: redis:8.4
+    image: redis:8.6.2
     container_name: redis-adbc-cluster
     profiles: ["cluster"]
     ports:

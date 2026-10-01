@@ -27,11 +27,14 @@ The full validation suite (324 passed, 0 failed) has been run against:
 
 | Server | Version | Connection |
 |-|-|-|
-| Redis Open Source (`redis:8.4` Docker image) | 8.4.4, Search 8.4.10 | `redis://` |
-| Redis Open Source cluster, 3 shards (OSS Cluster API) | 8.4.4, Search 8.4.10 | `redis://` |
+| Redis Open Source (`redis:8.6.2` Docker image) | 8.6.2, Search 8.6.0 | `redis://` |
+| Redis Open Source cluster, 3 shards (OSS Cluster API) | 8.6.2, Search 8.6.0 | `redis://` |
 | Redis Cloud, single shard | 8.6.2, Search 8.6.10 | `redis://` and TLS (`rediss://`)*† |
 | Redis Cloud Pro, 2 shards, through the proxy endpoint | 8.6.2 | `redis://`† |
 | Redis Cloud Pro, 2 shards, OSS Cluster API enabled | 8.6.2 | `redis://`† |
+
+Local testing uses the Redis version that Redis Cloud runs (currently
+8.6.2), so `go/compose.yaml` pins that image.
 
 \* Run before cluster support was added; not re-run since.
 † Run before the two temporary-table ingest tests were enabled (322
@@ -49,7 +52,7 @@ requirement is the Query Engine.
 **What you need**
 
 - **Redis with the Query Engine (RediSearch).** It is built into Redis 8.x
-  (e.g. the `redis:8.4` image). On older versions use Redis Stack, or Redis
+  (e.g. the `redis:8.6.2` image). On older versions use Redis Stack, or Redis
   Cloud / Redis Software with Search enabled. The driver runs `FT._LIST`
   when it connects and refuses to connect if search isn't available.
 - **A standalone server, Redis Cloud / Redis Software, or a Redis Cluster.**
@@ -96,7 +99,7 @@ load it through the driver; bulk ingest from Arrow is the quickest route.
 Requirements: Go 1.26+, a C toolchain (cgo), Docker, and
 [uv](https://docs.astral.sh/uv/). Run everything from the `go` directory.
 
-**1. Start Redis 8.4 and build the driver**
+**1. Start Redis 8.6 and build the driver**
 
 ```bash
 cd go
