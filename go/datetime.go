@@ -68,11 +68,20 @@ func toTime(v Value) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("expected a date, time or timestamp, got %s", v.T.Kind)
 }
 
+// dateValue is the DATE days after the epoch. A DATE is an Arrow date32, so
+// beyond the int32 range of days it is "date out of range", as in Postgres.
+func dateValue(days int64) (Value, error) {
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		return Value{}, fmt.Errorf("date out of range")
+	}
+	return intValue(typeDate, days), nil
+}
+
 // fromTime converts a UTC time.Time to a value of type t.
 func fromTime(tm time.Time, t ColType) (Value, error) {
 	switch t.Kind {
 	case KindDate:
-		return intValue(typeDate, floorDiv(tm.Unix(), 86400)), nil
+		return dateValue(floorDiv(tm.Unix(), 86400))
 	case KindTime:
 		day := tm.Unix() - floorDiv(tm.Unix(), 86400)*86400
 		i, err := secondsNanosToUnit(day, int64(tm.Nanosecond()), t.Unit)
@@ -392,9 +401,6 @@ func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
 	}
 	if err == nil {
 		x, err = temporalOp("+", x, iv, t)
-	}
-	if err == nil && t.Kind == KindDate && (x.I < math.MinInt32 || x.I > math.MaxInt32) {
-		err = fmt.Errorf("date out of range")
 	}
 	if err != nil {
 		return Value{}, fmt.Errorf("%s: %v", name, err)
@@ -928,11 +934,21 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 			}
 			ymd[i] = n
 		}
+		ymdText := fmt.Sprintf("%d-%02d-%02d", ymd[0], ymd[1], ymd[2])
+		// A year past int32 is far outside the date range, and could
+		// overflow time.Date.
+		if ymd[0] < math.MinInt32 || ymd[0] > math.MaxInt32 {
+			return done(Value{}, fmt.Errorf("date out of range: %s", ymdText))
+		}
 		tm := time.Date(ymd[0], time.Month(ymd[1]), ymd[2], 0, 0, 0, 0, time.UTC)
 		if int(tm.Month()) != ymd[1] || tm.Day() != ymd[2] {
-			return done(Value{}, fmt.Errorf("date field value out of range: %d-%02d-%02d", ymd[0], ymd[1], ymd[2]))
+			return done(Value{}, fmt.Errorf("date field value out of range: %s", ymdText))
 		}
-		return done(fromTime(tm, typeDate))
+		v, err := fromTime(tm, typeDate)
+		if err != nil {
+			return done(Value{}, fmt.Errorf("date out of range: %s", ymdText))
+		}
+		return done(v, nil)
 	case "MAKE_TIMESTAMP", "MAKE_TIMESTAMPTZ", "MAKE_TIME":
 		want := 6
 		if f.Name == "MAKE_TIME" {

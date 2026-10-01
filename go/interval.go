@@ -98,8 +98,15 @@ func (p intervalParts) value() (Value, error) {
 	m := math.Trunc(p.months)
 	d := p.days + (p.months-m)*30
 	dd := math.Trunc(d)
-	ns := p.nanos + (d-dd)*float64(nsPerDay)
-	return intervalValue(int64(m), int64(dd), int64(math.Round(ns)))
+	ns := math.Round(p.nanos + (d-dd)*float64(nsPerDay))
+	for _, f := range []float64{m, dd, ns} {
+		// Go's conversion of a float past int64 (or NaN) to an integer is
+		// platform-dependent: it saturates or wraps.
+		if !(f >= -(1<<63) && f < 1<<63) {
+			return Value{}, fmt.Errorf("interval out of range")
+		}
+	}
+	return intervalValue(int64(m), int64(dd), int64(ns))
 }
 
 // intervalLiteral parses Postgres interval input: '1 year 2 months 3 days',
@@ -342,11 +349,21 @@ func addMonths(t time.Time, n int) time.Time {
 	return time.Date(ny, nm, d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 }
 
-// addInterval adds sign*interval to a time.
-func addInterval(t time.Time, iv Value, sign int) time.Time {
-	t = addMonths(t, sign*int(iv.Months))
-	t = t.AddDate(0, 0, sign*int(iv.Days))
-	return t.Add(time.Duration(int64(sign) * iv.I))
+// addInterval adds an interval to a time.
+func addInterval(t time.Time, iv Value) time.Time {
+	t = addMonths(t, int(iv.Months))
+	t = t.AddDate(0, 0, int(iv.Days))
+	return t.Add(time.Duration(iv.I))
+}
+
+// addOrSub is a + b, or a - b for op "-", and whether it overflowed int64.
+func addOrSub(op string, a, b int64) (int64, bool) {
+	if op == "-" {
+		s := a - b
+		return s, (s < a) != (b > 0)
+	}
+	s := a + b
+	return s, (s > a) != (b > 0)
 }
 
 func negateInterval(v Value) (Value, error) {
@@ -450,7 +467,11 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 		if op == "-" {
 			sign = -1
 		}
-		return intervalValue(int64(l.Months)+sign*int64(r.Months), int64(l.Days)+sign*int64(r.Days), l.I+sign*r.I)
+		ns, overflow := addOrSub(op, l.I, r.I)
+		if overflow {
+			return Value{}, fmt.Errorf("interval out of range")
+		}
+		return intervalValue(int64(l.Months)+sign*int64(r.Months), int64(l.Days)+sign*int64(r.Days), ns)
 	case op == "*" && lk == KindInterval:
 		f, _ := r.asFloat()
 		return scaleInterval(l, f)
@@ -463,14 +484,19 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 			return Value{}, fmt.Errorf("division by zero")
 		}
 		return scaleInterval(l, 1/f)
-	case lk == KindDate && rk.isInteger():
-		if op == "-" {
-			return intValue(typeDate, l.I-r.I), nil
+	case lk == KindDate && rk.isInteger(), lk.isInteger() && rk == KindDate:
+		// date ± days, days + date
+		d, n := l.I, r.I
+		if lk != KindDate {
+			d, n = n, d
 		}
-		return intValue(typeDate, l.I+r.I), nil
-	case lk.isInteger() && rk == KindDate:
-		return intValue(typeDate, l.I+r.I), nil
+		days, overflow := addOrSub(op, d, n)
+		if overflow {
+			return Value{}, fmt.Errorf("date out of range")
+		}
+		return dateValue(days)
 	case lk == KindDate && rk == KindDate:
+		// Dates are date32, so the difference fits.
 		return intValue(typeInt64, l.I-r.I), nil
 	case (lk == KindTime) && rk == KindTime:
 		return intervalValue(0, 0, timeOfDay(l)-timeOfDay(r))
@@ -483,8 +509,8 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 		if op == "-" {
 			sign = -1
 		}
-		ns := timeOfDay(t) + sign*iv.I
-		ns -= floorDiv(ns, nsPerDay) * nsPerDay // wrap around midnight
+		ns := timeOfDay(t) + sign*(iv.I%nsPerDay) // reduced first, so it can't overflow
+		ns -= floorDiv(ns, nsPerDay) * nsPerDay   // wrap around midnight
 		return intValue(rt, ns/(nsPerSecond/unitsPerSecond[rt.Unit])), nil
 	case lk == KindDate && rk == KindTime:
 		tm, err := toTime(l)
@@ -513,15 +539,18 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 		if lk == KindInterval {
 			t, iv = r, l
 		}
-		sign := 1
 		if op == "-" {
-			sign = -1
+			// As in Postgres, an interval that can't be negated is out of range.
+			var err error
+			if iv, err = negateInterval(iv); err != nil {
+				return Value{}, err
+			}
 		}
 		tm, err := toTime(t)
 		if err != nil {
 			return Value{}, err
 		}
-		return fromTime(addInterval(tm, iv, sign), rt)
+		return fromTime(addInterval(tm, iv), rt)
 	}
 }
 

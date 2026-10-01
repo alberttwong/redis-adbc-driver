@@ -596,8 +596,7 @@ func Coerce(v Value, t ColType) (Value, error) {
 		case KindDate:
 			return v, nil
 		case KindTimestamp:
-			days := floorDiv(v.I, unitsPerSecond[v.T.Unit]*86400)
-			return intValue(typeDate, days), nil
+			return dateValue(floorDiv(v.I, unitsPerSecond[v.T.Unit]*86400))
 		}
 	case KindTime:
 		if v.T.Kind == KindTime {
