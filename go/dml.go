@@ -32,11 +32,12 @@ package redis
 //     every target row.
 //
 // Every change is decided and checked before anything is written: SET and
-// VALUES are evaluated and cast to the column types, NOT NULL is checked,
-// and so is the rule that MERGE changes a target row at most once. A
-// RETURNING list is evaluated for each change then too (returning.go). The
-// writes then go through the same paths as UPDATE, DELETE and INSERT (see
-// exec.go): updates, then deletes, then inserts.
+// VALUES are evaluated and cast to the column types, NOT NULL and the CHECK
+// constraints are checked (check.go), and so is the rule that MERGE changes
+// a target row at most once. A RETURNING list is evaluated for each change
+// then too (returning.go). The writes then go through the same paths as
+// UPDATE, DELETE and INSERT (see exec.go): updates, then deletes, then
+// inserts.
 
 import (
 	"context"
@@ -150,6 +151,11 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 		return 0, err
 	}
 	maps.Copy(need, sc.needs)
+	checks, err := e.tableChecks(ctx, dj.meta)
+	if err != nil {
+		return 0, err
+	}
+	checks.need(need, dj.target.prefix)
 	ret, err := e.planReturning(ctx, st.Returning, dj.rels, dj.targetFirst(), false, need)
 	if err != nil {
 		return 0, err
@@ -167,6 +173,9 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 		env.row = row
 		vals, err := setValues(env, dj.meta, cols, st.Sets)
 		if err != nil {
+			return 0, err
+		}
+		if err := checks.checkChanged(row, dj.target.prefix, cols, vals); err != nil {
 			return 0, err
 		}
 		if i, ok := seen[key]; ok {
@@ -311,6 +320,13 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 	if err != nil {
 		return 0, err
 	}
+	checks, err := e.tableChecks(ctx, dj.meta)
+	if err != nil {
+		return 0, err
+	}
+	if slices.ContainsFunc(clauses, func(c mergeClause) bool { return c.Action == MergeUpdate }) {
+		checks.need(need, dj.target.prefix)
+	}
 	rows, err := dj.rows(ctx, e, nil, need, params)
 	if err != nil {
 		return 0, err
@@ -340,7 +356,7 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 			continue
 		}
 		if c.Action == MergeInsert {
-			r, err := insertRow(env, dj.meta, defs, c.targets, c.Values)
+			r, err := insertRow(env, dj.meta, defs, checks, c.targets, c.Values)
 			if err != nil {
 				return 0, err
 			}
@@ -365,6 +381,9 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 		}
 		vals, err := setValues(env, dj.meta, c.cols, c.Sets)
 		if err != nil {
+			return 0, err
+		}
+		if err := checks.checkChanged(row, dj.target.prefix, c.cols, vals); err != nil {
 			return 0, err
 		}
 		updates = append(updates, newRowChange(dj.meta, key, c.cols, vals))

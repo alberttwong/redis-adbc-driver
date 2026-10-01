@@ -272,6 +272,9 @@ func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) erro
 	if err := meta.applyIndexPolicy(nil, noIndex); err != nil {
 		return err
 	}
+	if meta.Checks, err = e.defineChecks(ctx, meta, st.Checks); err != nil {
+		return err
+	}
 	_, err = e.store.createTable(ctx, meta, st.IfNotExists)
 	return err
 }
@@ -398,6 +401,10 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 	}
 	env := e.newEnv(ctx, nil, params)
 	defs := e.columnDefaults(ctx, meta)
+	checks, err := e.tableChecks(ctx, meta)
+	if err != nil {
+		return 0, err
+	}
 	rows := make([][]Value, 0, len(values))
 	for _, exprs := range values {
 		if len(exprs) != len(targets) {
@@ -408,7 +415,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 				return 0, err
 			}
 		}
-		row, err := insertRow(env, meta, defs, targets, exprs)
+		row, err := insertRow(env, meta, defs, checks, targets, exprs)
 		if err != nil {
 			return 0, err
 		}
@@ -442,8 +449,9 @@ func insertTargets(meta *tableMeta, cols []string) ([]int, error) {
 
 // insertRow evaluates the values of one inserted row into a full row ordered
 // like meta.Columns (columns not listed, or given as DEFAULT, get their
-// defaults), coerced to the column types and checked against NOT NULL.
-func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, targets []int, exprs []Expr) ([]Value, error) {
+// defaults), coerced to the column types and checked against NOT NULL and
+// the table's CHECK constraints.
+func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, checks *tableChecks, targets []int, exprs []Expr) ([]Value, error) {
 	row := make([]Value, len(meta.Columns))
 	given := make([]bool, len(meta.Columns))
 	for j, expr := range exprs {
@@ -464,12 +472,21 @@ func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, targets []in
 	if err := defs.fill(row, given); err != nil {
 		return nil, err
 	}
-	for i, c := range meta.Columns {
-		if row[i].Null && !c.Nullable {
-			return nil, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
-		}
+	if err := checkNewRow(meta, checks, row); err != nil {
+		return nil, err
 	}
 	return row, nil
+}
+
+// checkNewRow checks a row to be inserted (ordered like meta.Columns)
+// against NOT NULL and then the table's CHECK constraints, as Postgres does.
+func checkNewRow(meta *tableMeta, checks *tableChecks, row []Value) error {
+	for i, c := range meta.Columns {
+		if row[i].Null && !c.Nullable {
+			return errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
+		}
+	}
+	return checks.check(row)
 }
 
 // insertSelect implements INSERT INTO … SELECT.
@@ -486,6 +503,10 @@ func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *table
 		return 0, err
 	}
 	defs := e.columnDefaults(ctx, meta)
+	checks, err := e.tableChecks(ctx, meta)
+	if err != nil {
+		return 0, err
+	}
 	rows := make([][]Value, len(results))
 	for r, res := range results {
 		row := make([]Value, len(meta.Columns))
@@ -499,6 +520,9 @@ func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *table
 			row[targets[j]], given[targets[j]] = cv, true
 		}
 		if err := defs.fill(row, given); err != nil {
+			return 0, err
+		}
+		if err := checkNewRow(meta, checks, row); err != nil {
 			return 0, err
 		}
 		rows[r] = row
@@ -1125,7 +1149,8 @@ func collectAggregates(e Expr, out *[]*Func) {
 // ---- UPDATE / DELETE ----
 //
 // UPDATE, DELETE and MERGE (dml.go) first find their rows and compute and
-// check every new value (casts, column types, NOT NULL), and only then write.
+// check every new value (casts, column types, NOT NULL, CHECK constraints),
+// and only then write.
 // Writes are pipelined, pipelineChunk commands per round trip, each touching
 // a single row key, so they work on a cluster, where a table's rows are
 // spread over hash slots. There is no transaction: if a write fails part-way
@@ -1161,6 +1186,11 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 		columnRefs(s.Expr, need)
 		maps.Copy(need, needs)
 	}
+	checks, err := e.tableChecks(ctx, meta)
+	if err != nil {
+		return 0, err
+	}
+	checks.need(need, "")
 	ret, err := e.planReturning(ctx, st.Returning, []relation{{name: name, meta: meta}}, meta, false, need)
 	if err != nil {
 		return 0, err
@@ -1175,6 +1205,9 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 		env.row = rows[r]
 		vals, err := setValues(env, meta, cols, st.Sets)
 		if err != nil {
+			return 0, err
+		}
+		if err := checks.checkChanged(rows[r], "", cols, vals); err != nil {
 			return 0, err
 		}
 		changes[r] = newRowChange(meta, key, cols, vals)
