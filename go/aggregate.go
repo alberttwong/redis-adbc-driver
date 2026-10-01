@@ -24,18 +24,28 @@ import (
 // aggRequest describes one FT.AGGREGATE pipeline:
 //
 //	FT.AGGREGATE <index> <query>
-//	  [LOAD n @field ...]
 //	  [APPLY ... GROUPBY n @field ... REDUCE ...]
-//	  [SORTBY 2k @field ASC|DESC ... MAX m]
+//	  [LOAD 3k @field AS __sort<i> ... SORTBY 2k @__sort<i> ASC|DESC ... MAX m]
 //	  [LIMIT offset num]
+//	  [LOAD n @field ...] [LOAD *]
 //	  WITHCURSOR COUNT <page>
+//
+// The fields are loaded last, so only the rows that survive sorting and
+// limiting are read.
 type aggRequest struct {
 	index   string
 	query   string
-	load    []string
-	groupBy []any // raw APPLY/GROUPBY/REDUCE arguments
-	sortBy  []sortKey
+	groupBy []any     // raw APPLY/GROUPBY/REDUCE arguments
+	sortBy  []sortKey // index attributes (not used with groupBy)
 	limit   *[2]int64
+	load    []string
+	loadAll bool // also load every HASH field (LOAD *)
+	width   int  // fields per result row, to size cursor pages (0 if small)
+}
+
+// pageRows returns the cursor page size.
+func (r *aggRequest) pageRows() int {
+	return max(1000, min(cursorCount, pageValues/max(r.width, 1)))
 }
 
 type sortKey struct {
@@ -49,30 +59,42 @@ type aggRow map[string]string
 
 func (r *aggRequest) args(maxRows int64) []any {
 	args := []any{"FT.AGGREGATE", r.index, r.query}
-	if len(r.load) > 0 {
-		args = append(args, "LOAD", len(r.load))
-		for _, f := range r.load {
-			args = append(args, "@"+f)
-		}
-	}
 	args = append(args, r.groupBy...)
 	if len(r.sortBy) > 0 {
+		// Sort on copies of the keys. LOAD * replaces the fields with their
+		// HASH strings, and a cluster coordinator merges the shards' sorted
+		// results on those values, which would compare numbers as strings.
+		args = append(args, "LOAD", 3*len(r.sortBy))
+		for i, k := range r.sortBy {
+			args = append(args, "@"+k.field, "AS", sortAlias(i))
+		}
 		args = append(args, "SORTBY", 2*len(r.sortBy))
-		for _, k := range r.sortBy {
+		for i, k := range r.sortBy {
 			dir := "ASC"
 			if k.desc {
 				dir = "DESC"
 			}
-			args = append(args, "@"+k.field, dir)
+			args = append(args, "@"+sortAlias(i), dir)
 		}
 		args = append(args, "MAX", max(maxRows, 1))
 	}
 	if r.limit != nil {
 		args = append(args, "LIMIT", r.limit[0], r.limit[1])
 	}
-	args = append(args, "TIMEOUT", 0, "WITHCURSOR", "COUNT", cursorCount, "DIALECT", 2)
+	if len(r.load) > 0 {
+		args = append(args, "LOAD", len(r.load))
+		for _, f := range r.load {
+			args = append(args, "@"+f)
+		}
+	}
+	if r.loadAll {
+		args = append(args, "LOAD", "*")
+	}
+	args = append(args, "TIMEOUT", 0, "WITHCURSOR", "COUNT", r.pageRows(), "DIALECT", 2)
 	return args
 }
+
+func sortAlias(i int) string { return fmt.Sprintf("__sort%d", i) }
 
 // countMatches returns the number of documents matching the query.
 func (s *store) countMatches(ctx context.Context, index, query string) (int64, error) {
@@ -128,7 +150,7 @@ func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error
 		if cursor == 0 {
 			return rows, nil
 		}
-		reply, err = node.Do(ctx, "FT.CURSOR", "READ", req.index, cursor, "COUNT", cursorCount).Result()
+		reply, err = node.Do(ctx, "FT.CURSOR", "READ", req.index, cursor, "COUNT", req.pageRows()).Result()
 		if err != nil {
 			_ = node.Do(ctx, "FT.CURSOR", "DEL", req.index, cursor).Err()
 			return nil, wrapRedis(err, "FT.CURSOR READ failed")

@@ -295,7 +295,7 @@ docker exec redis-adbc-test redis-cli HGETALL public:sales:42
 docker exec redis-adbc-test redis-cli FT.INFO idx:public:sales
 ```
 
-To see the `FT.AGGREGATE` / `HMGET` commands the driver sends for each query,
+To see the `FT.AGGREGATE` / `FT.CURSOR` commands the driver sends for each query,
 run `MONITOR` in a second terminal while you run SQL:
 
 ```bash
@@ -311,9 +311,9 @@ Stop Redis with `docker compose down`.
           │ Secondary index (RediSearch)  idx:<s>:<t>     │
           │ only filter/sort/aggregate columns, SORTABLE  │
           └───────────────┬───────────────────────────────┘
-      finds matching keys │   computes GROUPBY/REDUCE without
-      (filter, sort,      │   opening the HASHes
-      limit)              ▼
+  finds matching rows     │   computes GROUPBY/REDUCE without
+  (filter, sort, limit),  │   opening the HASHes
+  LOAD reads their fields ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ Primary data store: one flat HASH per row (every column)         │
 │ public:sales:1 ─► { __rowid: 1, country: "USA", amount: 45, ... }│
@@ -345,7 +345,7 @@ How SQL is executed:
 | Query shape | Execution |
 |-|-|
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
-| Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" LOAD 1 @__key SORTBY … LIMIT … WITHCURSOR`, then pipelined `HMGET` of only the needed columns |
+| Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
@@ -359,9 +359,18 @@ How SQL is executed:
 
 Pushed down into the index: numeric range/equality predicates on indexed
 columns (`@c:[lo hi]`), string equality on indexed columns (`@c:{value}`),
-`ORDER BY` on indexed columns, `LIMIT/OFFSET`, and aggregates. Row values are
-always read from the HASHes, never from the index sort vectors (those hold
-doubles, which would round 64-bit integers, timestamps and decimals).
+`ORDER BY` on indexed columns, `LIMIT/OFFSET`, and aggregates.
+
+Row values always come from the HASHes as stored, never from the index sort
+vectors: `LOAD @c` on a SORTABLE numeric attribute returns the sort vector's
+double printed with 12 significant digits, which would round 64-bit integers,
+timestamps, decimals and doubles. So the driver names the columns it needs
+(`LOAD n @__key @__rowid @c …`) only when each one is a string, a 16/32-bit
+integer, boolean, date or time, or not indexed, and otherwise uses `LOAD *`,
+which returns the HASH fields unchanged. Sorts run on aliases
+(`LOAD @c AS __sort0 SORTBY @__sort0`) so that on a cluster the coordinator
+merges the shards' results on the numeric sort values rather than on the
+strings `LOAD *` returns.
 
 Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 
@@ -485,66 +494,61 @@ compact encoding, and index only the columns you filter or aggregate on.
 Measured with `go/examples/bench.py` (see below) on the sample data set
 scaled to **100,000 `sales` rows × 10 columns** and 50 `customers`.
 Setup: Apple M4 (10 cores, 16 GB), Docker Desktop, Redis 8.4.4 (Search
-8.4.10) in Docker on the same machine, driver at `main` after v0.0.3 plus the
-string-parameter fix. Times are the median of 5 runs after a warm-up, measured
-in Python and including the Arrow transfer; "Redis commands" are counted with
-`INFO commandstats` (summed over shards on the cluster). Numbers on a laptop
-vary from run to run; treat them as orders of magnitude.
+8.4.10) in Docker on the same machine. Times are the median of 5 runs after a
+warm-up, measured in Python and including the Arrow transfer; "Redis
+commands" are counted with `INFO commandstats` on the standalone server (a
+cluster adds the shard fan-out, `_FT.AGGREGATE` / `_FT.CURSOR`). Numbers on a
+laptop vary from run to run; treat them as orders of magnitude.
 
-Bulk ingest (`adbc_ingest`): 100,000 rows in 1.5 s standalone (67,000 rows/s)
-and 1.7 s on a 3-shard cluster (59,000 rows/s).
+Bulk ingest (`adbc_ingest`): 100,000 rows in 1.6 s standalone (62,000 rows/s)
+and 0.56 s on a 3-shard cluster (180,000 rows/s).
 
 | Query | Rows out | Standalone (ms) | 3-shard cluster (ms) | Redis commands |
 |-|-:|-:|-:|-:|
-| Point lookup, `WHERE __rowid = N` | 1 | 1.4 | 15.7 | 2 |
-| Indexed TAG filters + `ORDER BY … LIMIT 10` | 10 | 14 | 30 | 12 |
-| `COUNT(*)` with an indexed range | 1 | 6.5 | 19 | 2 |
-| `COUNT(*)` with `ts >= TIMESTAMP … - INTERVAL '30 days'` | 1 | 15 | 1.8 | 2 |
-| `GROUP BY` with `COUNT` / integer `SUM` (index reduce) | 6 | 15 | 4.6 | 2 |
-| `UNION` of two indexed filters | 1,750 | 40 | 88 | 1,954 |
-| `COUNT(*)` on a view, filter pushed into its base table | 1 | 45 | 66 | 1,688 |
-| Selective join (index lookup join) + `GROUP BY` | 8 | 138 | 66 | 5,318 |
-| Correlated scalar subquery for each of 50 customers | 50 | 287 | 291 | 104 |
-| `COUNT(*)` with `LIKE 'gi%'` (index prefix query) | 1 | 428 | 383 | 20,125 |
-| Fetch 10% of the rows (indexed range) | 10,000 | 356 | 284 | 10,013 |
-| Unfiltered join + `GROUP BY` (hash join over all rows) | 6 | 2,092 | 643 | 100,157 |
-| `GROUP BY` with `AVG` of a `DOUBLE` (driver-side) | 6 | 3,435 | 3,241 | 100,104 |
-| `GROUP BY` of an expression `SUM(quantity * unit_price)` | 5 | 3,443 | 3,401 | 100,104 |
-| `GROUP BY DATE_TRUNC('month', ts)` | 12 | 2,326 | 3,335 | 100,103 |
-| Filter on a non-indexed column (`notes LIKE '%x%'`) | 1 | 3,366 | 2,238 | 100,104 |
-| Full scan, `SELECT *` | 100,000 | 2,867 | 2,706 | 100,104 |
+| Point lookup, `WHERE __rowid = N` | 1 | 1.7 | 1.0 | 2 |
+| `COUNT(*)` with `ts >= TIMESTAMP … - INTERVAL '30 days'` | 1 | 1.4 | 1.0 | 2 |
+| Indexed TAG filters + `ORDER BY … LIMIT 10` | 10 | 4.4 | 1.9 | 2 |
+| `COUNT(*)` with an indexed range | 1 | 5.0 | 2.5 | 2 |
+| `GROUP BY` with `COUNT` / integer `SUM` (index reduce) | 6 | 6.9 | 3.1 | 2 |
+| Selective join (index lookup join) + `GROUP BY` | 8 | 25 | 27 | 6 |
+| `COUNT(*)` on a view, filter pushed into its base table | 1 | 27 | 15 | 4 |
+| Correlated scalar subquery for each of 50 customers | 50 | 31 | 28 | 54 |
+| `UNION` of two indexed filters | 1,750 | 48 | 46 | 6 |
+| Fetch 10% of the rows (indexed range) | 10,000 | 50 | 68 | 4 |
+| `COUNT(*)` with `LIKE 'gi%'` (index prefix query) | 1 | 62 | 64 | 4 |
+| Filter on a non-indexed column (`notes LIKE '%x%'`) | 1 | 272 | 279 | 12 |
+| Unfiltered join + `GROUP BY` (hash join over all rows) | 6 | 345 | 358 | 16 |
+| `GROUP BY` with `AVG` of a `DOUBLE` (driver-side) | 6 | 463 | 522 | 12 |
+| `GROUP BY` of an expression `SUM(quantity * unit_price)` | 5 | 494 | 549 | 12 |
+| `GROUP BY DATE_TRUNC('month', ts)` | 12 | 499 | 542 | 12 |
+| Full scan, `SELECT *` | 100,000 | 679 | 825 | 13 |
 
 What drives the numbers:
 
 - **Queries the index answers on its own take milliseconds**, independent of
   table size: counts and ranges, TAG equality filters with `ORDER BY … LIMIT`,
-  and `GROUP BY` with `COUNT` and integer `SUM`/`MIN`/`MAX`. On the cluster,
-  each search fans out to all shards (`_FT.AGGREGATE`), and there is also a
-  fixed overhead of roughly 10–15 ms per query that hasn't been profiled yet
-  (the point lookup, which sends no search command, still takes ~16 ms).
-  Some differences are run-to-run noise: the standalone interval count's
-  fastest run was 2.4 ms against a 15 ms median.
-- **Reading rows costs about 30 µs per row**, because each matching row is
-  fetched with its own (pipelined) `HMGET`: about 0.3 s for 10,000 rows and
-  2–3.5 s for 100,000. Queries that need the driver to see every row pay
-  this: aggregates the index can't compute exactly (`AVG` of doubles,
-  expressions, `DATE_TRUNC` groups), filters on non-indexed columns, and
-  unfiltered joins.
+  and `GROUP BY` with `COUNT` and integer `SUM`/`MIN`/`MAX`.
+- **Reading rows costs about 3–7 µs per row.** Rows come back inside the
+  `FT.AGGREGATE` cursor pages, up to 10,000 per page, so reading all 100,000
+  rows takes a dozen commands and 0.3–0.8 s. Queries that need the driver to
+  see every row pay this: aggregates the index can't compute exactly (`AVG`
+  of doubles, expressions, `DATE_TRUNC` groups), filters on non-indexed
+  columns, and unfiltered joins. Of the full scan's 0.68 s, Redis itself
+  takes about 0.35 s to produce the rows (measured from inside the
+  container); the rest is decoding, Arrow conversion, and Docker Desktop's
+  port forwarding (about 15 ms per page). Up to v0.0.3 the driver fetched
+  each row with its own pipelined `HMGET` instead, at about 30 µs per row
+  (3.3–3.8 s for the full scan).
 - **Selective joins are fast** because the smaller side is filtered in its
   index first and only matching rows of the other side are fetched. A
   correlated subquery costs one indexed query per distinct outer value
-  (about 6 ms each here).
+  (about 0.6 ms each here).
 
 Known ways to make the slow cases faster (not done yet):
 
-- Read rows with `FT.AGGREGATE … LOAD *` inside the cursor pages, which
-  already return 1,000 keys at a time. `LOAD *` returns the exact stored
-  values (checked: `3.14159265358979` and `9223372036854775807` come back
-  intact, unlike `LOAD @field` on a SORTABLE field). That would replace one
-  `HMGET` per row with one cursor read per 1,000 rows.
-- `COUNT(*)` with a `LIKE` prefix, and `COUNT(*)` on a lazy view, re-check rows
-  the index has already matched exactly, so they could be answered by the
-  index alone.
+- `COUNT(*)` with a `LIKE` prefix, and `COUNT(*)` on a lazy view, still read
+  the matched rows to re-check them, although the index has already matched
+  them exactly; the index could answer them alone.
 
 To reproduce (from `go`, with a Redis running):
 

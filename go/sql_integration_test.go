@@ -1062,3 +1062,114 @@ func TestSQLIntervalBind(t *testing.T) {
 		t.Errorf("bound intervals: got %q, want %q", got, want)
 	}
 }
+
+// Rows found through the index are read by FT.AGGREGATE LOAD, which returns
+// SORTABLE numbers rounded to 12 significant digits. Every type must still
+// read back exactly: through an index filter, sort + limit, a residual
+// filter, and a projection of only the columns LOAD @field returns exactly.
+func TestSQLScanReadsExactValues(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP TABLE IF EXISTS it_exact")
+	h.exec(`CREATE TABLE it_exact (id INTEGER, big BIGINT, d DOUBLE, amt DECIMAL(38, 10), ts TIMESTAMP,
+		t TIME, s VARCHAR, ok BOOLEAN, day DATE, note VARCHAR NOINDEX)`)
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_exact") })
+	h.exec(`INSERT INTO it_exact VALUES
+		(1, 9007199254740993, 0.30000000000000004, 1234567890123456789012345678.0123456789,
+		 TIMESTAMP '2999-12-31 23:59:59.999999', TIME '23:59:59.999999', 'a|b "q" {x}', TRUE, DATE '2024-02-29', 'n1'),
+		(2, 9223372036854775807, -1.2345678901234568e-300, -0.0000000001,
+		 TIMESTAMP '1970-01-01 00:00:00.000001', TIME '00:00:00', '', FALSE, DATE '1900-01-01', NULL),
+		(2147483647, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+
+	const cols = `id, big, d, amt, CAST(ts AS VARCHAR), CAST(t AS VARCHAR), s, ok, day, note`
+	row1 := `1|9007199254740993|0.30000000000000004|1234567890123456789012345678.0123456789|` +
+		`2999-12-31 23:59:59.999999|23:59:59.999999|a|b "q" {x}|true|2024-02-29|n1`
+	row2 := `2|9223372036854775807|-1.2345678901234568e-300|-0.0000000001|` +
+		`1970-01-01 00:00:00.000001|00:00:00.000000|` + `|false|1900-01-01|NULL`
+	row3 := `2147483647|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL`
+	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE id >= 1 ORDER BY id`, row1, row2, row3)
+	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE big > 0 ORDER BY big LIMIT 2`, row1, row2)
+	h.expectRows(`SELECT `+cols+` FROM it_exact WHERE note LIKE 'n%' OR note IS NULL ORDER BY id`, row1, row2, row3)
+	h.expectRows(`SELECT id, CAST(t AS VARCHAR), s, ok, day, note FROM it_exact WHERE id >= 1 ORDER BY id`,
+		`1|23:59:59.999999|a|b "q" {x}|true|2024-02-29|n1`,
+		`2|00:00:00.000000||false|1900-01-01|NULL`,
+		`2147483647|NULL|NULL|NULL|NULL|NULL`)
+
+	// UPDATE and DELETE find their rows the same way.
+	if n := h.exec(`UPDATE it_exact SET note = 'u' WHERE big = 9223372036854775807`); n != 1 {
+		t.Errorf("UPDATE affected %d rows, want 1", n)
+	}
+	if n := h.exec(`DELETE FROM it_exact WHERE id = 2147483647`); n != 1 {
+		t.Errorf("DELETE affected %d rows, want 1", n)
+	}
+	h.expectRows(`SELECT id, big, note FROM it_exact ORDER BY id`, `1|9007199254740993|n1`, `2|9223372036854775807|u`)
+
+	// Index sorts compare numbers as numbers on a cluster too, where the
+	// coordinator merges the shards' sorted rows.
+	h.exec("DROP TABLE IF EXISTS it_sortnum")
+	h.exec("CREATE TABLE it_sortnum (n BIGINT, label VARCHAR)")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_sortnum") })
+	var values, cubes []string
+	for i := 1; i <= 12; i++ {
+		values = append(values, fmt.Sprintf("(%d, 'r%d')", i*i*i, i))
+		cubes = append(cubes, fmt.Sprint(i*i*i))
+	}
+	h.exec("INSERT INTO it_sortnum VALUES " + strings.Join(values, ", "))
+	h.expectRows(`SELECT n FROM it_sortnum`, cubes...) // insertion (__rowid) order
+	h.expectRows(`SELECT n, label FROM it_sortnum ORDER BY n DESC LIMIT 4`, "1728|r12", "1331|r11", "1000|r10", "729|r9")
+}
+
+// Scans read rows a cursor page at a time; check results that span several
+// pages, including sorting and offsets across page boundaries.
+func TestSQLScanAcrossCursorPages(t *testing.T) {
+	h := newSQLHarness(t)
+	const n = 2*cursorCount + 500
+	h.exec("DROP TABLE IF EXISTS it_pages")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_pages") })
+
+	mem := memory.DefaultAllocator
+	ib := array.NewInt64Builder(mem)
+	defer ib.Release()
+	sb := array.NewStringBuilder(mem)
+	defer sb.Release()
+	for i := int64(1); i <= n; i++ {
+		ib.Append(i)
+		sb.Append(fmt.Sprintf("row %d", i))
+	}
+	ids, labels := ib.NewArray(), sb.NewArray()
+	defer ids.Release()
+	defer labels.Release()
+	rec := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "label", Type: arrow.BinaryTypes.String},
+	}, nil), []arrow.Array{ids, labels}, n)
+	defer rec.Release()
+	st, err := h.conn.NewStatement(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(h.ctx)
+	if err := st.SetOption(h.ctx, adbc.OptionKeyIngestTargetTable, "it_pages"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Bind(h.ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.ExecuteUpdate(h.ctx); err != nil || got != n {
+		t.Fatalf("ingest: n=%d err=%v", got, err)
+	}
+
+	rows, _ := h.query(`SELECT id, label FROM it_pages`)
+	if len(rows) != n {
+		t.Fatalf("full scan returned %d rows, want %d", len(rows), n)
+	}
+	for i, r := range rows {
+		if want := fmt.Sprintf("%d|row %d", i+1, i+1); r != want {
+			t.Fatalf("row %d = %q, want %q", i, r, want)
+		}
+	}
+	h.expectRows(fmt.Sprintf(`SELECT id FROM it_pages ORDER BY id DESC LIMIT 3 OFFSET %d`, cursorCount-1),
+		fmt.Sprint(n-cursorCount+1), fmt.Sprint(n-cursorCount), fmt.Sprint(n-cursorCount-1))
+	// Driver-side filter and aggregate over every page.
+	h.expectRows(`SELECT COUNT(*), SUM(id) FROM it_pages WHERE label LIKE '%5'`,
+		fmt.Sprintf("%d|%d", n/10, (5+n-5)*(n/10)/2))
+}

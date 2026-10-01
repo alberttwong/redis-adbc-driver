@@ -75,8 +75,11 @@ const (
 	tagSeparator = "\x1f"
 	// pipelineChunk is the number of commands sent per pipeline round trip.
 	pipelineChunk = 1000
-	// cursorCount is the FT.AGGREGATE cursor page size.
-	cursorCount = 1000
+	// cursorCount is the FT.AGGREGATE cursor page size. Every page is a
+	// round trip, so pages are large; pageValues caps the fields per page so
+	// that pages of wide rows stay a bounded size.
+	cursorCount = 10000
+	pageValues  = 200_000
 )
 
 type columnMeta struct {

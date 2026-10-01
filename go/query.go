@@ -313,32 +313,14 @@ type scanRequest struct {
 	need   map[string]bool // columns to read from the row HASHes
 }
 
-// scan finds the matching keys through the index (or directly), fetches the
-// needed columns from the row HASHes, and applies the residual predicate.
+// scan finds the matching rows through the index (or directly by key), reads
+// the needed columns, and applies the residual predicate. Rows found through
+// the index are read by the FT.AGGREGATE pipeline itself, a cursor page at a
+// time, rather than with one HMGET per row.
 func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([]string, []map[string]Value, error) {
 	meta := req.meta
 	if meta.isMem {
 		return e.scanMem(ctx, req, params)
-	}
-	keys := req.where.keys
-	if keys == nil {
-		ar := &aggRequest{
-			index:  meta.index(),
-			query:  req.where.query,
-			load:   []string{"__key"},
-			sortBy: req.sortBy,
-			limit:  req.limit,
-		}
-		raw, err := e.store.aggregate(ctx, ar)
-		if err != nil {
-			return nil, nil, err
-		}
-		keys = make([]string, 0, len(raw))
-		for _, r := range raw {
-			if k, ok := r["__key"]; ok {
-				keys = append(keys, k)
-			}
-		}
 	}
 	need := map[string]bool{}
 	for k := range req.need {
@@ -348,14 +330,46 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 		columnRefs(req.where.residual, need)
 	}
 	var fields []string
+	exact := true
 	for _, c := range meta.Columns {
 		if need[c.Name] {
 			fields = append(fields, c.field())
+			exact = exact && loadsExactly(c)
 		}
 	}
-	fetched, err := e.store.fetchRows(ctx, keys, fields)
-	if err != nil {
-		return nil, nil, err
+	keys := req.where.keys
+	var fetched []aggRow
+	if keys != nil {
+		var err error
+		if fetched, err = e.store.fetchRows(ctx, keys, fields); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		ar := &aggRequest{
+			index:  meta.index(),
+			query:  req.where.query,
+			sortBy: req.sortBy,
+			limit:  req.limit,
+		}
+		if exact {
+			ar.load = append([]string{"__key", rowIDField}, fields...)
+			ar.width = len(ar.load)
+		} else {
+			ar.load, ar.loadAll = []string{"__key"}, true
+			ar.width = len(meta.Columns) + 2
+		}
+		var err error
+		if fetched, err = e.store.aggregate(ctx, ar); err != nil {
+			return nil, nil, err
+		}
+		keys = make([]string, len(fetched))
+		for i, r := range fetched {
+			if _, ok := r[rowIDField]; !ok {
+				fetched[i] = nil // deleted after the index matched it
+				continue
+			}
+			keys[i] = r["__key"]
+		}
 	}
 	env := e.newEnv(ctx, meta.types(), params)
 	outKeys := make([]string, 0, len(keys))
@@ -382,6 +396,25 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 		rows = append(rows, vals)
 	}
 	return outKeys, rows, nil
+}
+
+// loadsExactly reports whether LOAD @field returns a column's stored value.
+// LOAD reads SORTABLE attributes from the index's sorting vector, where
+// numbers are doubles printed with 12 significant digits: strings (stored
+// UNF) and integers below 2^53 survive, other numbers must be read from the
+// HASH with LOAD *. Unindexed fields are always read from the HASH.
+func loadsExactly(c columnMeta) bool {
+	if !simpleName(c.field()) {
+		return false
+	}
+	if !c.Indexed {
+		return true
+	}
+	switch c.Type.Kind {
+	case KindString, KindBool, KindInt16, KindInt32, KindDate, KindTime:
+		return true
+	}
+	return false
 }
 
 // scanMem filters an in-memory relation.
