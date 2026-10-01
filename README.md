@@ -238,6 +238,16 @@ SELECT order_id, customer_id, country, product, quantity FROM sales WHERE status
 SELECT COUNT(*) FROM shipped_sales WHERE country = 'JPN' AND quantity >= 15;
 DROP VIEW shipped_sales;
 
+-- Set operations: each branch runs in its own index; the driver combines them
+SELECT country FROM customers WHERE customer_id <= 10
+UNION
+SELECT country FROM sales WHERE quantity = 20 AND product = 'gizmo'
+ORDER BY 1;
+SELECT customer_id FROM customers
+EXCEPT
+SELECT customer_id FROM sales WHERE product = 'gizmo' AND quantity = 20
+ORDER BY 1 LIMIT 5;
+
 -- information_schema: which columns of sales are indexed?
 SELECT column_name, data_type, is_nullable, is_indexed
 FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position;
@@ -330,6 +340,7 @@ How SQL is executed:
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
+| `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
 | Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
@@ -384,6 +395,14 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
+- `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` (`INTERSECT` binds
+  tighter; parenthesized branches may have their own `ORDER BY`/`LIMIT`).
+  Columns are matched by position and widened to a common type; NULLs count
+  as equal when removing duplicates. `ORDER BY` on the combined result uses
+  output column names or positions. Set operations work anywhere a query
+  does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
+- `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
+  both directions
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW`), `columns`
@@ -392,7 +411,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   (`view_definition`). Any SQL works on them, including joins
 - `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
-  comparisons, `UNION`/`INTERSECT`/`EXCEPT`, window functions
+  comparisons, window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE]`

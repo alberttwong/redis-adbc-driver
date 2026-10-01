@@ -787,3 +787,72 @@ func TestSQLLike(t *testing.T) {
 	h.expectRows(`SELECT id FROM it_like WHERE s LIKE '%'  ORDER BY id`, "1", "2", "3", "4", "5", "6", "8", "9")
 	h.expectRows(`SELECT 'abc' LIKE 'a%c', 'abc' LIKE 'b%', NULL LIKE 'a'`, "true|false|NULL")
 }
+
+func TestSQLSetOperations(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP VIEW IF EXISTS it_union_view")
+	h.exec("DROP TABLE IF EXISTS it_union_ctas")
+	t.Cleanup(func() {
+		h.exec("DROP VIEW IF EXISTS it_union_view")
+		h.exec("DROP TABLE IF EXISTS it_union_ctas")
+	})
+
+	// customer ids: customers {1,2,3,4}; orders {1,1,2,2,3,9}
+	h.expectRows(`SELECT id FROM it_customers UNION SELECT customer_id FROM it_orders ORDER BY 1`,
+		"1", "2", "3", "4", "9")
+	h.expectRows(`SELECT id FROM it_customers UNION ALL SELECT customer_id FROM it_orders ORDER BY id`,
+		"1", "1", "1", "2", "2", "2", "3", "3", "4", "9")
+	h.expectRows(`SELECT id FROM it_customers INTERSECT SELECT customer_id FROM it_orders ORDER BY id`, "1", "2", "3")
+	h.expectRows(`SELECT customer_id FROM it_orders INTERSECT ALL SELECT customer_id FROM it_orders WHERE status = 'shipped' ORDER BY 1`,
+		"1", "2", "2", "9")
+	h.expectRows(`SELECT id FROM it_customers EXCEPT SELECT customer_id FROM it_orders`, "4")
+	h.expectRows(`SELECT customer_id FROM it_orders EXCEPT ALL SELECT id FROM it_customers ORDER BY 1`, "1", "2", "9")
+
+	// NULLs are equal for duplicate elimination; types are widened.
+	h.expectRows(`SELECT country FROM it_customers UNION SELECT country FROM it_customers ORDER BY country`,
+		"GBR", "USA", "NULL")
+	h.expectRows(`SELECT country FROM it_customers UNION SELECT country FROM it_customers ORDER BY country NULLS FIRST`,
+		"NULL", "GBR", "USA")
+	schema := h.expectRows(`SELECT qty FROM it_orders WHERE id = 1 UNION SELECT amount FROM it_orders WHERE id = 2 ORDER BY 1`,
+		"1.00", "99.99")
+	if dt := schema.Field(0).Type; dt.ID() != arrow.DECIMAL128 {
+		t.Errorf("UNION of INTEGER and NUMERIC = %s, want decimal", dt)
+	}
+	h.expectRows(`SELECT 1 AS n UNION SELECT 1.0 UNION SELECT 2`, "1.0", "2.0")
+	h.expectRows(`SELECT NULL AS x UNION ALL SELECT 'a' ORDER BY x`, "a", "NULL")
+
+	// Precedence (INTERSECT first), parentheses, chaining, per-branch LIMIT.
+	h.expectRows(`SELECT 1 AS n UNION SELECT 2 INTERSECT SELECT 3`, "1")
+	h.expectRows(`(SELECT 1 AS n UNION SELECT 2) INTERSECT SELECT 2`, "2")
+	h.expectRows(`SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 EXCEPT SELECT 2 ORDER BY n DESC`, "3", "1")
+	h.expectRows(`(SELECT id FROM it_orders ORDER BY amount DESC LIMIT 2) UNION ALL (SELECT id FROM it_orders ORDER BY id LIMIT 1) ORDER BY 1`,
+		"1", "2", "4")
+	h.expectRows(`SELECT id, status FROM it_orders WHERE qty > 3 UNION SELECT id, 'small' FROM it_orders WHERE qty = 1
+		ORDER BY status, id LIMIT 3 OFFSET 1`,
+		"6|shipped", "1|small", "5|small")
+
+	// In subqueries, CTEs, views, IN, correlated, CTAS.
+	h.expectRows(`SELECT name FROM it_customers WHERE id IN (SELECT customer_id FROM it_orders WHERE qty >= 10 UNION SELECT 3) ORDER BY name`,
+		"Bo", "Cy")
+	h.expectRows(`WITH ids AS (SELECT id FROM it_customers EXCEPT SELECT customer_id FROM it_orders) SELECT COUNT(*) FROM ids`, "1")
+	h.expectRows(`SELECT COUNT(*) FROM (SELECT customer_id FROM it_orders UNION SELECT id FROM it_customers) AS u`, "5")
+	h.exec(`CREATE VIEW it_union_view AS SELECT id AS k FROM it_customers UNION SELECT customer_id FROM it_orders`)
+	h.expectRows(`SELECT k FROM it_union_view WHERE k > 3 ORDER BY k`, "4", "9")
+	h.expectRows(`SELECT c.name FROM it_customers c WHERE EXISTS (
+			SELECT 1 FROM it_orders o WHERE o.customer_id = c.id AND o.status = 'pending'
+			UNION ALL SELECT 1 FROM it_orders o WHERE o.customer_id = c.id AND o.qty >= 10) ORDER BY c.name`,
+		"Ada", "Bo")
+	h.exec(`CREATE TABLE it_union_ctas AS SELECT id, name FROM it_customers WHERE id <= 2 UNION ALL SELECT 99, 'extra'`)
+	h.expectRows(`SELECT id, name FROM it_union_ctas ORDER BY id`, "1|Ada", "2|Bo", "99|extra")
+
+	// NULLS FIRST / LAST on ordinary queries now apply too.
+	h.expectRows(`SELECT id FROM it_orders ORDER BY amount NULLS FIRST, id LIMIT 2`, "5", "3")
+	h.expectRows(`SELECT id FROM it_orders ORDER BY amount DESC NULLS LAST LIMIT 1`, "4")
+
+	// Errors.
+	h.expectError(`SELECT id, name FROM it_customers UNION SELECT id FROM it_orders`, "same number of columns")
+	h.expectError(`SELECT id FROM it_customers UNION SELECT name FROM it_customers`, "cannot be matched")
+	h.expectError(`SELECT id FROM it_customers UNION SELECT customer_id FROM it_orders ORDER BY id + 1`, "output column names or positions")
+	h.expectError(`SELECT id FROM it_customers ORDER BY id UNION SELECT 1`, "UNION")
+}
