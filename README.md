@@ -204,6 +204,11 @@ ORDER BY name LIMIT 5;
 SELECT c.name, (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.customer_id) AS orders
 FROM customers c ORDER BY orders DESC, c.name LIMIT 3;
 
+-- EXISTS / IN correlated only by equalities can run once instead, as a hash
+-- semi-join (here the matching customer ids also filter sales in the index)
+SELECT COUNT(*) FROM sales s
+WHERE EXISTS (SELECT 1 FROM customers c WHERE c.customer_id = s.customer_id AND c.country = 'JPN');
+
 -- CTEs and derived tables are computed once and held in memory
 WITH per_customer AS (
   SELECT customer_id, SUM(quantity) AS units FROM sales GROUP BY customer_id
@@ -396,8 +401,8 @@ How SQL is executed:
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
-| `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`) |
-| Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
+| `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that the driver checks each row; `IN (SELECT …)` against a hash set of the values |
+| Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row). A query with window functions never pushes its LIMIT into the index |
@@ -747,8 +752,18 @@ What drives the numbers:
   (3.3–3.8 s for the full scan).
 - **Selective joins are fast** because the smaller side is filtered in its
   index first and only matching rows of the other side are fetched. A
-  correlated subquery costs one indexed query per distinct outer value
-  (about 0.6 ms each here).
+  correlated scalar subquery costs one indexed query per distinct outer
+  value (about 0.6 ms each here).
+- **`IN (SELECT …)` and correlated `EXISTS` / `IN` on equalities don't
+  run per row** (`bench.py` has three such queries over the 100,000 rows).
+  `order_id IN (SELECT …)` with 50,000 values takes 0.74 s: each row is
+  checked against a hash set of the values. `EXISTS (SELECT … WHERE
+  r.order_id = s.order_id AND …)` with 50,000 inner rows takes 0.87 s: it
+  runs per outer row for the first 500 rows, then reads the inner side once
+  as a hash semi-join. When the subquery has no rows it takes 2 ms, because
+  the index then rules out every row. Without the hash set, each row was
+  compared with every value (23 s), and without the semi-join the subquery
+  ran once per outer row (100,000 `FT.AGGREGATE` commands, 22–23 s).
 
 Known ways to make the slow cases faster (not done yet):
 

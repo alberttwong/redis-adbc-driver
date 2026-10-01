@@ -415,6 +415,255 @@ func TestSQLSubqueryDML(t *testing.T) {
 	h.expectRows(`SELECT country FROM it_customers WHERE id = 3`, "returned")
 }
 
+// subqueryWork is the subquery work done by one statement (subqueryStats).
+type subqueryWork struct{ runs, semiJoins, inSets int64 }
+
+// expectWork runs a query, checks its rows, and returns the subquery work it
+// did.
+func (h *sqlHarness) expectWork(sql string, want ...string) subqueryWork {
+	h.t.Helper()
+	r, s, i := subqueryStats.runs.Load(), subqueryStats.semiJoins.Load(), subqueryStats.inSets.Load()
+	h.expectRows(sql, want...)
+	return subqueryWork{subqueryStats.runs.Load() - r, subqueryStats.semiJoins.Load() - s, subqueryStats.inSets.Load() - i}
+}
+
+// IN (SELECT …) probes a hash set of the subquery's values; the answers must
+// be those of comparing one by one, including NULLs and cross-type equality.
+func TestSQLInSubqueryHashSet(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP TABLE IF EXISTS it_hs_keys")
+		h.exec("DROP TABLE IF EXISTS it_hs_probe")
+		h.exec("DROP TABLE IF EXISTS it_hs_many")
+	}
+	drop()
+	t.Cleanup(drop)
+	// NOINDEX: the predicates are evaluated by the driver, not by an index
+	// union. Twelve values (k = 10, 20, …, 120; f alternates 10.5, 20, 30.5,
+	// …) plus a row of NULLs.
+	h.exec(`CREATE TABLE it_hs_keys (i INTEGER, k BIGINT NOINDEX, d NUMERIC(10,2) NOINDEX,
+		f DOUBLE NOINDEX, s VARCHAR NOINDEX)`)
+	var vals []string
+	for i := 1; i <= 12; i++ {
+		vals = append(vals, fmt.Sprintf("(%d, %d, %d.00, %g, 'k%d')", i, 10*i, 10*i, float64(10*i)+float64(i%2)*0.5, i))
+	}
+	h.exec("INSERT INTO it_hs_keys VALUES " + strings.Join(vals, ", ") + ", (13, NULL, NULL, NULL, NULL)")
+	h.exec(`CREATE TABLE it_hs_probe (id INTEGER, n BIGINT NOINDEX, d NUMERIC(10,2) NOINDEX,
+		f DOUBLE NOINDEX, s VARCHAR NOINDEX)`)
+	h.exec(`INSERT INTO it_hs_probe VALUES (1, 10, 10.00, 10.0, 'k1'), (2, 20, 30.50, 30.5, 'k2'),
+		(3, 25, 25.00, 25.0, 'zz'), (4, NULL, NULL, NULL, NULL), (5, 120, 120.00, 120.0, 'k12')`)
+
+	// Each subquery runs once and builds one hash set, whatever the number of
+	// outer rows.
+	w := h.expectWork(`SELECT id, n IN (SELECT k FROM it_hs_keys WHERE k IS NOT NULL),
+			n NOT IN (SELECT k FROM it_hs_keys WHERE k IS NOT NULL)
+		FROM it_hs_probe ORDER BY id`,
+		"1|true|false", "2|true|false", "3|false|true", "4|NULL|NULL", "5|true|false")
+	if w.runs != 2 || w.inSets != 2 {
+		t.Errorf("IN subqueries: %+v, want 2 runs and 2 hash sets", w)
+	}
+	// A NULL in the subquery: no match is NULL, so NOT IN is never true.
+	h.expectRows(`SELECT id, n IN (SELECT k FROM it_hs_keys), n NOT IN (SELECT k FROM it_hs_keys)
+		FROM it_hs_probe ORDER BY id`,
+		"1|true|false", "2|true|false", "3|NULL|NULL", "4|NULL|NULL", "5|true|false")
+	h.expectRows(`SELECT id FROM it_hs_probe WHERE n NOT IN (SELECT k FROM it_hs_keys)`)
+	h.expectRows(`SELECT id FROM it_hs_probe WHERE n NOT IN (SELECT k FROM it_hs_keys WHERE k IS NOT NULL)`, "3")
+	h.expectRows(`SELECT id FROM it_hs_probe WHERE n IN (SELECT k FROM it_hs_keys) ORDER BY id`, "1", "2", "5")
+	// Cross-type equality: integers, decimals (10 = 10.00) and doubles
+	// (20 = 20.0, 30.50 = 30.5, but 10 <> 10.5).
+	h.expectRows(`SELECT id,
+			n IN (SELECT d FROM it_hs_keys WHERE i <= 12), d IN (SELECT k FROM it_hs_keys WHERE i <= 12),
+			n IN (SELECT f FROM it_hs_keys WHERE i <= 12), f IN (SELECT k FROM it_hs_keys WHERE i <= 12),
+			d IN (SELECT f FROM it_hs_keys WHERE i <= 12), f IN (SELECT d FROM it_hs_keys WHERE i <= 12)
+		FROM it_hs_probe ORDER BY id`,
+		"1|true|true|false|true|false|true", "2|true|false|true|false|true|false",
+		"3|false|false|false|false|false|false", "4|NULL|NULL|NULL|NULL|NULL|NULL", "5|true|true|true|true|true|true")
+	// Strings, and a string compared with numbers (converted, as before).
+	h.expectRows(`SELECT id, s IN (SELECT s FROM it_hs_keys WHERE i <= 12),
+			CAST(n AS VARCHAR) IN (SELECT k FROM it_hs_keys WHERE i <= 12)
+		FROM it_hs_probe ORDER BY id`,
+		"1|true|true", "2|true|true", "3|false|false", "4|NULL|NULL", "5|true|true")
+
+	// More than maxUnionTerms values on an indexed column: no index union,
+	// every row is checked against the set.
+	h.exec(`CREATE TABLE it_hs_many AS SELECT a.k * 1000000 + b.k * 1000 + c.k AS v, c.k AS c
+		FROM it_hs_keys a, it_hs_keys b, it_hs_keys c WHERE a.i <= 12 AND b.i <= 12 AND c.i <= 12`)
+	w = h.expectWork(`SELECT COUNT(*) FROM it_hs_many WHERE v IN (SELECT v FROM it_hs_many WHERE c <= 100)`, "1440")
+	if w.runs != 1 || w.inSets != 1 {
+		t.Errorf("large IN subquery: %+v, want 1 run and 1 hash set", w)
+	}
+	h.expectRows(`SELECT COUNT(*) FROM it_hs_many WHERE v NOT IN (SELECT v FROM it_hs_many WHERE c <= 100)`, "288")
+	h.expectRows(`SELECT COUNT(*) FROM it_hs_many WHERE v + 0.0 IN (SELECT v FROM it_hs_many WHERE c <= 100)`, "1440")
+}
+
+// Correlated EXISTS / IN with only `inner = outer` correlation run once as a
+// semi-join; the results must be those of running them per outer row.
+func TestSQLSemiJoins(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_sj_v")
+		for _, name := range []string{"it_sj_o", "it_sj_i", "it_sj_big", "it_sj_mo", "it_sj_tmp", "it_sj_tmp2"} {
+			h.exec("DROP TABLE IF EXISTS " + name)
+		}
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_sj_o (id INTEGER, k BIGINT, g VARCHAR, x INTEGER)")
+	h.exec(`INSERT INTO it_sj_o VALUES (1, 1, 'a', 10), (2, 2, 'a', 20), (3, 2, 'b', 30),
+		(4, 3, 'a', NULL), (5, NULL, 'a', 50), (6, 4, NULL, 60), (7, 5, 'c', 70)`)
+	h.exec("CREATE TABLE it_sj_i (k BIGINT, g VARCHAR, v INTEGER, kd NUMERIC(10,2), z INTEGER)")
+	h.exec(`INSERT INTO it_sj_i VALUES (1, 'a', 10, 1.00, 1), (2, 'b', 20, 2.00, 1), (2, 'b', NULL, 2.00, 1),
+		(3, 'x', 31, 3.00, 1), (NULL, 'a', 50, NULL, 1), (4, NULL, 60, 4.00, 1), (9, 'c', 70, 9.00, 0)`)
+
+	semi := func(w subqueryWork, what string, semiJoins int64) {
+		t.Helper()
+		if w.semiJoins != semiJoins || w.runs != 0 {
+			t.Errorf("%s: %+v, want %d semi-join(s) and no per-row runs", what, w, semiJoins)
+		}
+	}
+	perRow := func(w subqueryWork, what string) {
+		t.Helper()
+		if w.semiJoins != 0 || w.runs < 2 {
+			t.Errorf("%s: %+v, want per-row runs and no semi-join", what, w)
+		}
+	}
+
+	// EXISTS / NOT EXISTS: a NULL key never matches. Each runs the inner
+	// query once, not once per outer row.
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k) ORDER BY id`,
+		"1", "2", "3", "4", "6"), "EXISTS", 1)
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE NOT EXISTS (SELECT * FROM it_sj_i i WHERE o.k = i.k) ORDER BY id`,
+		"5", "7"), "NOT EXISTS", 1)
+	semi(h.expectWork(`SELECT id, EXISTS (SELECT i.v FROM it_sj_i i WHERE i.k = o.k LIMIT 1) FROM it_sj_o o ORDER BY id`,
+		"1|true", "2|true", "3|true", "4|true", "5|false", "6|true", "7|false"), "EXISTS in SELECT", 1)
+	// Composite keys (NULL = NULL is not a match), extra inner conditions, a
+	// decimal key against an integer one, and a CTE.
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND i.g = o.g) ORDER BY id`,
+		"1", "3"), "composite EXISTS", 1)
+	h.expectRows(`SELECT id FROM it_sj_o o WHERE NOT EXISTS (SELECT 1 FROM it_sj_i i WHERE i.g = o.g AND o.k = i.k) ORDER BY id`,
+		"2", "4", "5", "6", "7")
+	h.expectRows(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND i.v > 15) ORDER BY id`,
+		"2", "3", "4", "6")
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.kd = o.k) ORDER BY id`,
+		"1", "2", "3", "4", "6"), "decimal = integer", 1)
+	h.expectRows(`WITH ks AS (SELECT k FROM it_sj_i WHERE v >= 20)
+		SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM ks WHERE ks.k = o.k) ORDER BY id`,
+		"2", "3", "4", "6")
+	// Temporary tables, inside the subquery and as the outer table.
+	h.exec("CREATE TEMP TABLE it_sj_tmp (k BIGINT, g VARCHAR)")
+	h.exec("INSERT INTO it_sj_tmp VALUES (1, 'a'), (2, 'b'), (NULL, 'a')")
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_tmp t WHERE t.k = o.k AND t.g = o.g) ORDER BY id`,
+		"1", "3"), "temp table EXISTS", 1)
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE o.k IN (SELECT t.k FROM it_sj_tmp t WHERE t.g = o.g) ORDER BY id`,
+		"1", "3"), "temp table IN", 1)
+	h.exec("CREATE TEMP TABLE it_sj_tmp2 (k BIGINT)")
+	h.exec("INSERT INTO it_sj_tmp2 VALUES (1), (5), (9), (NULL)")
+	if n := h.exec(`DELETE FROM it_sj_tmp2 WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = it_sj_tmp2.k)`); n != 2 {
+		t.Errorf("DELETE from a temp table … WHERE EXISTS matched %d rows, want 2", n)
+	}
+	h.expectRows(`SELECT k FROM it_sj_tmp2 ORDER BY k`, "5", "NULL")
+	// The outer query is a join, or a view.
+	h.expectRows(`SELECT o.id FROM it_sj_o o JOIN it_sj_o p ON p.id = o.id
+		WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND i.g = p.g) ORDER BY o.id`, "1", "3")
+	h.exec(`CREATE VIEW it_sj_v AS SELECT id, k FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k)`)
+	semi(h.expectWork(`SELECT id FROM it_sj_v WHERE k >= 2 ORDER BY id`, "2", "3", "4", "6"), "view", 1)
+	// A semi-join inside a semi-join (correlated to the inner query only).
+	semi(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i
+			WHERE i.k = o.k AND EXISTS (SELECT 1 FROM it_sj_i j WHERE j.k = i.k AND j.v IS NULL)) ORDER BY id`,
+		"2", "3"), "nested semi-joins", 2)
+	// No inner rows: EXISTS is false for every row and NOT EXISTS true.
+	semi(h.expectWork(`SELECT COUNT(*) FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND i.v < 0)`,
+		"0"), "empty EXISTS", 1)
+	h.expectRows(`SELECT COUNT(*) FROM it_sj_o o WHERE NOT EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND i.v < 0)`, "7")
+
+	// Correlated [NOT] IN: SQL's three-valued logic over each outer row's
+	// values (k = 2 gives {20, NULL}; k = NULL or 5 gives no rows).
+	semi(h.expectWork(`SELECT id, x IN (SELECT v FROM it_sj_i i WHERE i.k = o.k),
+			x NOT IN (SELECT v FROM it_sj_i i WHERE i.k = o.k)
+		FROM it_sj_o o ORDER BY id`,
+		"1|true|false", "2|true|false", "3|NULL|NULL", "4|NULL|NULL", "5|false|true", "6|true|false", "7|false|true"),
+		"correlated IN", 2)
+	h.expectRows(`SELECT id FROM it_sj_o o WHERE x IN (SELECT v FROM it_sj_i i WHERE i.k = o.k) ORDER BY id`, "1", "2", "6")
+	h.expectRows(`SELECT id FROM it_sj_o o WHERE x NOT IN (SELECT v FROM it_sj_i i WHERE i.k = o.k) ORDER BY id`, "5", "7")
+	h.expectRows(`SELECT id FROM it_sj_o o WHERE g IN (SELECT i.g FROM it_sj_i i WHERE i.kd = o.k) ORDER BY id`, "1", "3")
+
+	// Shapes that keep running per outer row, with the same results as ever:
+	// non-equality or OR correlation, an aggregate, LIMIT in IN, an outer
+	// column in the select list or in a nested subquery, keys of different
+	// types, a join in the subquery, RANDOM().
+	perRow(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k > o.k) ORDER BY id`,
+		"1", "2", "3", "4", "6", "7"), "non-equality")
+	perRow(h.expectWork(`SELECT COUNT(*) FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k OR i.v = o.x)`,
+		"7"), "OR")
+	perRow(h.expectWork(`SELECT COUNT(*) FROM it_sj_o o WHERE EXISTS (SELECT COUNT(*) FROM it_sj_i i WHERE i.k = o.k)`,
+		"7"), "aggregate")
+	perRow(h.expectWork(`SELECT id, x IN (SELECT v FROM it_sj_i i WHERE i.k = o.k ORDER BY v LIMIT 1) FROM it_sj_o o ORDER BY id`,
+		"1|true", "2|true", "3|false", "4|NULL", "5|false", "6|true", "7|false"), "LIMIT")
+	perRow(h.expectWork(`SELECT id, x IN (SELECT v + o.id - o.id FROM it_sj_i i WHERE i.k = o.k) FROM it_sj_o o ORDER BY id`,
+		"1|true", "2|true", "3|NULL", "4|NULL", "5|false", "6|true", "7|false"), "outer column in the select list")
+	perRow(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i
+			WHERE i.k = o.k AND EXISTS (SELECT 1 FROM it_sj_i j WHERE j.v = o.x)) ORDER BY id`,
+		"1", "2", "6"), "nested correlation")
+	perRow(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE CAST(i.k AS DOUBLE) = o.k) ORDER BY id`,
+		"1", "2", "3", "4", "6"), "double = integer")
+	perRow(h.expectWork(`SELECT id FROM it_sj_o o
+			WHERE EXISTS (SELECT 1 FROM it_sj_i i JOIN it_sj_i j ON j.k = i.k WHERE j.v IS NULL AND i.k = o.k) ORDER BY id`,
+		"2", "3"), "join in the subquery")
+	perRow(h.expectWork(`SELECT id FROM it_sj_o o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND RANDOM() >= 0) ORDER BY id`,
+		"1", "2", "3", "4", "6"), "volatile function")
+	// The inner query fails on a row (10 / 0) that no outer row matches:
+	// the semi-join gives up and the per-row path runs, as before.
+	w := h.expectWork(`SELECT id FROM it_sj_o o
+		WHERE o.k IS NOT NULL AND EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = o.k AND 10 / i.z > 1) ORDER BY id`,
+		"1", "2", "3", "4", "6")
+	if w.semiJoins != 1 || w.runs < 2 {
+		t.Errorf("failing semi-join: %+v, want 1 semi-join attempt, then per-row runs", w)
+	}
+
+	// A large inner side (2,000 rows) is read only once running per outer
+	// row has cost about as much (2000 / rowsPerRun = 20 runs); a few outer
+	// rows never pay for it.
+	var big []string
+	for k := 1; k <= 2000; k++ {
+		big = append(big, fmt.Sprintf("(%d)", k))
+	}
+	h.exec("CREATE TABLE it_sj_big (k BIGINT)")
+	h.exec("INSERT INTO it_sj_big VALUES " + strings.Join(big, ", "))
+	h.exec("CREATE TABLE it_sj_mo (id INTEGER, k BIGINT)")
+	var mo []string
+	for id := 1; id <= 100; id++ {
+		mo = append(mo, fmt.Sprintf("(%d, %d)", id, id*25))
+	}
+	h.exec("INSERT INTO it_sj_mo VALUES " + strings.Join(mo, ", "))
+	if w := h.expectWork(`SELECT COUNT(*) FROM it_sj_mo o WHERE EXISTS (SELECT 1 FROM it_sj_big b WHERE b.k = o.k)`,
+		"80"); w.runs != 2000/rowsPerRun || w.semiJoins != 1 {
+		t.Errorf("large inner side: %+v, want %d per-row runs, then 1 semi-join", w, 2000/rowsPerRun)
+	}
+	h.expectRows(`SELECT COUNT(*) FROM it_sj_mo o WHERE NOT EXISTS (SELECT 1 FROM it_sj_big b WHERE b.k = o.k)`, "20")
+	if w := h.expectWork(`SELECT COUNT(*) FROM it_sj_mo o WHERE o.id <= 5 AND EXISTS (SELECT 1 FROM it_sj_big b WHERE b.k = o.k)`,
+		"5"); w.runs != 5 || w.semiJoins != 0 {
+		t.Errorf("large inner side, 5 outer rows: %+v, want 5 per-row runs", w)
+	}
+
+	// UPDATE and DELETE.
+	if n := h.exec(`UPDATE it_sj_o SET x = 0 WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = it_sj_o.k AND i.g = it_sj_o.g)`); n != 2 {
+		t.Errorf("UPDATE … WHERE EXISTS matched %d rows, want 2", n)
+	}
+	if n := h.exec(`UPDATE it_sj_o SET g = 'in' WHERE x IN (SELECT v FROM it_sj_i i WHERE i.k = it_sj_o.k)`); n != 2 {
+		t.Errorf("UPDATE … WHERE IN matched %d rows, want 2", n)
+	}
+	h.exec(`UPDATE it_sj_o SET x = CASE WHEN EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = it_sj_o.k) THEN x ELSE -1 END`)
+	h.expectRows(`SELECT id, g, x FROM it_sj_o ORDER BY id`,
+		"1|a|0", "2|in|20", "3|b|0", "4|a|NULL", "5|a|-1", "6|in|60", "7|c|-1")
+	if n := h.exec(`DELETE FROM it_sj_o WHERE EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = it_sj_o.k AND i.v > 1000)`); n != 0 {
+		t.Errorf("DELETE … WHERE EXISTS (no rows) matched %d rows, want 0", n)
+	}
+	if n := h.exec(`DELETE FROM it_sj_o WHERE NOT EXISTS (SELECT 1 FROM it_sj_i i WHERE i.k = it_sj_o.k)`); n != 2 {
+		t.Errorf("DELETE … WHERE NOT EXISTS matched %d rows, want 2", n)
+	}
+	h.expectRows(`SELECT id, g, x FROM it_sj_o ORDER BY id`, "1|a|0", "2|in|20", "3|b|0", "4|a|NULL", "6|in|60")
+}
+
 func TestSQLJoins(t *testing.T) {
 	h := newSQLHarness(t)
 	h.setupOrders()

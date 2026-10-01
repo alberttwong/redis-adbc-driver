@@ -58,6 +58,11 @@ type Subquery struct {
 	// outerRefs are the outer columns the body reads, relative to the
 	// environment that evaluates the subquery (used as the memo key).
 	outerRefs []outerRef
+	// outerUses counts the outer references bound in the body (including
+	// nested subqueries).
+	outerUses int
+	// semi is set when the subquery runs as a semi-join (see semijoin.go).
+	semi *semiJoin
 }
 
 type SubqueryKind int
