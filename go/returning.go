@@ -231,6 +231,10 @@ func (e *executor) resultColumns(ctx context.Context, st Stmt, paramTypes []ColT
 		}
 		return plan.columns(), true, nil
 	}
+	if show, isShow := st.(*ShowStmt); isShow {
+		cols, err := showColumns(show)
+		return cols, err == nil, err
+	}
 	if paramTypes != nil {
 		e.paramTypes = paramTypes
 	}

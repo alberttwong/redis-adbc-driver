@@ -59,7 +59,6 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	goredis "github.com/redis/go-redis/v9"
 )
 
 // nullMarker is the HASH field that says a row's column was set to NULL,
@@ -133,42 +132,6 @@ func (s *store) dropMissingValues(ctx context.Context, meta *tableMeta) error {
 		}
 		return nil
 	}, nil)
-}
-
-// updateTableAtRowID is updateTable for a change that depends on the table's
-// row id high-water mark (the last row id allocated, 0 if none): fn gets it,
-// and the change only commits if no row ids were allocated meanwhile.
-func (s *store) updateTableAtRowID(ctx context.Context, schema, table string, fn func(m *tableMeta, lastRowID int64) error) error {
-	key, seq := metaKey(schema, table), seqKey(schema, table)
-	for attempt := 0; attempt < 20; attempt++ {
-		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
-			m, err := s.getTableWith(ctx, tx, schema, table)
-			if err != nil {
-				return err
-			}
-			last, err := tx.Get(ctx, seq).Int64()
-			if err != nil && err != goredis.Nil {
-				return err
-			}
-			if err := fn(m, last); err != nil {
-				return err
-			}
-			raw, err := marshalMeta(m)
-			if err != nil {
-				return err
-			}
-			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
-				p.Set(ctx, key, raw, 0)
-				return nil
-			})
-			return err
-		}, key, seq)
-		if err == goredis.TxFailedErr {
-			continue // concurrent change or insert: retry
-		}
-		return wrapRedis(err, "failed to update table metadata")
-	}
-	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", displaySchema(schema), table)
 }
 
 // checkDefault checks the DEFAULT of a column definition (see the top of

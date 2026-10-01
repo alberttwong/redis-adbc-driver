@@ -67,7 +67,7 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 	case isTempSchema(schemaName):
 		return -1, errorf(adbc.StatusNotFound, "schema %q does not exist", schemaName)
 	case schemaName == "":
-		schemaName = s.conn.schema
+		schemaName = s.conn.sess.currentSchema()
 	}
 	arrowSchema := s.params.Schema()
 	wanted, err := metaFromArrow(schemaName, opts.TableName, arrowSchema)

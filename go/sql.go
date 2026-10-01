@@ -458,7 +458,14 @@ type AlterTableStmt struct {
 	Table    TableName
 	IfExists bool
 	// View is set for ALTER VIEW (which only supports RENAME TO).
-	View              bool
+	View bool
+	// Cmds are the actions in the order written: a single RENAME TO or
+	// RENAME COLUMN, or one or more of the others (see alter.go).
+	Cmds []AlterCmd
+}
+
+// AlterCmd is one action of an ALTER TABLE.
+type AlterCmd struct {
 	Action            AlterAction
 	NewTable          TableName // RENAME TO
 	Column            string    // RENAME COLUMN (old) / DROP COLUMN / ALTER COLUMN
@@ -1085,6 +1092,19 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseTruncate()
 	case p.isKeyword("COMMENT"):
 		return p.parseComment()
+	case p.isKeyword("BEGIN"), p.isKeyword("START"), p.isKeyword("COMMIT"), p.isKeyword("END"),
+		p.isKeyword("ROLLBACK"), p.isKeyword("ABORT"):
+		return p.parseTransaction()
+	case p.isKeyword("SAVEPOINT"):
+		return nil, autocommitOnly("SAVEPOINT")
+	case p.isKeyword("RELEASE"):
+		return nil, autocommitOnly("RELEASE SAVEPOINT")
+	case p.isKeyword("SET"):
+		return p.parseSet()
+	case p.isKeyword("RESET"):
+		return p.parseReset()
+	case p.isKeyword("SHOW"):
+		return p.parseShow()
 	}
 	return nil, &sqlError{msg: fmt.Sprintf("unsupported statement starting with %q", p.peek().text)}
 }
@@ -2162,10 +2182,12 @@ func (p *parser) parseReferences() error {
 	return nil
 }
 
-// parseAlter parses ALTER TABLE [IF EXISTS] t followed by one of
-// RENAME TO u | RENAME [COLUMN] a TO b | ADD [COLUMN] [IF NOT EXISTS] def |
-// DROP [COLUMN] [IF EXISTS] c | ALTER [COLUMN] c {SET DEFAULT expr | DROP
-// DEFAULT} | ADD table_constraint | DROP CONSTRAINT [IF EXISTS] name.
+// parseAlter parses ALTER TABLE [IF EXISTS] t followed by RENAME TO u, by
+// RENAME [COLUMN] a TO b, or by a comma-separated list of ADD [COLUMN] [IF
+// NOT EXISTS] def | DROP [COLUMN] [IF EXISTS] c | ALTER [COLUMN] c {SET
+// DEFAULT expr | DROP DEFAULT} | ADD table_constraint | DROP CONSTRAINT [IF
+// EXISTS] name. As in Postgres, the RENAME forms take no list: a ',' after
+// one, or a RENAME in a list, is a syntax error there.
 func (p *parser) parseAlter() (Stmt, error) {
 	if err := p.expectKeyword("ALTER"); err != nil {
 		return nil, err
@@ -2182,80 +2204,132 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return nil, err
 	}
 	st.Table = t
-	switch {
-	case p.acceptKeyword("RENAME", "TO"):
-		nt, err := p.parseTableName()
+	if p.isKeyword("RENAME") {
+		cmd, err := p.parseAlterRename()
 		if err != nil {
 			return nil, err
 		}
-		st.Action, st.NewTable = AlterRenameTable, nt
-	case p.acceptKeyword("RENAME"):
-		p.acceptKeyword("COLUMN")
-		if st.Column, err = p.parseIdent(); err != nil {
+		if st.View && cmd.Action != AlterRenameTable {
+			return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
+		}
+		if p.isOp(",") {
+			return nil, pgSyntaxErr(p.peek().text)
+		}
+		st.Cmds = []AlterCmd{cmd}
+		return st, nil
+	}
+	for {
+		if p.isKeyword("RENAME") {
+			return nil, pgSyntaxErr(p.peek().text)
+		}
+		cmd, err := p.parseAlterCmd(st.View)
+		if err != nil {
 			return nil, err
 		}
-		if err := p.expectKeyword("TO"); err != nil {
-			return nil, err
+		if st.View {
+			return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
 		}
-		if st.NewColumn, err = p.parseIdent(); err != nil {
-			return nil, err
+		st.Cmds = append(st.Cmds, cmd)
+		if !p.acceptOp(",") {
+			return st, nil
 		}
-		st.Action = AlterRenameColumn
+		if p.peek().kind == tokEOF || p.isOp(";") {
+			return nil, &sqlError{msg: "syntax error at end of input"}
+		}
+	}
+}
+
+// pgSyntaxErr is Postgres's message for a syntax error at a token.
+func pgSyntaxErr(tok string) error {
+	return &sqlError{msg: fmt.Sprintf(`syntax error at or near "%s"`, tok)}
+}
+
+// parseAlterRename parses RENAME TO u or RENAME [COLUMN] a TO b.
+func (p *parser) parseAlterRename() (AlterCmd, error) {
+	var cmd AlterCmd
+	if p.acceptKeyword("RENAME", "TO") {
+		nt, err := p.parseTableName()
+		if err != nil {
+			return cmd, err
+		}
+		cmd.Action, cmd.NewTable = AlterRenameTable, nt
+		return cmd, nil
+	}
+	if err := p.expectKeyword("RENAME"); err != nil {
+		return cmd, err
+	}
+	p.acceptKeyword("COLUMN")
+	var err error
+	if cmd.Column, err = p.parseIdent(); err != nil {
+		return cmd, err
+	}
+	if err := p.expectKeyword("TO"); err != nil {
+		return cmd, err
+	}
+	if cmd.NewColumn, err = p.parseIdent(); err != nil {
+		return cmd, err
+	}
+	cmd.Action = AlterRenameColumn
+	return cmd, nil
+}
+
+// parseAlterCmd parses one action of an ALTER TABLE list (see parseAlter).
+func (p *parser) parseAlterCmd(view bool) (AlterCmd, error) {
+	var cmd AlterCmd
+	var err error
+	switch {
 	case p.acceptKeyword("ADD"):
 		if p.isTableConstraint() {
-			if st.Check, err = p.parseTableConstraint(true); err != nil {
-				return nil, err
+			if cmd.Check, err = p.parseTableConstraint(true); err != nil {
+				return cmd, err
 			}
-			st.Action = AlterAddConstraint
+			cmd.Action = AlterAddConstraint
 			break
 		}
 		p.acceptKeyword("COLUMN")
-		st.IfColumnNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
-		if st.Def, err = p.parseColumnDef(); err != nil {
-			return nil, err
+		cmd.IfColumnNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
+		if cmd.Def, err = p.parseColumnDef(); err != nil {
+			return cmd, err
 		}
-		st.Action = AlterAddColumn
+		cmd.Action = AlterAddColumn
 	case p.acceptKeyword("DROP", "CONSTRAINT"):
-		st.IfConstraintExists = p.acceptKeyword("IF", "EXISTS")
-		if st.Constraint, err = p.parseIdent(); err != nil {
-			return nil, err
+		cmd.IfConstraintExists = p.acceptKeyword("IF", "EXISTS")
+		if cmd.Constraint, err = p.parseIdent(); err != nil {
+			return cmd, err
 		}
 		p.parseDropBehavior()
-		st.Action = AlterDropConstraint
+		cmd.Action = AlterDropConstraint
 	case p.acceptKeyword("DROP"):
 		p.acceptKeyword("COLUMN")
-		st.IfColumnExists = p.acceptKeyword("IF", "EXISTS")
-		if st.Column, err = p.parseIdent(); err != nil {
-			return nil, err
+		cmd.IfColumnExists = p.acceptKeyword("IF", "EXISTS")
+		if cmd.Column, err = p.parseIdent(); err != nil {
+			return cmd, err
 		}
 		p.parseDropBehavior()
-		st.Action = AlterDropColumn
+		cmd.Action = AlterDropColumn
 	case p.acceptKeyword("ALTER"):
 		p.acceptKeyword("COLUMN")
-		if st.Column, err = p.parseIdent(); err != nil {
-			return nil, err
+		if cmd.Column, err = p.parseIdent(); err != nil {
+			return cmd, err
 		}
 		switch {
 		case p.acceptKeyword("SET", "DEFAULT"):
-			if st.Def.Default, st.Def.DefaultText, err = p.parseDefault(); err != nil {
-				return nil, err
+			if cmd.Def.Default, cmd.Def.DefaultText, err = p.parseDefault(); err != nil {
+				return cmd, err
 			}
-			st.Action = AlterSetDefault
+			cmd.Action = AlterSetDefault
 		case p.acceptKeyword("DROP", "DEFAULT"):
-			st.Action = AlterDropDefault
+			cmd.Action = AlterDropDefault
 		default:
-			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER COLUMN action near %q (supported: SET DEFAULT, DROP DEFAULT)", p.peek().text)}
+			return cmd, &sqlError{msg: fmt.Sprintf("unsupported ALTER COLUMN action near %q (supported: SET DEFAULT, DROP DEFAULT)", p.peek().text)}
 		}
 	default:
-		if st.View {
-			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER VIEW action near %q (supported: RENAME TO)", p.peek().text)}
+		if view {
+			return cmd, &sqlError{msg: fmt.Sprintf("unsupported ALTER VIEW action near %q (supported: RENAME TO)", p.peek().text)}
 		}
-		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN, ALTER COLUMN, ADD CONSTRAINT, DROP CONSTRAINT)", p.peek().text)}
+		return cmd, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN, ALTER COLUMN, ADD CONSTRAINT, DROP CONSTRAINT)", p.peek().text)}
 	}
-	if st.View && st.Action != AlterRenameTable {
-		return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
-	}
-	return st, nil
+	return cmd, nil
 }
 
 // skipBalanced skips tokens up to the next top-level ',' or ')', or with

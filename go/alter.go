@@ -18,7 +18,9 @@ package redis
 //
 // Every change is a metadata update (WATCH/MULTI on the table's metadata key),
 // so it takes the same time at any table size (except where a CHECK
-// constraint is added, which reads the rows first):
+// constraint is added, which reads the rows first). RENAME TO and RENAME
+// COLUMN come alone; the other actions may come several to a statement,
+// comma-separated, and are then one metadata update (see alterTable):
 //
 //   - RENAME TO: the table keeps its key prefix and index (fixed at creation
 //     and reserved in a registry), so no row is touched. With the option
@@ -65,12 +67,13 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 	if err != nil {
 		return err
 	}
+	rename := len(st.Cmds) == 1 && (st.Cmds[0].Action == AlterRenameTable || st.Cmds[0].Action == AlterRenameColumn)
 	if isView {
 		// As in Postgres, ALTER TABLE … RENAME TO also renames a view.
-		if st.Action != AlterRenameTable {
+		if len(st.Cmds) != 1 || st.Cmds[0].Action != AlterRenameTable {
 			return errorf(adbc.StatusInvalidArgument, "%q.%q is a view; ALTER TABLE on a view supports only RENAME TO", displaySchema(schema), name)
 		}
-		return e.store.renameView(ctx, schema, name, st.NewTable)
+		return e.store.renameView(ctx, schema, name, st.Cmds[0].NewTable)
 	}
 	meta, err := e.store.getTable(ctx, schema, name)
 	if err != nil {
@@ -91,23 +94,14 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 	if err := e.store.checkWritable(ctx, meta); err != nil {
 		return err
 	}
-	switch st.Action {
-	case AlterRenameTable:
-		return e.renameTable(ctx, meta, st.NewTable)
-	case AlterRenameColumn:
-		return e.renameColumn(ctx, meta, st.Column, st.NewColumn)
-	case AlterAddColumn:
-		return e.addColumn(ctx, meta, st.Def, st.IfColumnNotExists)
-	case AlterDropColumn:
-		return e.dropColumn(ctx, meta, st.Column, st.IfColumnExists)
-	case AlterSetDefault, AlterDropDefault:
-		return e.setDefault(ctx, meta, st.Column, st.Def)
-	case AlterAddConstraint:
-		return e.addConstraint(ctx, meta, st.Check)
-	case AlterDropConstraint:
-		return e.dropConstraint(ctx, meta, st.Constraint, st.IfConstraintExists)
+	if rename {
+		cmd := st.Cmds[0]
+		if cmd.Action == AlterRenameTable {
+			return e.renameTable(ctx, meta, cmd.NewTable)
+		}
+		return e.renameColumn(ctx, meta, cmd.Column, cmd.NewColumn)
 	}
-	return errorf(adbc.StatusNotImplemented, "unsupported ALTER TABLE action")
+	return e.alterTable(ctx, meta, st.Cmds)
 }
 
 func checkColumnName(name string) error {
@@ -235,8 +229,9 @@ func (e *executor) renameColumn(ctx context.Context, meta *tableMeta, from, to s
 }
 
 // freeField returns a HASH field name for a new column that no current,
-// retired, or pending-cleanup field uses.
-func freeField(m *tableMeta, name string) string {
+// retired, or pending-cleanup field uses, nor an index attribute in taken
+// (lower-cased; see alterTable).
+func freeField(m *tableMeta, name string, taken map[string]bool) string {
 	used := map[string]bool{}
 	for _, c := range m.Columns {
 		used[strings.ToLower(c.field())] = true
@@ -245,27 +240,229 @@ func freeField(m *tableMeta, name string) string {
 		used[strings.ToLower(f)] = true
 	}
 	cand := name
-	for n := 2; used[strings.ToLower(cand)] || cand == rowIDField; n++ {
+	for n := 2; used[strings.ToLower(cand)] || taken[strings.ToLower(cand)] || cand == rowIDField; n++ {
 		cand = fmt.Sprintf("%s_%d", name, n)
 	}
 	return cand
 }
 
-func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef, ifNotExists bool) error {
+// ---- ADD / DROP COLUMN, ALTER COLUMN … DEFAULT, ADD / DROP CONSTRAINT ----
+
+// alterResult is what applying the actions of an ALTER TABLE (other than
+// RENAME) to a table's metadata did.
+type alterResult struct {
+	// added are the columns added (and not dropped again), with the
+	// missing value they get, for the index and the row checks.
+	added []addedColumn
+	// checks are the CHECK constraints added that are still there at the
+	// end; existing rows must pass them.
+	checks []checkMeta
+	// dropped is set when a column of the table was dropped, so its field
+	// must be removed from the rows.
+	dropped bool
+	// trace is each action's resolved effect, so that the actions applied
+	// again in the transaction that commits them (to the metadata as it is
+	// then) can be compared with what was planned, checked and indexed.
+	trace []string
+}
+
+// addedColumn is a column added by ALTER TABLE. missing says the existing
+// rows read Missing (a non-NULL DEFAULT, whose encoding may be "").
+type addedColumn struct {
+	columnMeta
+	missing bool
+}
+
+func (r *alterResult) log(format string, args ...any) {
+	r.trace = append(r.trace, fmt.Sprintf(format, args...))
+}
+
+// addedValues returns the value every existing row reads for each added
+// column, by name: its missing value, or NULL.
+func (r *alterResult) addedValues() (map[string]Value, error) {
+	out := make(map[string]Value, len(r.added))
+	for _, c := range r.added {
+		v := nullValue(c.Type)
+		if c.missing {
+			var err error
+			if v, err = decodeStored(c.Missing, c.Type); err != nil {
+				return nil, err
+			}
+		}
+		out[c.Name] = v
+	}
+	return out, nil
+}
+
+// cloneMeta copies the parts of a table's metadata that ALTER TABLE changes.
+func cloneMeta(m *tableMeta) *tableMeta {
+	c := *m
+	c.Columns = slices.Clone(m.Columns)
+	c.RetiredFields = slices.Clone(m.RetiredFields)
+	c.PendingCleanup = slices.Clone(m.PendingCleanup)
+	c.Checks = slices.Clone(m.Checks)
+	return &c
+}
+
+// alterTable runs the actions of an ALTER TABLE other than RENAME, one or
+// several, as one change of the table's metadata:
+//
+//  1. Plan: the actions are applied in the order written to a copy of the
+//     metadata as read (applyAlter), each seeing what the ones before it
+//     did. Every error in a definition (a column that exists or doesn't, a
+//     DEFAULT or CHECK that isn't valid) is found here.
+//  2. The existing rows are checked against the new CHECK constraints, in
+//     one scan, as the table will be after the change.
+//  3. The new indexed columns are added to the search index, in one FT.ALTER
+//     (which adds all of them or none).
+//  4. Commit: in one WATCH/MULTI on the metadata (and on the row id counter
+//     if a column gets a missing value), the actions are applied again to
+//     the metadata as it is then, and the result written if they did the
+//     same as planned; otherwise the statement fails ("try again").
+//  5. The fields of dropped columns are removed from the rows in the
+//     background, as for a single DROP COLUMN.
+//
+// So an action that fails leaves the table as it was: metadata, index and
+// rows. Nothing writes rows before the commit. If the commit itself fails
+// (a concurrent change, or a lost connection), the attributes step 3 added
+// stay in the index unused, which is harmless: no column reads them, and a
+// later ADD COLUMN doesn't reuse their names.
+func (e *executor) alterTable(ctx context.Context, meta *tableMeta, cmds []AlterCmd) error {
+	// Index attributes that no column uses (left by a commit that failed)
+	// can't be added again, so new columns don't take their names.
+	var taken map[string]bool
+	if slices.ContainsFunc(cmds, func(c AlterCmd) bool { return c.Action == AlterAddColumn }) {
+		var err error
+		if taken, err = e.store.indexAttributes(ctx, meta.index()); err != nil {
+			return err
+		}
+	}
+	plan := cloneMeta(meta)
+	res, err := e.applyAlter(ctx, plan, cmds, taken)
+	if err != nil {
+		return err
+	}
+	if len(res.checks) > 0 {
+		added, err := res.addedValues()
+		if err != nil {
+			return err
+		}
+		if err := e.validateChecks(ctx, meta, plan, res.checks, added); err != nil {
+			return err
+		}
+	}
+	args := []any{"FT.ALTER", meta.index(), "SCHEMA", "ADD"}
+	n := 0
+	for _, c := range res.added {
+		if c.Indexed {
+			args = append(args, indexAttrArgs(c.columnMeta)...)
+			n++
+		}
+	}
+	if n > 0 {
+		what := "the column"
+		if n > 1 {
+			what = "the columns"
+		}
+		if err := e.store.searchDo(ctx, meta.index(), args...).Err(); err != nil {
+			return wrapRedis(err, "failed to add "+what+" to the search index")
+		}
+	}
+	// The rows that exist when a column with a missing value is added, those
+	// with ids up to the last one allocated, read it (see defaults.go).
+	withMissing := slices.ContainsFunc(res.added, func(c addedColumn) bool { return c.missing })
+	err = e.store.updateTableTx(ctx, meta.Schema, meta.Name, withMissing, func(m *tableMeta, lastRowID int64) error {
+		cur := cloneMeta(m)
+		again, err := e.applyAlter(ctx, m, cmds, taken)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(again.trace, res.trace) || !sameChecksColumns(meta, cur, res.checks) {
+			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
+		}
+		for _, a := range again.added {
+			if !a.missing {
+				continue
+			}
+			i := slices.IndexFunc(m.Columns, func(c columnMeta) bool { return c.field() == a.field() })
+			if lastRowID == 0 {
+				m.Columns[i].Missing = ""
+			} else {
+				m.Columns[i].MissingThrough = lastRowID
+			}
+		}
+		return nil
+	}, func(p goredis.Pipeliner) {
+		if res.dropped {
+			p.SAdd(ctx, cleanupKey, cleanupMember(meta.Schema, meta.Name))
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if res.dropped {
+		e.store.startCleanup(meta.Schema, meta.Name)
+	}
+	return nil
+}
+
+// applyAlter applies ALTER TABLE actions (not RENAME) to m in order. It
+// reads nothing from Redis: alterTable runs it on the metadata as read, and
+// again on the metadata as it is when the change commits. taken are index
+// attributes that new columns must not use as their field.
+func (e *executor) applyAlter(ctx context.Context, m *tableMeta, cmds []AlterCmd, taken map[string]bool) (*alterResult, error) {
+	res := &alterResult{}
+	had := len(m.Columns)
+	for _, cmd := range cmds {
+		var err error
+		switch cmd.Action {
+		case AlterAddColumn:
+			err = e.alterAddColumn(ctx, m, cmd, taken, res)
+		case AlterDropColumn:
+			err = alterDropColumn(m, cmd, res)
+		case AlterSetDefault, AlterDropDefault:
+			err = e.alterDefault(ctx, m, cmd, res)
+		case AlterAddConstraint:
+			err = e.alterAddConstraint(ctx, m, cmd.Check, res)
+		case AlterDropConstraint:
+			err = alterDropConstraint(m, cmd, res)
+		default:
+			err = errorf(adbc.StatusNotImplemented, "unsupported ALTER TABLE action")
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Checked at the end, so that DROP COLUMN a, ADD COLUMN b works on a
+	// table whose only column is a.
+	if len(m.Columns) == 0 {
+		if had == 1 {
+			return nil, errorf(adbc.StatusInvalidArgument, "cannot drop the only column of table %q", m.Name)
+		}
+		return nil, errorf(adbc.StatusInvalidArgument, "cannot drop all the columns of table %q", m.Name)
+	}
+	return res, nil
+}
+
+// alterAddColumn applies ADD COLUMN. The column gets a HASH field no
+// current or dropped column has used. With a DEFAULT, existing rows read the
+// default as it is now, recorded as the column's missing value (see
+// defaults.go), so it must be the same for all of them.
+func (e *executor) alterAddColumn(ctx context.Context, m *tableMeta, cmd AlterCmd, taken map[string]bool, res *alterResult) error {
+	def := cmd.Def
 	if err := checkColumnName(def.Name); err != nil {
 		return err
 	}
-	if _, ok := meta.resolve(def.Name); ok {
-		if ifNotExists {
+	if _, ok := m.resolve(def.Name); ok {
+		if cmd.IfColumnNotExists {
+			res.log("add %q: exists", def.Name)
 			return nil
 		}
-		return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", def.Name, meta.Name)
+		return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", def.Name, m.Name)
 	}
 	col := columnMeta{Name: def.Name, Type: def.Type, Nullable: !def.NotNull, Comment: def.Comment}
 	missing := false
 	if def.Default != nil {
-		// Existing rows read the default as it is now, so it must be the
-		// same for all of them.
 		if hasVolatile(def.Default) {
 			return errorf(adbc.StatusNotImplemented, "ADD COLUMN with a volatile DEFAULT is not supported: existing rows would each need their own value")
 		}
@@ -281,31 +478,11 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 	if def.NotNull && !missing {
 		return errorf(adbc.StatusNotImplemented, "cannot add a NOT NULL column without a non-NULL DEFAULT: existing rows would have no value")
 	}
-	if f := freeField(meta, def.Name); f != def.Name {
+	if f := freeField(m, def.Name, taken); f != def.Name {
 		col.Field = f
 	}
-	// CHECK constraints are defined on the table with the new column, and
-	// the existing rows, which read its missing value, must pass them.
-	with := *meta
-	with.Columns = append(slices.Clone(meta.Columns), col)
-	var checks []checkMeta
-	if len(def.Checks) > 0 {
-		var err error
-		if checks, err = e.defineChecks(ctx, &with, def.Checks); err != nil {
-			return err
-		}
-		v := nullValue(col.Type)
-		if missing {
-			if v, err = decodeStored(col.Missing, col.Type); err != nil {
-				return err
-			}
-		}
-		if err := e.validateChecks(ctx, meta, &with, checks, col.Name, v); err != nil {
-			return err
-		}
-	}
 	indexed := 0
-	for _, c := range meta.Columns {
+	for _, c := range m.Columns {
 		if c.Indexed {
 			indexed++
 		}
@@ -317,104 +494,157 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 	if col.TagsChecked {
 		col.TagValues = tagLevelOf(col.Missing)
 	}
-	if col.Indexed {
-		// Add the attribute first: an unused attribute is harmless if the
-		// metadata update below fails.
-		args := append([]any{"FT.ALTER", meta.index(), "SCHEMA", "ADD"}, indexAttrArgs(col)...)
-		if err := e.store.searchDo(ctx, meta.index(), args...).Err(); err != nil {
-			return wrapRedis(err, "failed to add the column to the search index")
+	m.Columns = append(m.Columns, col)
+	res.added = append(res.added, addedColumn{col, missing})
+	res.log("add %q field %q type %s indexed %v missing %v %q default %q", col.Name, col.field(), col.Type.SQLName(), col.Indexed, missing, col.Missing, col.Default)
+	// The column's CHECK constraints are defined on the table with it, and
+	// the existing rows read its missing value.
+	if len(def.Checks) > 0 {
+		checks, err := e.defineChecks(ctx, m, def.Checks)
+		if err != nil {
+			return err
 		}
+		res.addChecks(m, checks)
 	}
-	add := func(m *tableMeta, lastRowID int64) error {
-		if _, ok := m.resolve(def.Name); ok {
-			if ifNotExists {
-				return nil
-			}
-			return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", def.Name, m.Name)
-		}
-		if freeField(m, col.field()) != col.field() {
-			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
-		}
-		c := col
-		if lastRowID == 0 {
-			c.Missing = ""
-		} else {
-			c.MissingThrough = lastRowID
-		}
-		m.Columns = append(m.Columns, c)
-		if len(checks) > 0 {
-			return addChecks(&with, m, checks)
-		}
-		return nil
-	}
-	if !missing {
-		return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error { return add(m, 0) }, nil)
-	}
-	// The rows that exist when the column is added, those with ids up to the
-	// last one allocated, read its missing value.
-	return e.store.updateTableAtRowID(ctx, meta.Schema, meta.Name, add)
+	return nil
 }
 
-// setDefault implements ALTER COLUMN … SET DEFAULT and, with no default in
-// def, DROP DEFAULT. Existing rows keep their values (and missing values).
-func (e *executor) setDefault(ctx context.Context, meta *tableMeta, column string, def ColumnDef) error {
-	i, ok := meta.resolve(column)
+// alterDropColumn applies DROP COLUMN. The column disappears from the
+// metadata; its field is retired (never reused) and removed from the rows
+// later. As in Postgres, the CHECK constraints that read it go too.
+func alterDropColumn(m *tableMeta, cmd AlterCmd, res *alterResult) error {
+	i, ok := m.resolve(cmd.Column)
 	if !ok {
-		return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", column, meta.Name)
+		if cmd.IfColumnExists {
+			res.log("drop %q: missing", cmd.Column)
+			return nil
+		}
+		return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", cmd.Column, m.Name)
 	}
-	col := meta.Columns[i]
+	c := m.Columns[i]
+	f := c.field()
+	if j := slices.IndexFunc(res.added, func(a addedColumn) bool { return a.field() == f }); j >= 0 {
+		// Added by this statement: no row has its field.
+		res.added = slices.Delete(res.added, j, j+1)
+	} else {
+		if c.MissingThrough > 0 {
+			m.PendingCleanup = append(m.PendingCleanup, nullMarker(f))
+		}
+		m.RetiredFields = append(m.RetiredFields, f)
+		m.PendingCleanup = append(m.PendingCleanup, f)
+		res.dropped = true
+	}
+	var gone []string
+	m.Checks = slices.DeleteFunc(m.Checks, func(k checkMeta) bool {
+		if !checkReads(k.Expr, c.Name) {
+			return false
+		}
+		gone = append(gone, k.Name)
+		res.dropCheck(k.Name)
+		return true
+	})
+	m.Columns = slices.Delete(m.Columns, i, i+1)
+	res.log("drop %q field %q checks %q", c.Name, f, gone)
+	return nil
+}
+
+// alterDefault applies ALTER COLUMN … SET DEFAULT and DROP DEFAULT. Only
+// rows inserted later see the change: existing rows keep their values (and
+// missing values).
+func (e *executor) alterDefault(ctx context.Context, m *tableMeta, cmd AlterCmd, res *alterResult) error {
+	i, ok := m.resolve(cmd.Column)
+	if !ok {
+		return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", cmd.Column, m.Name)
+	}
+	col := m.Columns[i]
 	text := ""
-	if def.Default != nil {
+	if cmd.Action == AlterSetDefault {
+		def := cmd.Def
 		def.Name, def.Type = col.Name, col.Type
 		var err error
 		if text, _, err = e.checkDefault(ctx, def); err != nil {
 			return err
 		}
 	}
-	return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
-		i, ok := m.resolve(column)
-		if !ok {
-			return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", column, m.Name)
-		}
-		if m.Columns[i].field() != col.field() || m.Columns[i].Type != col.Type {
-			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
-		}
-		m.Columns[i].Default = text
-		return nil
-	}, nil)
+	m.Columns[i].Default = text
+	res.log("default %q field %q: %q", col.Name, col.field(), text)
+	return nil
 }
 
-func (e *executor) dropColumn(ctx context.Context, meta *tableMeta, name string, ifExists bool) error {
-	err := e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
-		i, ok := m.resolve(name)
-		if !ok {
-			if ifExists {
-				return nil
-			}
-			return errorf(adbc.StatusNotFound, "column %q does not exist in table %q", name, m.Name)
-		}
-		if len(m.Columns) == 1 {
-			return errorf(adbc.StatusInvalidArgument, "cannot drop the only column of table %q", m.Name)
-		}
-		f := m.Columns[i].field()
-		if m.Columns[i].MissingThrough > 0 {
-			m.PendingCleanup = append(m.PendingCleanup, nullMarker(f))
-		}
-		// As in Postgres, the CHECK constraints that read the column go too.
-		dropped := m.Columns[i].Name
-		m.Checks = slices.DeleteFunc(m.Checks, func(c checkMeta) bool { return checkReads(c.Expr, dropped) })
-		m.Columns = slices.Delete(m.Columns, i, i+1)
-		m.RetiredFields = append(m.RetiredFields, f)
-		m.PendingCleanup = append(m.PendingCleanup, f)
+// alterAddConstraint applies ADD CONSTRAINT. chk is nil for the PRIMARY KEY,
+// UNIQUE and FOREIGN KEY constraints, which are accepted and ignored.
+func (e *executor) alterAddConstraint(ctx context.Context, m *tableMeta, chk *CheckDef, res *alterResult) error {
+	if chk == nil {
+		res.log("constraint ignored")
 		return nil
-	}, func(p goredis.Pipeliner) {
-		p.SAdd(ctx, cleanupKey, cleanupMember(meta.Schema, meta.Name))
-	})
+	}
+	checks, err := e.defineChecks(ctx, m, []CheckDef{*chk})
 	if err != nil {
 		return err
 	}
-	e.store.startCleanup(meta.Schema, meta.Name)
+	res.addChecks(m, checks)
 	return nil
+}
+
+// alterDropConstraint applies DROP CONSTRAINT, for CHECK constraints (the
+// only ones kept).
+func alterDropConstraint(m *tableMeta, cmd AlterCmd, res *alterResult) error {
+	i := slices.IndexFunc(m.Checks, func(c checkMeta) bool { return strings.EqualFold(c.Name, cmd.Constraint) })
+	if i < 0 {
+		if cmd.IfConstraintExists {
+			res.log("drop constraint %q: missing", cmd.Constraint)
+			return nil
+		}
+		return errorf(adbc.StatusNotFound, "constraint %q of relation %q does not exist", cmd.Constraint, m.Name)
+	}
+	name := m.Checks[i].Name
+	res.dropCheck(name)
+	m.Checks = slices.Delete(m.Checks, i, i+1)
+	res.log("drop constraint %q", name)
+	return nil
+}
+
+// addChecks adds new CHECK constraints to m and records them.
+func (r *alterResult) addChecks(m *tableMeta, checks []checkMeta) {
+	m.Checks = append(m.Checks, checks...)
+	r.checks = append(r.checks, checks...)
+	for _, c := range checks {
+		r.log("check %q: %s", c.Name, c.Expr)
+	}
+}
+
+// dropCheck forgets a constraint added by the statement that is dropped
+// again by it.
+func (r *alterResult) dropCheck(name string) {
+	r.checks = slices.DeleteFunc(r.checks, func(c checkMeta) bool { return strings.EqualFold(c.Name, name) })
+}
+
+// indexAttributes returns the names of a search index's attributes, lower
+// case.
+func (s *store) indexAttributes(ctx context.Context, index string) (map[string]bool, error) {
+	reply, err := s.searchDo(ctx, index, "FT.INFO", index).Result()
+	if err != nil {
+		return nil, wrapRedis(err, "failed to read the search index")
+	}
+	out := map[string]bool{}
+	info, _ := reply.([]any)
+	for i := 0; i+1 < len(info); i += 2 {
+		if k, _ := info[i].(string); k != "attributes" {
+			continue
+		}
+		attrs, _ := info[i+1].([]any)
+		for _, a := range attrs {
+			parts, _ := a.([]any)
+			for j := 0; j+1 < len(parts); j += 2 {
+				if k, _ := parts[j].(string); k == "identifier" {
+					if name, ok := parts[j+1].(string); ok {
+						out[strings.ToLower(name)] = true
+					}
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // ---- background cleanup of dropped columns ----

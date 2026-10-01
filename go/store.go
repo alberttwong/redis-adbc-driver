@@ -362,38 +362,50 @@ func (s *store) ensureRegistry(ctx context.Context) error {
 // (WATCH/MULTI); extra adds commands to the same transaction.
 func (s *store) updateTable(ctx context.Context, schema, table string, fn func(*tableMeta) error,
 	extra func(goredis.Pipeliner)) error {
-	key := metaKey(schema, table)
+	return s.updateTableTx(ctx, schema, table, false, func(m *tableMeta, _ int64) error { return fn(m) }, extra)
+}
+
+// updateTableTx is updateTable for a change that may depend on the table's
+// row id high-water mark: with atRowID, fn gets the last row id allocated
+// (0 if none), and the change only commits if no row ids were allocated
+// meanwhile. Without it, fn gets 0.
+func (s *store) updateTableTx(ctx context.Context, schema, table string, atRowID bool,
+	fn func(m *tableMeta, lastRowID int64) error, extra func(goredis.Pipeliner)) error {
+	key, seq := metaKey(schema, table), seqKey(schema, table)
+	watch := []string{key}
+	if atRowID {
+		watch = append(watch, seq)
+	}
 	for attempt := 0; attempt < 20; attempt++ {
 		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
-			raw, err := tx.Get(ctx, key).Result()
-			if errors.Is(err, goredis.Nil) {
-				return tableNotFound(schema, table)
-			}
+			m, err := s.getTableWith(ctx, tx, schema, table)
 			if err != nil {
 				return err
 			}
-			var meta tableMeta
-			if err := json.Unmarshal([]byte(raw), &meta); err != nil {
-				return errorf(adbc.StatusInternal, "corrupt metadata for table %q.%q: %v", schema, table, err)
+			var last int64
+			if atRowID {
+				if last, err = tx.Get(ctx, seq).Int64(); err != nil && !errors.Is(err, goredis.Nil) {
+					return err
+				}
 			}
-			if err := fn(&meta); err != nil {
+			if err := fn(m, last); err != nil {
 				return err
 			}
-			out, err := json.Marshal(&meta)
+			raw, err := marshalMeta(m)
 			if err != nil {
 				return err
 			}
 			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
-				p.Set(ctx, key, out, 0)
+				p.Set(ctx, key, raw, 0)
 				if extra != nil {
 					extra(p)
 				}
 				return nil
 			})
 			return err
-		}, key)
+		}, watch...)
 		if errors.Is(err, goredis.TxFailedErr) {
-			continue // concurrent change: retry
+			continue // concurrent change (or insert): retry
 		}
 		return wrapRedis(err, "failed to update table metadata")
 	}

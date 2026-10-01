@@ -30,8 +30,9 @@ import (
 type connectionImpl struct {
 	driverbase.ConnectionImplBase
 
-	store    *store
-	schema   string
+	store *store
+	// sess holds the settings: the current schema, and what SET changes.
+	sess     *session
 	pushdown string
 	version  string
 	// rekey is adbc.redis.rename_rekey (from the database unless set on the
@@ -40,7 +41,7 @@ type connectionImpl struct {
 }
 
 func (c *connectionImpl) executor() *executor {
-	return &executor{store: c.store, schema: c.schema, pushdown: c.pushdown, rekey: c.rekey}
+	return &executor{store: c.store, sess: c.sess, schema: c.sess.currentSchema(), pushdown: c.pushdown, rekey: c.rekey}
 }
 
 func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
@@ -116,7 +117,7 @@ func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) 
 }
 
 func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
-	return c.schema, nil
+	return c.sess.currentSchema(), nil
 }
 
 func (c *connectionImpl) SetCurrentCatalog(ctx context.Context, catalog string) error {
@@ -134,7 +135,7 @@ func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, schema string) 
 	if !ok {
 		return errorf(adbc.StatusNotFound, "schema %q does not exist", schema)
 	}
-	c.schema = schema
+	c.sess.setSchema(schema)
 	return nil
 }
 
