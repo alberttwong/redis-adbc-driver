@@ -53,7 +53,9 @@ var scalarArity = map[string][2]int{
 	"TRIM": {1, 2}, "BTRIM": {1, 2}, "LTRIM": {1, 2}, "RTRIM": {1, 2},
 	"POSITION": {2, 2}, "STRPOS": {2, 2}, "SPLIT_PART": {3, 3}, "LPAD": {2, 3}, "RPAD": {2, 3},
 	"REVERSE": {1, 1}, "REPEAT": {2, 2}, "INITCAP": {1, 1}, "MD5": {1, 1},
-	"REGEXP_REPLACE": {3, 4}, "STARTS_WITH": {2, 2},
+	"REGEXP_REPLACE": {3, 6}, "STARTS_WITH": {2, 2},
+	"REGEXP_LIKE": {2, 3}, "REGEXP_COUNT": {2, 4}, "REGEXP_INSTR": {2, 7}, "REGEXP_SUBSTR": {2, 6},
+	"REGEXP_MATCH": {2, 3}, "~": {2, 2}, "~*": {2, 2}, "SIMILAR TO": {2, 3},
 
 	"NULLIF": {2, 2}, "GREATEST": {1, -1}, "LEAST": {1, -1}, "IIF": {3, 3},
 }
@@ -87,6 +89,8 @@ func checkArity(f *Func) error {
 		return fmt.Errorf("%s expects at least %d argument(s)", f.Name, a[0])
 	case a[0] == a[1] && n != a[0]:
 		return fmt.Errorf("%s expects %d argument(s)", f.Name, a[0])
+	case a[1] > a[0]+1 && (n < a[0] || n > a[1]):
+		return fmt.Errorf("%s expects %d to %d arguments", f.Name, a[0], a[1])
 	case n < a[0] || (a[1] >= 0 && n > a[1]):
 		return fmt.Errorf("%s expects %d or %d arguments", f.Name, a[0], a[1])
 	}
@@ -133,6 +137,12 @@ func scalarFuncType(f *Func, args []ColType) (ColType, bool) {
 		return typeInt64, true
 	case "STARTS_WITH":
 		return typeBool, true
+	case "~", "~*", "SIMILAR TO", "REGEXP_LIKE":
+		return typeBool, true
+	case "REGEXP_COUNT", "REGEXP_INSTR":
+		return typeInt64, true
+	case "REGEXP_SUBSTR", "REGEXP_MATCH":
+		return typeString, true
 	case "NULLIF":
 		if arg(0).Kind == KindNull {
 			return arg(1), true
@@ -382,6 +392,16 @@ func scalarFunc(f *Func, args []Value) (Value, error) {
 
 	// ---- strings ----
 	case "SUBSTRING", "SUBSTR":
+		// As in Postgres, text arguments make SUBSTRING a pattern match:
+		// SUBSTRING(s FROM pattern) and SUBSTRING(s SIMILAR pattern ESCAPE e).
+		if f.Name == "SUBSTRING" && args[0].T.Kind != KindBinary && args[1].T.Kind == KindString {
+			switch {
+			case len(args) == 2:
+				return regexpSubstring(text(0), text(1))
+			case args[2].T.Kind == KindString:
+				return similarSubstring(text(0), text(1), text(2))
+			}
+		}
 		start, err := intArg(f.Name, "start position", args[1])
 		if err != nil {
 			return Value{}, err
@@ -504,17 +524,11 @@ func scalarFunc(f *Func, args []Value) (Value, error) {
 		sum := md5.Sum([]byte(text(0)))
 		return stringValue(hex.EncodeToString(sum[:])), nil
 	case "REGEXP_REPLACE":
-		flags := ""
-		if len(args) == 4 {
-			flags = text(3)
-		}
-		s, err := regexpReplace(text(0), text(1), text(2), flags)
-		if err != nil {
-			return Value{}, err
-		}
-		return stringValue(s), nil
+		return regexpReplaceFunc(args)
 	case "STARTS_WITH":
 		return boolValue(strings.HasPrefix(text(0), text(1))), nil
+	case "~", "~*", "SIMILAR TO", "REGEXP_LIKE", "REGEXP_COUNT", "REGEXP_INSTR", "REGEXP_SUBSTR", "REGEXP_MATCH":
+		return regexpFunc(f, args)
 	}
 	return Value{}, fmt.Errorf("unsupported function %s", f.Name)
 }
@@ -879,64 +893,75 @@ func compileRegexp(expr string) (*regexp.Regexp, error) {
 	return re, nil
 }
 
-// regexpReplace implements REGEXP_REPLACE(s, pattern, replacement [, flags])
-// with Postgres's flags and replacement syntax: only the first match is
-// replaced unless the flags contain 'g', and \1 … \9 and \& in the
-// replacement insert the groups and the whole match. Patterns use RE2
-// syntax (no backreferences or lookaround).
-func regexpReplace(s, pattern, repl, flags string) (string, error) {
-	global, caseInsensitive, literal := false, false, false
-	dotNL, multiLine := true, false // Postgres: '.' matches newlines; ^ and $ anchor the string
+// regexpFlags are the options of a regular expression, from the flags
+// argument of the REGEXP_* functions.
+type regexpFlags struct {
+	global          bool // g: every match
+	caseInsensitive bool // i
+	literal         bool // q: the pattern is a literal string
+	dotNL           bool // '.' matches a newline
+	multiLine       bool // ^ and $ also match at line breaks
+}
+
+// parseRegexpFlags reads a flags argument with Postgres's meanings. Without
+// flags, '.' matches newlines and ^ and $ anchor the whole string.
+func parseRegexpFlags(name, flags string) (regexpFlags, error) {
+	fl := regexpFlags{dotNL: true}
 	for _, c := range flags {
 		switch c {
 		case 'g':
-			global = true
+			fl.global = true
 		case 'i':
-			caseInsensitive = true
+			fl.caseInsensitive = true
 		case 'c':
-			caseInsensitive = false
+			fl.caseInsensitive = false
 		case 'n', 'm':
-			dotNL, multiLine = false, true
+			fl.dotNL, fl.multiLine = false, true
 		case 's':
-			dotNL, multiLine = true, false
+			fl.dotNL, fl.multiLine = true, false
 		case 'p':
-			dotNL, multiLine = false, false
+			fl.dotNL, fl.multiLine = false, false
 		case 'w':
-			dotNL, multiLine = true, true
+			fl.dotNL, fl.multiLine = true, true
 		case 'q':
-			literal = true
+			fl.literal = true
 		case 't':
 		case 'x', 'b', 'e':
-			return "", fmt.Errorf("REGEXP_REPLACE: regular expression option %q is not supported", string(c))
+			return fl, fmt.Errorf("%s: regular expression option %q is not supported", name, string(c))
 		default:
-			return "", fmt.Errorf("REGEXP_REPLACE: invalid regular expression option %q", string(c))
+			return fl, fmt.Errorf("%s: invalid regular expression option %q", name, string(c))
 		}
 	}
-	if literal {
-		pattern = regexp.QuoteMeta(pattern)
-	}
-	var prefix string
-	if caseInsensitive {
-		prefix += "i"
-	}
-	if dotNL {
-		prefix += "s"
-	}
-	if multiLine {
-		prefix += "m"
-	}
-	if prefix != "" {
-		pattern = "(?" + prefix + ")" + pattern
-	}
-	re, err := compileRegexp(pattern)
+	return fl, nil
+}
+
+// regexpReplace implements REGEXP_REPLACE with Postgres's flags and
+// replacement syntax: the n-th match at or after byte offset from is
+// replaced, or every one of them if n is 0, and \1 … \9 and \& in the
+// replacement insert the groups and the whole match. Patterns use RE2
+// syntax (no backreferences or lookaround).
+func regexpReplace(s, pattern, repl string, fl regexpFlags, from int, n int64) (string, error) {
+	rs, err := compilePattern("REGEXP_REPLACE", pattern, fl)
 	if err != nil {
-		return "", fmt.Errorf("REGEXP_REPLACE: invalid regular expression: %v", err)
+		return "", err
 	}
-	var matches [][]int
-	if global {
-		matches = re.FindAllStringSubmatchIndex(s, -1)
-	} else if m := re.FindStringSubmatchIndex(s); m != nil {
-		matches = [][]int{m}
+	if from < 0 {
+		return s, nil
+	}
+	limit := -1
+	if n > 0 {
+		// There are at most len(s)+1 matches.
+		limit = int(min(n, int64(len(s))+2))
+	}
+	matches, err := rs.all(s, from, limit)
+	if err != nil {
+		return "", err
+	}
+	if n > 0 {
+		if int64(len(matches)) < n {
+			return s, nil
+		}
+		matches = matches[n-1:]
 	}
 	if len(matches) == 0 {
 		return s, nil

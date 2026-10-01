@@ -391,7 +391,7 @@ func TestScalarErrors(t *testing.T) {
 		{"ROUND(DATE '2024-01-01')", "ROUND expects a number, got DATE"},
 		{"ROUND(1.5, 'x')", "ROUND: the number of decimal places must be an integer"},
 		{"SUBSTRING('abc', 1, -1)", "SUBSTRING: negative substring length not allowed"},
-		{"SUBSTRING('abc', 'x')", "SUBSTRING: the start position must be an integer"},
+		{"SUBSTRING('abc', TRUE)", "SUBSTRING: the start position must be an integer"},
 		{"SPLIT_PART('a,b', ',', 0)", "SPLIT_PART: field position must not be zero"},
 		{"LPAD('x', 100000000)", "LPAD: requested length too large"},
 		{"REPEAT('ab', 100000000)", "REPEAT: requested length too large"},

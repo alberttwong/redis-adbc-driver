@@ -637,6 +637,17 @@ func lex(src string) ([]token, error) {
 				break
 			}
 			toks = append(toks, token{kind: tokIdent, text: src[start:i], pos: start, end: i})
+		case c == '~' || (c == '!' && i+1 < len(src) && src[i+1] == '~'):
+			// The regular-expression match operators ~, ~*, !~ and !~*.
+			start := i
+			if c == '!' {
+				i++
+			}
+			i++
+			if i < len(src) && src[i] == '*' {
+				i++
+			}
+			toks = append(toks, token{kind: tokOp, text: src[start:i], pos: start, end: i})
 		default:
 			ops := []string{"<>", "!=", "<=", ">=", "||", "::", "==", "(", ")", ",", ";", "*", "+", "-", "/", "%", "=", "<", ">", "."}
 			matched := false
@@ -2365,7 +2376,7 @@ func (p *parser) parseNot() (Expr, error) {
 }
 
 func (p *parser) parseComparison() (Expr, error) {
-	l, err := p.parseAdditive()
+	l, err := p.parseOtherOp()
 	if err != nil {
 		return nil, err
 	}
@@ -2375,7 +2386,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			switch t.text {
 			case "=", "==", "<>", "!=", "<", "<=", ">", ">=":
 				p.pos++
-				r, err := p.parseAdditive()
+				r, err := p.parseOtherOp()
 				if err != nil {
 					return nil, err
 				}
@@ -2407,13 +2418,36 @@ func (p *parser) parseComparison() (Expr, error) {
 			} else {
 				p.acceptKeyword("LIKE")
 			}
-			pat, err := p.parseAdditive()
+			pat, err := p.parseOtherOp()
 			if err != nil {
 				return nil, err
 			}
 			f := &Func{Name: name, Args: []Expr{l, pat}}
 			if p.acceptKeyword("ESCAPE") {
-				esc, err := p.parseAdditive()
+				esc, err := p.parseOtherOp()
+				if err != nil {
+					return nil, err
+				}
+				f.Args = append(f.Args, esc)
+			}
+			l = f
+			if not {
+				l = &Unary{Op: "NOT", X: f}
+			}
+			continue
+		}
+		if (p.isKeyword("SIMILAR") && p.isKeywordAt(1, "TO")) ||
+			(p.isKeyword("NOT") && p.isKeywordAt(1, "SIMILAR") && p.isKeywordAt(2, "TO")) {
+			// [NOT] SIMILAR TO pattern [ESCAPE e]
+			not := p.acceptKeyword("NOT")
+			p.pos += 2
+			pat, err := p.parseOtherOp()
+			if err != nil {
+				return nil, err
+			}
+			f := &Func{Name: "SIMILAR TO", Args: []Expr{l, pat}}
+			if p.acceptKeyword("ESCAPE") {
+				esc, err := p.parseOtherOp()
 				if err != nil {
 					return nil, err
 				}
@@ -2428,14 +2462,14 @@ func (p *parser) parseComparison() (Expr, error) {
 		if p.isKeyword("BETWEEN") || (p.isKeyword("NOT") && p.isKeywordAt(1, "BETWEEN")) {
 			not := p.acceptKeyword("NOT")
 			p.acceptKeyword("BETWEEN")
-			lo, err := p.parseAdditive()
+			lo, err := p.parseOtherOp()
 			if err != nil {
 				return nil, err
 			}
 			if err := p.expectKeyword("AND"); err != nil {
 				return nil, err
 			}
-			hi, err := p.parseAdditive()
+			hi, err := p.parseOtherOp()
 			if err != nil {
 				return nil, err
 			}
@@ -2489,6 +2523,38 @@ func (p *parser) parseComparison() (Expr, error) {
 	}
 }
 
+// parseOtherOp parses the operators Postgres puts at its "any other
+// operator" precedence: || and the regular-expression matches ~, ~*, !~ and
+// !~*, left to right. They bind tighter than comparisons, IS, LIKE, BETWEEN
+// and IN, and looser than arithmetic: `s ~ 'a' || 'b'` is (s ~ 'a') || 'b',
+// and 'n=' || 1 + 1 is 'n=2'. `x ~ p` is the function "~" (case-sensitive),
+// `x ~* p` is "~*", and the negated forms are NOT around them.
+func (p *parser) parseOtherOp() (Expr, error) {
+	l, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		t := p.peek()
+		if t.kind != tokOp || (t.text != "||" && t.text != "~" && t.text != "~*" && t.text != "!~" && t.text != "!~*") {
+			return l, nil
+		}
+		p.pos++
+		r, err := p.parseAdditive()
+		if err != nil {
+			return nil, err
+		}
+		if t.text == "||" {
+			l = &Binary{Op: "||", L: l, R: r}
+			continue
+		}
+		l = &Func{Name: strings.TrimPrefix(t.text, "!"), Args: []Expr{l, r}}
+		if strings.HasPrefix(t.text, "!") {
+			l = &Unary{Op: "NOT", X: l}
+		}
+	}
+}
+
 func (p *parser) parseAdditive() (Expr, error) {
 	l, err := p.parseMultiplicative()
 	if err != nil {
@@ -2496,7 +2562,7 @@ func (p *parser) parseAdditive() (Expr, error) {
 	}
 	for {
 		switch {
-		case p.isOp("+"), p.isOp("-"), p.isOp("||"):
+		case p.isOp("+"), p.isOp("-"):
 			op := p.next().text
 			r, err := p.parseMultiplicative()
 			if err != nil {
@@ -2827,11 +2893,31 @@ func (p *parser) finishCall(name string, first Expr) (Expr, error) {
 }
 
 // parseSubstring parses what follows `SUBSTRING(`: either an argument list
-// or the SQL-standard `s FROM start [FOR count]` / `s FOR count`.
+// or the SQL-standard `s FROM start [FOR count]` / `s FOR count`, or
+// `s SIMILAR pattern ESCAPE e`. As in Postgres, the last is SUBSTRING(s,
+// pattern, e), and the argument types decide which form runs (text
+// arguments for FROM … FOR … also mean a SIMILAR TO pattern and escape).
 func (p *parser) parseSubstring() (Expr, error) {
 	s, err := p.parseExpr()
 	if err != nil {
 		return nil, err
+	}
+	if p.acceptKeyword("SIMILAR") {
+		pat, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("ESCAPE"); err != nil {
+			return nil, err
+		}
+		esc, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return &Func{Name: "SUBSTRING", Args: []Expr{s, pat, esc}}, nil
 	}
 	if !p.isKeyword("FROM") && !p.isKeyword("FOR") {
 		return p.finishCall("SUBSTRING", s)
@@ -2860,14 +2946,14 @@ func (p *parser) parseSubstring() (Expr, error) {
 // The operands cannot contain comparisons, so that IN is not read as the
 // IN operator.
 func (p *parser) parsePosition() (Expr, error) {
-	sub, err := p.parseAdditive()
+	sub, err := p.parseOtherOp()
 	if err != nil {
 		return nil, err
 	}
 	if !p.acceptKeyword("IN") {
 		return p.finishCall("POSITION", sub)
 	}
-	s, err := p.parseAdditive()
+	s, err := p.parseOtherOp()
 	if err != nil {
 		return nil, err
 	}

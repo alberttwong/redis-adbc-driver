@@ -315,6 +315,13 @@ FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_posi
 -- LIKE; a prefix pattern on an indexed column is an index prefix query
 SELECT COUNT(*) FROM sales WHERE product LIKE 'gi%';
 
+-- Regular expressions (RE2 syntax) and SIMILAR TO run in the driver, on the
+-- rows the rest of the WHERE clause finds in the index
+SELECT name, REGEXP_SUBSTR(email, '([0-9]+)@', 1, 1, '', 1) AS num, SUBSTRING(email FROM '@(.*)$') AS domain
+FROM customers WHERE email ~ '^customer[0-9]@' ORDER BY customer_id LIMIT 3;
+SELECT product, COUNT(*) AS orders FROM sales
+WHERE country = 'JPN' AND product SIMILAR TO 'g(adget|izmo)' GROUP BY product ORDER BY product;
+
 -- IN lists, dates
 SELECT name, country, signup_date
 FROM customers
@@ -664,7 +671,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     that underflows is an error too ("value out of range: underflow"); `EXP`
     of a `NUMERIC` then returns 0, as Postgres's `exp(numeric)` does
 - String functions; positions are 1-based and count characters, not bytes:
-  - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`,
+  - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`
+    (with text arguments, the pattern forms below),
     `SUBSTR`, `LEFT(s, n)` / `RIGHT(s, n)` (a negative `n` drops characters
     from the other end), `POSITION(sub IN s)`, `STRPOS(s, sub)`
   - `TRIM([BOTH | LEADING | TRAILING] [chars] FROM s)`, `TRIM(s [, chars])`,
@@ -672,11 +680,55 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     [, fill])`, `REPLACE`, `REVERSE`, `REPEAT`, `INITCAP`, `MD5`,
     `STARTS_WITH`, `SPLIT_PART(s, delim, n)` (a negative `n` counts from
     the end)
-  - `REGEXP_REPLACE(s, pattern, replacement [, flags])` replaces the first
-    match, or all of them with flag `g`; flags `i`, `n`, `p`, `w`, `q`
-    (literal pattern) work as in Postgres, and `\1` … `\9` and `\&` in the
-    replacement insert groups and the match. Patterns use Go's RE2 syntax,
-    so backreferences and lookaround are not available
+  - `REGEXP_REPLACE(s, pattern, replacement [, start [, n]] [, flags])`
+    replaces the first match, or all of them with flag `g`; with Postgres
+    16's `start` and `n`, the `n`-th match from `start` (all of them if `n`
+    is 0). `\1` … `\9` and `\&` in the replacement insert groups and the
+    match. Flags and pattern syntax as below
+- Regular expressions, with Postgres's arguments, results and errors:
+  - `s ~ pattern`, `s ~* pattern` (case-insensitive), `s !~ pattern`,
+    `s !~* pattern`. As in Postgres, they bind like `||`: tighter than
+    comparisons, `IS`, `LIKE`, `BETWEEN` and `IN`, looser than arithmetic
+    (`s ~ 'a' || 'b'` is `(s ~ 'a') || 'b'`)
+  - `REGEXP_LIKE(s, pattern [, flags])`, `REGEXP_COUNT(s, pattern [, start
+    [, flags]])`, `REGEXP_INSTR(s, pattern [, start [, n [, endoption
+    [, flags [, subexpr]]]]])` and `REGEXP_SUBSTR(s, pattern [, start [, n
+    [, flags [, subexpr]]]])`, as in Postgres 15 (Snowflake's have the same
+    order): the `n`-th match from position `start`, or its group `subexpr`.
+    A search from `start` sees the text before it, so `^` does not match
+    there
+  - `REGEXP_MATCH(s, pattern [, flags])` returns the first match's groups
+    (or the whole match if there are none) as the text of Postgres's
+    `text[]` result, `'{bar,beque}'`, since the driver has no array type.
+    `REGEXP_SUBSTR(s, pattern, 1, 1, '', n)` returns group `n` alone
+  - `SUBSTRING(s FROM pattern)` returns the first group of the first match,
+    or the whole match. As in Postgres, the argument types choose the form:
+    text is a pattern and an integer a position, so `SUBSTRING(s, '2')` is a
+    pattern match and `SUBSTRING(s FROM 2 FOR 3)` a position
+  - `[NOT] SIMILAR TO pattern [ESCAPE e]` and `SUBSTRING(s SIMILAR pattern
+    ESCAPE e)` (also `SUBSTRING(s FROM pattern FOR e)`) translate the SQL
+    pattern as Postgres does. It must match the whole string, `%` and `_`
+    are wildcards, `|`, `*`, `+`, `?`, `{m,n}`, `( )` and `[ ]` keep their
+    meaning, and the escape character (backslash by default, none with
+    `ESCAPE ''`) makes the next character literal (an escaped letter is an
+    RE2 escape, such as `\d` for a digit). `SUBSTRING … SIMILAR`
+    returns the part between the two `e"` separators, where the part before
+    them matches as little of the string as it can
+  - Flags: `i` (case-insensitive), `c`, `n` / `m` (newline-sensitive), `s`,
+    `p`, `w`, `q` (a literal pattern), and `g` for `REGEXP_REPLACE` only;
+    `x`, `b` and `e` are not supported. Without flags, `.` matches newlines
+    and `^` and `$` anchor the whole string
+  - Patterns use Go's RE2 syntax: no backreferences (`\1`) or lookaround,
+    and `\b` is a word boundary (`\y` in Postgres). Where a pattern can match
+    text of different lengths at the same position, RE2 takes the first
+    alternative, as Perl does, so `SUBSTRING('xyz' FROM 'x|xy')` is `x`
+    where Postgres gives `xy`. A pattern that doesn't compile is an error
+    such as `` invalid regular expression: missing closing ): `(` ``
+  - Patterns over columns are evaluated by the driver, on the rows the rest
+    of the `WHERE` clause finds in the index: `~ '^abc'` and
+    `SIMILAR TO 'abc%'` are not index prefix queries. `REGEXP_MATCHES` and
+    `REGEXP_SPLIT_TO_TABLE` / `REGEXP_SPLIT_TO_ARRAY` (sets and arrays) are
+    not supported
 - Conditional functions: `NULLIF(a, b)`, `GREATEST(…)` / `LEAST(…)` (NULL
   arguments are ignored), and `IIF(cond, a, b)` (like `CASE`, only the chosen
   branch is evaluated). `COALESCE`, `GREATEST` and `LEAST` widen their
