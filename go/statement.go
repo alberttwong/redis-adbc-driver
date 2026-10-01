@@ -261,6 +261,10 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 		return execResult{}, err
 	}
 	exec := s.executor()
+	// A script of several statements is one transaction for SET LOCAL, as
+	// in Postgres; what it set ends with it unless a BEGIN is open.
+	exec.script = len(parsed) > 1
+	defer exec.sess.endScript()
 	var last execResult
 	for _, ps := range parsed {
 		if paramRows == nil {
@@ -277,7 +281,8 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 			return execResult{}, errorf(adbc.StatusInvalidArgument, "query has %d parameter(s) but %d are bound", ps.NumParams, len(paramTypes))
 		}
 		combined := execResult{affected: 0}
-		if _, ok := ps.Stmt.(*SelectStmt); ok || hasReturning(ps.Stmt) {
+		_, isShow := ps.Stmt.(*ShowStmt)
+		if _, ok := ps.Stmt.(*SelectStmt); ok || isShow || hasReturning(ps.Stmt) {
 			// Establish the result schema even when no rows are bound.
 			exec.cache = newExecCache()
 			exec.paramTypes = paramTypes

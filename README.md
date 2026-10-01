@@ -527,7 +527,7 @@ How SQL is executed:
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
-| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
+| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata, one for all the actions of a statement), plus `FT.INFO` and one `FT.ALTER` for the added columns and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan for all the statement's new `CHECK`s, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
 | Views | `CREATE VIEW` plans the body without running it, which checks its tables, columns and function calls. Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING`. An item whose `ON` can never be true (`ON false`), or that has no rows, isn't read when that settles the result: an inner join is then empty and reads no item, a `LEFT JOIN` keeps the left rows with NULLs for the item, and a `RIGHT JOIN` returns the item's rows without reading the items before it |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
@@ -636,8 +636,8 @@ field, even if later rows have it.
   [CASCADE | RESTRICT]` removes every row and keeps the table (metadata, key
   prefix, index). Row ids continue unless `RESTART IDENTITY` is given. All
   names are checked before any table is emptied
-- `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
-  `RENAME [COLUMN] a TO b`,
+- `ALTER TABLE [IF EXISTS] t` with `RENAME TO u`, with
+  `RENAME [COLUMN] a TO b`, or with one or more of these, separated by commas:
   `ADD [COLUMN] [IF NOT EXISTS] c TYPE [column_constraint …] [NOINDEX] [COMMENT 'text']`,
   `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`,
   `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`,
@@ -646,6 +646,40 @@ field, even if later rows have it.
   take the same time at any table size (except `RENAME TO` with
   `adbc.redis.rename_rekey`, and adding a `CHECK`, which reads every row
   first):
+  - **Several actions** (dbt's `on_schema_change` and snapshots send
+    `alter table t add column "a" …, add column "b" …, drop column "c"`) are
+    one change of the table's metadata, made in one `WATCH`/`MULTI`, so
+    other statements see the table before all of them or after all of
+    them. They apply in the order written, each seeing what the ones before
+    it did: `ADD COLUMN x …, ADD CONSTRAINT c CHECK (x > 0)` checks the rows
+    with `x`'s default, `DROP COLUMN a, ADD COLUMN a …` gives a new, empty
+    column, and two unnamed `CHECK`s on `v` are named `t_v_check` and
+    `t_v_check1`. Postgres instead runs all the `DROP`s first, then the
+    `ADD COLUMN`s, then the constraints and defaults, so a few orders it
+    accepts are errors here, such as a `CHECK` on a column added later in
+    the list (write the column first), and `ADD COLUMN a …, DROP COLUMN a`,
+    an error there, adds nothing here. A table can't be left without
+    columns, but `DROP COLUMN a, ADD COLUMN b …` works on a table whose only
+    column is `a`.
+  - **All or nothing:** if any action fails (a column that exists or
+    doesn't, a `DEFAULT` that doesn't convert, a `CHECK` that some row
+    fails, …), none is applied: the metadata, the search index and the
+    rows stay as they were. Every definition is checked first, then the
+    rows against the new `CHECK`s (one scan for all of them), then the new
+    indexed columns are added to the index (one `FT.ALTER`, which adds all
+    of them or none), and then the metadata is written. No row is
+    rewritten before that: the only row writes are the removal of dropped
+    columns' fields afterwards, in the background, which is recorded in
+    the metadata and resumed by the next connection if it stops part-way
+    (the table is already correct then: the fields are never read or
+    reused). If writing the metadata fails (a concurrent change, "try
+    again", or a lost connection), the index keeps attributes that no
+    column uses, which is harmless, and a later `ADD COLUMN` doesn't reuse
+    their names.
+  - **`RENAME TO` and `RENAME COLUMN`** take no list, as in Postgres:
+    `ALTER TABLE t RENAME TO u, ADD …` is `syntax error at or near ","`,
+    and `ALTER TABLE t ADD …, RENAME …` is `syntax error at or near
+    "RENAME"`. On a view, only `RENAME TO` is accepted.
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
     was created), so no row is touched. A table that dbt builds as
     `t__dbt_tmp` and renames to `t` keeps the keys `public:t__dbt_tmp:<rowid>`
@@ -1567,6 +1601,60 @@ field, even if later rows have it.
   read in the `RETURNING` list of `UPDATE … FROM`, `DELETE … USING` or
   `MERGE` (as in any join), and `merge_action()` can't be called inside a
   subquery
+- Transactions and settings. The driver is autocommit only: every statement
+  commits on its own. SQL written for Postgres still sends transaction
+  control and `SET` (dbt sends a literal `commit;` before hooks that run
+  outside the transaction, and `sql_header` often holds `SET`s), so they are
+  accepted as Postgres accepts them in autocommit mode:
+  - **Transaction control does nothing:** `BEGIN [WORK | TRANSACTION]
+    [mode, …]`, `START TRANSACTION [mode, …]`, `COMMIT [WORK | TRANSACTION]
+    [AND [NO] CHAIN]`, `END …`, `ROLLBACK [WORK | TRANSACTION] [AND [NO]
+    CHAIN]` and `ABORT …`, and also `SET TRANSACTION mode, …` and `SET
+    SESSION CHARACTERISTICS AS TRANSACTION mode, …`. The modes
+    (`ISOLATION LEVEL …`, `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE`) are
+    accepted and ignored, so `READ ONLY` doesn't stop writes. **`ROLLBACK`
+    undoes nothing**: in `BEGIN; INSERT …; ROLLBACK` the row stays, because
+    the `INSERT` committed. Postgres warns when there is no transaction to
+    commit or roll back; ADBC has no way to return warnings, so nothing is
+    reported. `COMMIT AND CHAIN` outside `BEGIN` is Postgres's error
+    `COMMIT AND CHAIN can only be used in transaction blocks`.
+  - **Not supported:** `SAVEPOINT`, `RELEASE [SAVEPOINT]`, `ROLLBACK TO
+    [SAVEPOINT]`, `COMMIT PREPARED` / `ROLLBACK PREPARED` and `SET
+    TRANSACTION SNAPSHOT` (`SAVEPOINT is not supported (autocommit only)`, …).
+    The error comes when the script is parsed, so none of its statements
+    run.
+  - **`SET [SESSION | LOCAL] name {= | TO} {value [, …] | DEFAULT}`,
+    `RESET name`, `RESET ALL`, `SHOW name` and `SHOW ALL`**, also `SET TIME
+    ZONE …`, `RESET TIME ZONE`, `SHOW TIME ZONE`, `SET SCHEMA 'name'`
+    (`search_path`) and `SET NAMES 'name'` (`client_encoding`), for the
+    parameters below. Names are case-insensitive. Other names, Postgres's
+    custom `a.b` ones included, give `unrecognized configuration parameter
+    "x"`. `SHOW` returns one `VARCHAR` column named as in Postgres
+    (`DateStyle`, `TimeZone`, …); `SHOW ALL` returns `name`, `setting` and
+    `description`. Settings belong to the connection and last until it
+    closes; `ROLLBACK` doesn't undo them either.
+  - **`SET LOCAL`** lasts until the transaction ends, as in Postgres: until
+    `COMMIT`, `END`, `ROLLBACK` or `ABORT` after a `BEGIN` (the connection
+    remembers that a `BEGIN` is open, for this only), or else until the end
+    of the script it is in (Postgres runs a script of several statements as
+    one transaction). A `SET LOCAL` statement on its own, outside `BEGIN`,
+    is checked and has no effect, as in Postgres.
+  - **Parameters:**
+
+    | Parameter | Values | Default |
+    |-|-|-|
+    | `search_path` | Schemas, comma-separated. Unqualified names use the first one, skipping `"$user"`, `pg_catalog` and `pg_temp` (temporary objects are always found first), as `adbc.redis.default_schema` sets it: `CREATE`, queries, writes and bulk ingest. The schema needn't exist yet (schemas exist once they have a table). `SHOW` shows the list as set, and the ADBC current schema (`adbc.connection.db_schema`) is the same setting | `adbc.redis.default_schema` |
+    | `TimeZone` (`SET TIME ZONE`) | Only `UTC`, `LOCAL` and `DEFAULT`, which are UTC: the session time zone is always UTC (see the date/time functions). Others give `invalid value for parameter "TimeZone": "…" (only UTC is supported)` | `UTC` |
+    | `client_encoding` | Only `UTF8` (`UTF-8`, `UNICODE`) | `UTF8` |
+    | `application_name` | Any; not used | `''` |
+    | `standard_conforming_strings` | Only `on`: `'…'` strings don't treat backslashes as escapes | `on` |
+    | `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout` | Milliseconds, or a number with a unit (`us`, `ms`, `s`, `min`, `h`, `d`), shown as Postgres shows them (`5s`, `1500ms`). Not enforced: there is no statement timeout (and there are no locks or transactions) | `0` |
+    | `extra_float_digits` | -15 to 3; no effect, as results are Arrow values, not text | `1` |
+    | `DateStyle` | Only the `ISO` style, with an order `MDY`, `DMY` or `YMD`, which has no effect (only ISO dates are read) | `ISO, MDY` |
+    | `IntervalStyle` | Only `postgres`, the format of intervals cast to text | `postgres` |
+
+    The same settings through ADBC options (other than the current schema)
+    are not supported.
 - Not supported: mutually recursive CTEs, `ANY` / `ALL` over arrays or
   value lists, set-returning functions in the SELECT list
   (`SELECT generate_series(1, 3)`), table functions other than
@@ -1590,8 +1678,10 @@ Tables can be qualified as `schema.table` or `redis.schema.table`, and
 `pg_temp.table` is the connection's temporary table. Strings are written
 `'…'` (`''` for a quote) or dollar-quoted, `$$…$$` or `$tag$…$tag$`, as in
 Postgres. Schemas are key
-namespaces (default `public`). There are no transactions (autocommit
-only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
+namespaces (default `public`; `SET search_path` changes it for the
+connection). There are no transactions (autocommit only; `BEGIN`, `COMMIT`
+and `ROLLBACK` are accepted and do nothing, see "Transactions and settings"
+above). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
 every change first (new values and casts, string lengths, `NOT NULL`, `CHECK`, MERGE's
 one-change-per-row rule, `RETURNING`), so such an error leaves the table untouched. Then
 they write, in pipelined batches of up to 1,000 rows (`MERGE`: updates, then
@@ -1607,7 +1697,7 @@ clients can see a partly applied statement.
 | `username`, `password` | database | Credentials (override the URI) |
 | `adbc.redis.address`, `adbc.redis.db` | database | Used when no URI is given |
 | `adbc.redis.cluster` | database | `auto` (default) / `true` / `false`: OSS Cluster API client or single endpoint |
-| `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`) |
+| `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`). `SET search_path` and the ADBC current schema change it for one connection; `RESET search_path` goes back to it |
 | `adbc.redis.aggregate_pushdown` | database, statement | `exact` / `all` / `none` |
 | `adbc.redis.rename_rekey` | database, connection | `false` (default): `RENAME TO` only changes metadata. `true`: it also moves the rows and index to the new name's keys, in time proportional to the number of rows, and the table refuses changes meanwhile (see `ALTER TABLE`). The connection option overrides the database's |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |

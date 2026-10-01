@@ -95,7 +95,7 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 	conn := &connectionImpl{
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 		store:              st,
-		schema:             d.schema,
+		sess:               newSession(d.schema),
 		pushdown:           d.pushdown,
 		rekey:              d.rekey,
 	}

@@ -29,8 +29,11 @@ import (
 
 // executor runs parsed statements against a store.
 type executor struct {
-	store    *store
-	schema   string // current schema
+	store *store
+	// sess is the connection's settings (session.go), and schema its
+	// current schema.
+	sess     *session
+	schema   string
 	pushdown string // aggregate pushdown mode
 	rekey    bool   // RENAME TO also moves the rows (see rekey.go)
 
@@ -52,6 +55,9 @@ type executor struct {
 	// planOnly is set while planning queries whose rows are never read:
 	// derived tables, CTEs and views are planned but not run (see empty.go).
 	planOnly bool
+	// script is set while running a script of several statements, which is
+	// a transaction for SET LOCAL (see session.go).
+	script bool
 }
 
 // execResult is the outcome of one statement.
@@ -216,8 +222,27 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		return execResult{affected: -1}, e.runTruncate(ctx, st)
 	case *CommentStmt:
 		return execResult{affected: -1}, e.runComment(ctx, st)
+	case *TransactionStmt, *SetStmt, *ShowStmt:
+		return e.runSession(ps.Stmt)
 	}
 	return execResult{}, errorf(adbc.StatusNotImplemented, "unsupported statement %T", ps.Stmt)
+}
+
+// runSession runs transaction control, SET and SHOW (session.go).
+func (e *executor) runSession(st Stmt) (execResult, error) {
+	if e.sess == nil {
+		// An executor made without a connection (tests).
+		e.sess = newSession(e.schema)
+	}
+	switch st := st.(type) {
+	case *TransactionStmt:
+		return execResult{affected: -1}, e.runTransaction(st)
+	case *SetStmt:
+		return execResult{affected: -1}, e.runSet(st)
+	case *ShowStmt:
+		return e.runShow(st)
+	}
+	return execResult{}, errorf(adbc.StatusNotImplemented, "unsupported statement %T", st)
 }
 
 // ---- DDL ----

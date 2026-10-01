@@ -59,6 +59,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -415,10 +416,12 @@ func (tc *tableChecks) violated(row map[string]Value) (int, error) {
 }
 
 // validateChecks checks the rows of a table against new CHECK constraints
-// (ADD COLUMN, ADD CONSTRAINT), as Postgres does. stored is the table as it
-// is; with is the table the constraints are defined on: stored plus the
-// column being added, if any (added), which every existing row reads as v.
-func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, checks []checkMeta, added string, v Value) error {
+// (ALTER TABLE … ADD COLUMN … CHECK, ADD CONSTRAINT), as Postgres does.
+// stored is the table as it is; with is the table the constraints are on,
+// as the ALTER TABLE leaves it. A column of with that stored has (with the
+// same field) is read from the rows; one the statement adds is in added,
+// with the value every existing row reads for it.
+func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, checks []checkMeta, added map[string]Value) error {
 	m := *with
 	m.Checks = checks
 	tc, err := e.tableChecks(ctx, &m)
@@ -427,7 +430,7 @@ func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, 
 	}
 	need := map[string]bool{}
 	for _, i := range tc.cols {
-		if name := with.Columns[i].Name; name != added {
+		if name := with.Columns[i].Name; !hasKey(added, name) {
 			need[name] = true
 		}
 	}
@@ -435,9 +438,9 @@ func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, 
 		return errorf(adbc.StatusIntegrity, "check constraint %q of relation %q is violated by some row", checks[i].Name, with.Name)
 	}
 	if len(need) == 0 {
-		// Only the new column is read, so every row gives the same result:
+		// Only new columns are read, so every row gives the same result:
 		// the table is read only to see whether it has any rows.
-		i, err := tc.violated(map[string]Value{added: v})
+		i, err := tc.violated(maps.Clone(added))
 		if err != nil || i < 0 {
 			return err
 		}
@@ -451,9 +454,7 @@ func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, 
 		return err
 	}
 	for _, row := range rows {
-		if added != "" {
-			row[added] = v
-		}
+		maps.Copy(row, added)
 		i, err := tc.violated(row)
 		if err != nil {
 			return err
@@ -463,6 +464,11 @@ func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, 
 		}
 	}
 	return nil
+}
+
+func hasKey[V any](m map[string]V, k string) bool {
+	_, ok := m[k]
+	return ok
 }
 
 // sameChecksColumns reports whether the columns that new constraints read
@@ -479,54 +485,4 @@ func sameChecksColumns(was, now *tableMeta, checks []checkMeta) bool {
 		}
 	}
 	return true
-}
-
-// ---- ALTER TABLE … ADD CONSTRAINT / DROP CONSTRAINT ----
-
-// addConstraint adds a CHECK constraint to a table, after checking its rows.
-// chk is nil for the PRIMARY KEY, UNIQUE and FOREIGN KEY constraints, which
-// are accepted and ignored.
-func (e *executor) addConstraint(ctx context.Context, meta *tableMeta, chk *CheckDef) error {
-	if chk == nil {
-		return nil
-	}
-	checks, err := e.defineChecks(ctx, meta, []CheckDef{*chk})
-	if err != nil {
-		return err
-	}
-	if err := e.validateChecks(ctx, meta, meta, checks, "", Value{}); err != nil {
-		return err
-	}
-	return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
-		return addChecks(meta, m, checks)
-	}, nil)
-}
-
-// addChecks adds constraints defined on table was to its current metadata m,
-// if the columns they read and their names are still free in m.
-func addChecks(was, m *tableMeta, checks []checkMeta) error {
-	taken := slices.ContainsFunc(checks, func(c checkMeta) bool {
-		return slices.ContainsFunc(m.Checks, func(o checkMeta) bool { return strings.EqualFold(o.Name, c.Name) })
-	})
-	if taken || !sameChecksColumns(was, m, checks) {
-		return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
-	}
-	m.Checks = append(m.Checks, checks...)
-	return nil
-}
-
-// dropConstraint implements DROP CONSTRAINT, for CHECK constraints (the
-// only ones kept).
-func (e *executor) dropConstraint(ctx context.Context, meta *tableMeta, name string, ifExists bool) error {
-	return e.store.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
-		i := slices.IndexFunc(m.Checks, func(c checkMeta) bool { return strings.EqualFold(c.Name, name) })
-		if i < 0 {
-			if ifExists {
-				return nil
-			}
-			return errorf(adbc.StatusNotFound, "constraint %q of relation %q does not exist", name, m.Name)
-		}
-		m.Checks = slices.Delete(m.Checks, i, i+1)
-		return nil
-	}, nil)
 }
