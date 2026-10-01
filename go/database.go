@@ -35,6 +35,7 @@ type databaseImpl struct {
 	schema   string
 	pushdown string
 	cluster  string
+	rekey    bool
 }
 
 func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
@@ -79,6 +80,12 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		_ = client.Close()
 		return nil, err
 	}
+	// Roll back or finish renames that were moving rows when their
+	// connection went away (see rekey.go).
+	if err := st.resumeRekeys(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 	// Drop temporary objects of connections that exited without closing.
 	st.sweepTemp(ctx)
 	conn := &connectionImpl{
@@ -86,6 +93,7 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		store:              st,
 		schema:             d.schema,
 		pushdown:           d.pushdown,
+		rekey:              d.rekey,
 	}
 	return driverbase.NewConnectionBuilder(conn).
 		WithCurrentNamespacer(conn).
@@ -159,6 +167,8 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.pushdown, nil
 	case OptionStringCluster:
 		return d.cluster, nil
+	case OptionStringRenameRekey:
+		return strconv.FormatBool(d.rekey), nil
 	}
 	return d.DatabaseImplBase.GetOption(ctx, key)
 }
@@ -199,6 +209,12 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 		default:
 			return errorf(adbc.StatusInvalidArgument, "invalid %s %q (want auto, true or false)", key, value)
 		}
+	case OptionStringRenameRekey:
+		rekey, err := parseRenameRekey(value)
+		if err != nil {
+			return err
+		}
+		d.rekey = rekey
 	default:
 		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}

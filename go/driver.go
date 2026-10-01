@@ -62,6 +62,13 @@ const (
 	// forces the cluster client; "false" forces the single-endpoint client.
 	OptionStringCluster = "adbc.redis.cluster"
 
+	// OptionStringRenameRekey (database or connection) controls ALTER TABLE
+	// … RENAME TO: "false" (default) only rewrites metadata, so the table
+	// keeps the key prefix and index name it was created with; "true" also
+	// moves its rows and index to the new name's (see rekey.go), which
+	// takes time proportional to the number of rows.
+	OptionStringRenameRekey = "adbc.redis.rename_rekey"
+
 	PushdownExact = "exact"
 	PushdownAll   = "all"
 	PushdownNone  = "none"
@@ -93,6 +100,16 @@ func validatePushdown(v string) error {
 		return nil
 	}
 	return errorf(adbc.StatusInvalidArgument, "invalid %s %q (want exact, all or none)", OptionStringAggregatePushdown, v)
+}
+
+func parseRenameRekey(v string) (bool, error) {
+	switch v {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, errorf(adbc.StatusInvalidArgument, "invalid %s %q (want true or false)", OptionStringRenameRekey, v)
 }
 
 func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.DatabaseWithContext, error) {

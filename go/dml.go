@@ -186,7 +186,7 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 			return 0, err
 		}
 	}
-	if err := e.writeUpdates(ctx, changes); err != nil {
+	if err := e.writeUpdates(ctx, dj.meta, changes); err != nil {
 		return 0, err
 	}
 	return int64(len(changes)), nil
@@ -227,7 +227,7 @@ func (e *executor) runDeleteUsing(ctx context.Context, st *DeleteStmt, params []
 			}
 		}
 	}
-	if err := e.deleteKeys(ctx, keys); err != nil {
+	if err := e.deleteKeys(ctx, dj.meta, keys); err != nil {
 		return 0, err
 	}
 	return int64(len(keys)), nil
@@ -372,10 +372,10 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 			return 0, err
 		}
 	}
-	if err := e.writeUpdates(ctx, updates); err != nil {
+	if err := e.writeUpdates(ctx, dj.meta, updates); err != nil {
 		return 0, err
 	}
-	if err := e.deleteKeys(ctx, deletes); err != nil {
+	if err := e.deleteKeys(ctx, dj.meta, deletes); err != nil {
 		return 0, err
 	}
 	if _, err := e.store.insertRows(ctx, dj.meta, inserts); err != nil {

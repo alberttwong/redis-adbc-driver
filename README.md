@@ -345,7 +345,10 @@ DROP TABLE events;
 
 **4. Look at the data in Redis**
 
-Each row is a plain HASH, and each table has one RediSearch index:
+Each row is a plain HASH, and each table has one RediSearch index. A renamed
+table keeps its key names unless `adbc.redis.rename_rekey` is set (see
+`ALTER TABLE` below); `information_schema.tables` shows each table's
+`key_prefix` and `index_name`:
 
 ```bash
 docker exec redis-adbc-test redis-cli HGETALL public:sales:42
@@ -397,7 +400,15 @@ Stop Redis with `docker compose down`.
   Each table's metadata records its row key prefix and index name, and
   `adbc:{meta}:prefixes` / `adbc:{meta}:indexes` reserve them, so a renamed
   table's rows can never be shared with a new table of the old name.
-  `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress. Metadata written by
+  `adbc:{meta}:cleanup` lists tables with a dropped-column cleanup in progress.
+  `adbc:{meta}:rekey` records renames that are moving a table's rows
+  (`adbc.redis.rename_rekey`), keyed by the old prefix, and
+  `adbc:{meta}:rekey:alive:<id>` (30-second TTL, renewed by the renaming
+  connection) shows that the connection doing one is alive.
+  `adbc:{meta}:released` counts how often each key prefix was released (by
+  `DROP TABLE` or a re-keying rename); a table's metadata records the count
+  when it takes its prefix, so that a statement that read it earlier can
+  tell when its rows have moved away. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
 - **Missing values**: `ALTER TABLE … ADD COLUMN c … DEFAULT v` doesn't
@@ -450,7 +461,7 @@ How SQL is executed:
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
-| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows |
+| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
 | Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING` |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
@@ -555,9 +566,55 @@ field, even if later rows have it.
   `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOT NULL] [DEFAULT expr] [NOINDEX]`,
   `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`,
   `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`. All of them only change metadata, so they
-  take the same time at any table size:
+  take the same time at any table size (except `RENAME TO` with
+  `adbc.redis.rename_rekey`):
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
-    was created), so no row is touched.
+    was created), so no row is touched. A table that dbt builds as
+    `t__dbt_tmp` and renames to `t` keeps the keys `public:t__dbt_tmp:<rowid>`
+    and the index `idx:public:t__dbt_tmp` (or `t__dbt_tmp~2`, when the
+    previous build's table still holds those names).
+  - With the option `adbc.redis.rename_rekey` set to `true` (on the
+    database, e.g. in dbt's `db_kwargs`, or on the connection), `RENAME TO`
+    also moves the rows and the index to the new name's: `public:t:<rowid>`
+    and `idx:public:t`, or `~N` if another table still uses those. This
+    reads and writes every row, so it takes time proportional to the number
+    of rows (and about 100 ms more), and the table takes twice its memory
+    until the copy is done (if Redis runs out, the rename fails and is
+    rolled back). Every rename does it, including dbt's renames to
+    `__dbt_backup`. The rows are copied with `DUMP` / `RESTORE`, every field
+    included, then the metadata is switched in one transaction and the old
+    index is dropped with `DD`, which deletes the old rows. Views are still
+    renamed in the metadata only. While the rows move:
+    - Readers see the table, complete, under its old name until the switch
+      and under the new one after it. A statement that read the table's
+      metadata during the move and was still running at the switch, or one
+      that ran for 100 ms or more while the rows moved away, fails ("try
+      again") rather than returning rows that are gone or now belong to
+      another table.
+    - Statements that would change the table are refused ("is being
+      renamed"): `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, bulk
+      ingest that appends, and `ALTER TABLE`. An `ALTER TABLE … ADD`, `DROP`
+      or `RENAME COLUMN` that had already started is taken into account when
+      the metadata is switched. `DROP TABLE` (and so bulk ingest in
+      `replace` mode) is not refused: if it reaches the table before the
+      switch, the rename fails.
+    - A write statement that read the table's metadata before the move
+      started may still be running, so the copy waits 100 ms first. A write
+      statement that took longer than that, from reading the metadata to its
+      last write, checks afterwards whether the table was being moved (or
+      was moved, or dropped), and if so fails with "some of its changes may
+      be lost or have gone to another table": like a write that fails
+      part-way, some of them may have been applied. Faster statements don't
+      pay for the check.
+    - If the renaming process exits, the table is unchanged under its old
+      name and refuses changes until the move's 30-second lease has
+      expired. Then the next connection to open, the next statement refused,
+      or the next re-keying rename rolls the move back (its copies, its
+      index and the names it reserved are removed). If it had already
+      switched the metadata, the rename stands, and the next connection to
+      open or re-keying rename removes the old rows. A renaming connection
+      that can't renew its lease for 15 seconds stops before its next step
+      and fails; another connection then rolls the move back.
   - `RENAME COLUMN` keeps the column's HASH field; only its SQL name changes.
   - `ADD COLUMN` adds the column to the index with `FT.ALTER`; existing rows
     read it as NULL, or as its `DEFAULT`, which is computed once (so
@@ -995,7 +1052,8 @@ field, even if later rows have it.
     is possible future work)
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
-  queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`),
+  queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`,
+  and each table's row `key_prefix` and `index_name`, NULL for views),
   `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
   `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
   (`view_definition`). Any SQL works on them, including joins
@@ -1099,6 +1157,7 @@ clients can see a partly applied statement.
 | `adbc.redis.cluster` | database | `auto` (default) / `true` / `false`: OSS Cluster API client or single endpoint |
 | `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`) |
 | `adbc.redis.aggregate_pushdown` | database, statement | `exact` / `all` / `none` |
+| `adbc.redis.rename_rekey` | database, connection | `false` (default): `RENAME TO` only changes metadata. `true`: it also moves the rows and index to the new name's keys, in time proportional to the number of rows, and the table refuses changes meanwhile (see `ALTER TABLE`). The connection option overrides the database's |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |
 
 Scale tips: keep column names short (they are repeated in every HASH), raise

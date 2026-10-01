@@ -18,6 +18,7 @@ import (
 	"context"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -33,10 +34,32 @@ type connectionImpl struct {
 	schema   string
 	pushdown string
 	version  string
+	// rekey is adbc.redis.rename_rekey (from the database unless set on the
+	// connection).
+	rekey bool
 }
 
 func (c *connectionImpl) executor() *executor {
-	return &executor{store: c.store, schema: c.schema, pushdown: c.pushdown}
+	return &executor{store: c.store, schema: c.schema, pushdown: c.pushdown, rekey: c.rekey}
+}
+
+func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
+	if key == OptionStringRenameRekey {
+		return strconv.FormatBool(c.rekey), nil
+	}
+	return c.ConnectionImplBase.GetOption(ctx, key)
+}
+
+func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
+	if key == OptionStringRenameRekey {
+		rekey, err := parseRenameRekey(value)
+		if err != nil {
+			return err
+		}
+		c.rekey = rekey
+		return nil
+	}
+	return c.ConnectionImplBase.SetOption(ctx, key, value)
 }
 
 func (c *connectionImpl) Close(ctx context.Context) error {

@@ -61,6 +61,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	goredis "github.com/redis/go-redis/v9"
@@ -179,6 +180,14 @@ type tableMeta struct {
 	// still being removed from existing rows in the background.
 	RetiredFields  []string `json:"retired_fields,omitempty"`
 	PendingCleanup []string `json:"pending_cleanup,omitempty"`
+	// RekeyTo is set while RENAME TO moves the rows to a new key prefix (the
+	// one named here), and writes are refused. PrefixGen is how often the
+	// key prefix had been released when the table took it (see rekey.go).
+	RekeyTo   string `json:"rekey_to,omitempty"`
+	PrefixGen int64  `json:"prefix_gen,omitempty"`
+	// readAt is when the metadata was read (or last found not to be moving),
+	// for the checks in rekey.go.
+	readAt time.Time
 
 	// In-memory relations (CTEs, derived tables) hold their rows here and
 	// have no index or HASHes.
@@ -503,6 +512,7 @@ func (s *store) migrateLegacyMetadata(ctx context.Context) error {
 }
 
 func (s *store) getTable(ctx context.Context, schema, table string) (*tableMeta, error) {
+	readAt := time.Now()
 	raw, err := s.client.Get(ctx, metaKey(schema, table)).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, tableNotFound(schema, table)
@@ -514,6 +524,7 @@ func (s *store) getTable(ctx context.Context, schema, table string) (*tableMeta,
 	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
 		return nil, errorf(adbc.StatusInternal, "corrupt metadata for table %q.%q: %v", schema, table, err)
 	}
+	meta.readAt = readAt
 	return &meta, nil
 }
 
@@ -593,6 +604,10 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		release()
 		return false, err
 	}
+	if meta.PrefixGen, err = prefixGen(ctx, s.client, meta.KeyPrefix); err != nil {
+		release()
+		return false, wrapRedis(err, "failed to create table")
+	}
 	if raw, err = json.Marshal(meta); err == nil {
 		err = s.client.Set(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Err()
 	}
@@ -644,6 +659,9 @@ func (s *store) truncateTable(ctx context.Context, schema, table string, restart
 	if err != nil {
 		return err
 	}
+	if err := s.checkWritable(ctx, meta); err != nil {
+		return err
+	}
 	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
 		!isUnknownIndex(err) {
 		return wrapRedis(err, "failed to truncate table")
@@ -659,7 +677,7 @@ func (s *store) truncateTable(ctx context.Context, schema, table string, restart
 			return wrapRedis(err, "failed to restart the row id sequence")
 		}
 	}
-	return nil
+	return s.checkWritten(ctx, meta)
 }
 
 // dropTable removes the index, every row, and the table metadata.
@@ -682,6 +700,9 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 	pipe.SRem(ctx, tablesKey(schema), table)
 	pipe.SRem(ctx, prefixesKey, meta.prefix())
 	pipe.SRem(ctx, indexesKey, meta.index())
+	if !isTempSchema(schema) {
+		pipe.HIncrBy(ctx, releasedKey, meta.prefix(), 1) // see rekey.go
+	}
 	pipe.SRem(ctx, cleanupKey, cleanupMember(schema, table))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return wrapRedis(err, "failed to drop table")
@@ -832,6 +853,9 @@ func (s *store) allocRows(ctx context.Context, meta *tableMeta, rows [][]Value) 
 			}
 		}
 	}
+	if err := s.checkWritable(ctx, meta); err != nil {
+		return rowAlloc{}, err
+	}
 	// The row ids are allocated in one transaction with a read of the
 	// metadata, which shows columns that ADD COLUMN … DEFAULT added since
 	// meta was read: these rows get their missing values (see defaults.go).
@@ -868,6 +892,11 @@ func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
 			return 0, wrapRedis(err, "failed to write rows")
+		}
+	}
+	if len(rows) > 0 {
+		if err := s.checkWritten(ctx, meta); err != nil {
+			return 0, err
 		}
 	}
 	return int64(len(rows)), nil
