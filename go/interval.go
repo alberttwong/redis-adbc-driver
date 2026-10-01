@@ -279,14 +279,15 @@ func formatInterval(v Value) string {
 	unit(months, "mon", "mons")
 	unit(int64(v.Days), "day", "days")
 	if v.I != 0 || len(parts) == 0 {
-		ns := v.I
+		// The magnitude is a uint64 so that MinInt64's fits.
+		ns := uint64(v.I)
 		sign := ""
-		if ns < 0 {
+		if v.I < 0 {
 			sign, ns = "-", -ns
 		}
-		h, rem := ns/nsPerHour, ns%nsPerHour
-		m, rem := rem/nsPerMinute, rem%nsPerMinute
-		sec, frac := rem/nsPerSecond, rem%nsPerSecond
+		h, rem := ns/uint64(nsPerHour), ns%uint64(nsPerHour)
+		m, rem := rem/uint64(nsPerMinute), rem%uint64(nsPerMinute)
+		sec, frac := rem/uint64(nsPerSecond), rem%uint64(nsPerSecond)
 		clock := fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, sec)
 		if frac != 0 {
 			clock += strings.TrimRight(fmt.Sprintf(".%09d", frac), "0")
