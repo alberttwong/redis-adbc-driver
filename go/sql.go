@@ -1451,6 +1451,19 @@ func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
 			return sqlTypeSpec{}, err
 		}
 	}
+	if spec.Name == "INTERVAL" {
+		// Optional field qualifier (INTERVAL DAY TO SECOND etc.); intervals
+		// always carry months, days and nanoseconds.
+		if isIntervalUnit(p.peek()) {
+			p.pos++
+			if p.acceptKeyword("TO") {
+				if !isIntervalUnit(p.peek()) {
+					return sqlTypeSpec{}, syntaxErr("expected an interval field after TO")
+				}
+				p.pos++
+			}
+		}
+	}
 	if spec.Name == "TIMESTAMP" || spec.Name == "TIME" {
 		if p.acceptKeyword("WITH", "TIME", "ZONE") {
 			spec.WithTZ = true
@@ -1470,6 +1483,56 @@ func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
 }
 
 // ---- expressions ----
+
+// isIntervalUnit reports whether a token names an interval field.
+func isIntervalUnit(t token) bool {
+	if t.kind != tokIdent {
+		return false
+	}
+	_, ok := intervalUnits[strings.ToLower(t.text)]
+	return ok
+}
+
+// parseInterval parses what follows INTERVAL:
+//
+//	INTERVAL '1 day 2 hours'           a literal
+//	INTERVAL '2' HOUR                  string with a unit
+//	INTERVAL '1-2' YEAR TO MONTH       (the TO part is accepted; the string decides)
+//	INTERVAL 7 DAY / INTERVAL ? DAY    an expression with a unit
+func (p *parser) parseInterval() (Expr, error) {
+	if t := p.peek(); t.kind == tokString {
+		p.pos++
+		if !isIntervalUnit(p.peek()) {
+			v, err := intervalLiteral(t.text)
+			if err != nil {
+				return nil, &sqlError{msg: err.Error()}
+			}
+			return &Literal{V: v}, nil
+		}
+		unit := strings.ToLower(p.next().text)
+		if p.acceptKeyword("TO") {
+			if !isIntervalUnit(p.peek()) {
+				return nil, syntaxErr("expected an interval field after TO")
+			}
+			p.pos++
+			v, err := intervalLiteral(t.text)
+			if err != nil {
+				return nil, &sqlError{msg: err.Error()}
+			}
+			return &Literal{V: v}, nil
+		}
+		return &Func{Name: "__INTERVAL", Args: []Expr{&Literal{V: stringValue(t.text)}, &Literal{V: stringValue(unit)}}}, nil
+	}
+	x, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if !isIntervalUnit(p.peek()) {
+		return nil, syntaxErr("INTERVAL needs a quoted value or a unit (e.g. INTERVAL '1 day' or INTERVAL 1 DAY)")
+	}
+	unit := strings.ToLower(p.next().text)
+	return &Func{Name: "__INTERVAL", Args: []Expr{x, &Literal{V: stringValue(unit)}}}, nil
+}
 
 func (p *parser) parseCase() (Expr, error) {
 	c := &Case{}
@@ -1925,7 +1988,8 @@ func (p *parser) parsePrimary() (Expr, error) {
 			}
 			p.pos = save
 		case "INTERVAL":
-			return nil, &sqlError{msg: "INTERVAL is not supported"}
+			p.pos++
+			return p.parseInterval()
 		}
 		p.pos++
 		if p.acceptOp("(") {

@@ -641,6 +641,8 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 		return typeFloat64, true
 	case "TO_CHAR":
 		return typeString, true
+	case "__INTERVAL", "AGE":
+		return typeInterval, true
 	case "DATE_PART":
 		if len(f.Args) > 0 {
 			if lit, ok := f.Args[0].(*Literal); ok && !lit.V.Null {
@@ -687,7 +689,46 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if err := need(2); err != nil {
 			return done(Value{}, err)
 		}
+		if args[1].T.Kind == KindInterval {
+			return done(intervalPart(args[0].Text(), args[1]))
+		}
 		return done(datePart(args[0].Text(), args[1]))
+	case "__INTERVAL":
+		// INTERVAL n UNIT / INTERVAL 'n' UNIT
+		if err := need(2); err != nil {
+			return done(Value{}, err)
+		}
+		u, ok := intervalUnits[args[1].Text()]
+		if !ok {
+			return done(Value{}, fmt.Errorf("unknown interval unit %q", args[1].Text()))
+		}
+		n, err := Coerce(args[0], typeFloat64)
+		if err != nil {
+			return done(Value{}, fmt.Errorf("INTERVAL %s needs a number, got %q", strings.ToUpper(args[1].Text()), args[0].Text()))
+		}
+		var p intervalParts
+		p.add(n.F, u)
+		return done(p.value())
+	case "AGE":
+		if len(args) != 1 && len(args) != 2 {
+			return done(Value{}, fmt.Errorf("AGE expects 1 or 2 arguments"))
+		}
+		var a, b time.Time
+		var err error
+		if len(args) == 1 {
+			// AGE(x) is measured from the start of the current day.
+			n := env.now()
+			a = time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.UTC)
+			b, err = toTime(args[0])
+		} else {
+			if a, err = toTime(args[0]); err == nil {
+				b, err = toTime(args[1])
+			}
+		}
+		if err != nil {
+			return done(Value{}, err)
+		}
+		return done(age(a, b))
 	case "YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "DAYOFMONTH", "DAYOFYEAR", "HOUR", "MINUTE", "SECOND":
 		if err := need(1); err != nil {
 			return done(Value{}, err)

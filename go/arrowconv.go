@@ -113,6 +113,17 @@ func valueAt(arr arrow.Array, i int) (Value, error) {
 		return intValue(ct, int64(a.Value(i))), nil
 	case *array.Timestamp:
 		return intValue(ct, int64(a.Value(i))), nil
+	case *array.MonthDayNanoInterval:
+		v := a.Value(i)
+		return intervalValue(int64(v.Months), int64(v.Days), v.Nanoseconds)
+	case *array.MonthInterval:
+		return intervalValue(int64(a.Value(i)), 0, 0)
+	case *array.DayTimeInterval:
+		v := a.Value(i)
+		return intervalValue(0, int64(v.Days), int64(v.Milliseconds)*1_000_000)
+	case *array.Duration:
+		unit := a.DataType().(*arrow.DurationType).Unit
+		return intervalValue(0, 0, int64(a.Value(i))*(nsPerSecond/unitsPerSecond[unit]))
 	}
 	return Value{}, fmt.Errorf("unsupported Arrow type %s", arr.DataType())
 }
@@ -155,6 +166,8 @@ func appendValue(b array.Builder, t ColType, v Value) error {
 		bb.Append(arrow.Time64(v.I))
 	case *array.TimestampBuilder:
 		bb.Append(arrow.Timestamp(v.I))
+	case *array.MonthDayNanoIntervalBuilder:
+		bb.Append(arrow.MonthDayNanoInterval{Months: v.Months, Days: v.Days, Nanoseconds: v.I})
 	default:
 		return fmt.Errorf("unsupported builder %T for %s", b, t.Kind)
 	}

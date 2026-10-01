@@ -40,6 +40,9 @@ type Value struct {
 	F    float64
 	S    string
 	D    *big.Int
+	// Intervals: Months and Days, with nanoseconds in I.
+	Months int32
+	Days   int32
 }
 
 func nullValue(t ColType) Value { return Value{T: t, Null: true} }
@@ -466,6 +469,8 @@ func (v Value) Text() string {
 		return formatTime(v.I, v.T.Unit)
 	case KindTimestamp:
 		return formatTimestamp(v.I, v.T.Unit, v.T.TZ)
+	case KindInterval:
+		return formatInterval(v)
 	}
 	return ""
 }
@@ -610,6 +615,10 @@ func Coerce(v Value, t ColType) (Value, error) {
 			}
 			return intValue(t, i), nil
 		}
+	case KindInterval:
+		if v.T.Kind == KindInterval {
+			return v, nil
+		}
 	case KindTimestamp:
 		switch v.T.Kind {
 		case KindTimestamp:
@@ -660,6 +669,8 @@ func parseString(s string, t ColType) (Value, error) {
 		return timeLiteral(trimmed)
 	case KindTimestamp:
 		return timestampLiteral(trimmed, t.TZ != "")
+	case KindInterval:
+		return intervalLiteral(trimmed)
 	}
 	return Value{}, fmt.Errorf("cannot convert %q to %s", s, t.SQLName())
 }
@@ -678,6 +689,8 @@ func encodeStored(v Value) string {
 		return strconv.FormatFloat(v.F, 'g', -1, 64)
 	case KindDecimal:
 		return formatDecimal(v.D, v.T.Scale)
+	case KindInterval:
+		return encodeInterval(v)
 	default:
 		return v.S
 	}
@@ -717,6 +730,8 @@ func decodeStored(s string, t ColType) (Value, error) {
 		return decimalValue(rescaleDecimal(d, scale, t.Scale), t.Precision, t.Scale), nil
 	case KindBinary:
 		return binaryValue(s), nil
+	case KindInterval:
+		return decodeInterval(s)
 	default:
 		return stringValue(s), nil
 	}
@@ -729,6 +744,8 @@ func decodeStored(s string, t ColType) (Value, error) {
 func compareValues(a, b Value) (int, bool) {
 	ak, bk := a.T.Kind, b.T.Kind
 	switch {
+	case ak == KindInterval && bk == KindInterval:
+		return intervalTotal(a).Cmp(intervalTotal(b)), true
 	case (ak == KindString || ak == KindBinary) && (bk == KindString || bk == KindBinary):
 		return bytes.Compare([]byte(a.S), []byte(b.S)), true
 	case ak == KindString && bk != KindString:

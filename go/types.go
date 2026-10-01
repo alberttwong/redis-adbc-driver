@@ -39,6 +39,7 @@ const (
 	KindDate
 	KindTime
 	KindTimestamp
+	KindInterval
 )
 
 var kindNames = map[Kind]string{
@@ -55,6 +56,7 @@ var kindNames = map[Kind]string{
 	KindDate:      "date",
 	KindTime:      "time",
 	KindTimestamp: "timestamp",
+	KindInterval:  "interval",
 }
 
 func (k Kind) String() string { return kindNames[k] }
@@ -140,16 +142,17 @@ func (t *ColType) UnmarshalJSON(data []byte) error {
 }
 
 var (
-	typeNull    = ColType{Kind: KindNull}
-	typeBool    = ColType{Kind: KindBool}
-	typeInt16   = ColType{Kind: KindInt16}
-	typeInt32   = ColType{Kind: KindInt32}
-	typeInt64   = ColType{Kind: KindInt64}
-	typeFloat32 = ColType{Kind: KindFloat32}
-	typeFloat64 = ColType{Kind: KindFloat64}
-	typeString  = ColType{Kind: KindString}
-	typeBinary  = ColType{Kind: KindBinary}
-	typeDate    = ColType{Kind: KindDate}
+	typeNull     = ColType{Kind: KindNull}
+	typeBool     = ColType{Kind: KindBool}
+	typeInt16    = ColType{Kind: KindInt16}
+	typeInt32    = ColType{Kind: KindInt32}
+	typeInt64    = ColType{Kind: KindInt64}
+	typeFloat32  = ColType{Kind: KindFloat32}
+	typeFloat64  = ColType{Kind: KindFloat64}
+	typeString   = ColType{Kind: KindString}
+	typeBinary   = ColType{Kind: KindBinary}
+	typeDate     = ColType{Kind: KindDate}
+	typeInterval = ColType{Kind: KindInterval}
 )
 
 func timeType(unit arrow.TimeUnit) ColType { return ColType{Kind: KindTime, Unit: unit} }
@@ -222,6 +225,8 @@ func (t ColType) ArrowType() arrow.DataType {
 		return &arrow.Time64Type{Unit: t.Unit}
 	case KindTimestamp:
 		return &arrow.TimestampType{Unit: t.Unit, TimeZone: t.TZ}
+	case KindInterval:
+		return arrow.FixedWidthTypes.MonthDayNanoInterval
 	default:
 		return arrow.Null
 	}
@@ -257,6 +262,8 @@ func (t ColType) SQLName() string {
 			return fmt.Sprintf("TIMESTAMP(%d) WITH TIME ZONE", precisionForUnit(t.Unit))
 		}
 		return fmt.Sprintf("TIMESTAMP(%d)", precisionForUnit(t.Unit))
+	case KindInterval:
+		return "INTERVAL"
 	default:
 		return "NULL"
 	}
@@ -304,6 +311,8 @@ func colTypeFromArrow(dt arrow.DataType) (ColType, error) {
 			tz = "UTC"
 		}
 		return timestampType(t.Unit, tz), nil
+	case *arrow.MonthDayNanoIntervalType, *arrow.MonthIntervalType, *arrow.DayTimeIntervalType, *arrow.DurationType:
+		return typeInterval, nil
 	case *arrow.NullType:
 		return typeString, nil
 	}
@@ -368,6 +377,8 @@ func colTypeFromSQL(spec sqlTypeSpec) (ColType, error) {
 		return timestampType(unitForPrecision(param(0, 6)), tz), nil
 	case "TIMESTAMPTZ":
 		return timestampType(unitForPrecision(param(0, 6)), "UTC"), nil
+	case "INTERVAL":
+		return typeInterval, nil
 	}
 	return ColType{}, fmt.Errorf("unsupported SQL type %s", strings.ToUpper(spec.Name))
 }
