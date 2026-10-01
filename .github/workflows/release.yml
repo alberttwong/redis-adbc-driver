@@ -1,0 +1,178 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds the driver library for Linux (amd64, arm64) and macOS (arm64),
+# tests the Linux builds against Redis (standalone and a 3-shard cluster),
+# and attaches the tarballs to the release.
+#
+# Runs when a release is published, or by hand for an existing release tag
+# (its assets are replaced). Pull requests that change this file run the
+# builds and tests without uploading anything.
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (its assets are replaced)
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+env:
+  # The version stamped into the library and used in asset names.
+  VERSION: ${{ github.event.release.tag_name || inputs.tag || 'v0.0.0-dev' }}
+  REF: ${{ github.event.release.tag_name || inputs.tag || github.sha }}
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      # Built against Debian 12's glibc, so the library runs on any
+      # distribution with glibc 2.34 or newer (Ubuntu 22.04+, RHEL 9+).
+      - name: Build
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod -e CGO_ENABLED=1 \
+            -v "$PWD/go:/src" -w /src golang:1.26-bookworm \
+            go build -buildmode=c-shared -tags driverlib \
+              -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=$VERSION" \
+              -o build/libadbc_driver_redis.so ./pkg
+          glibc=$(objdump -T go/build/libadbc_driver_redis.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "requires $glibc"
+          test "$(printf '%s\n' "$glibc" GLIBC_2.34 | sort -V | tail -1)" = GLIBC_2.34
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Start Redis
+        working-directory: go
+        run: |
+          docker compose up --detach --wait redis
+          docker compose --profile cluster up --detach --wait redis-cluster
+
+      - name: Test (standalone)
+        working-directory: go
+        env:
+          REDIS_URI: redis://localhost:6379/0
+        run: |
+          go test -count=1 ./...
+          cd validation && uv run pytest -q tests/
+
+      - name: Test (3-shard cluster)
+        working-directory: go
+        env:
+          REDIS_URI: redis://localhost:7001/0
+        run: |
+          go test -count=1 ./...
+          cd validation && uv run pytest -q tests/
+
+      - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name="adbc_driver_redis-$VERSION-linux-$ARCH"
+          mkdir -p "dist/$name"
+          cp go/build/libadbc_driver_redis.so go/build/libadbc_driver_redis.h README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          rm -r "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+
+  # GitHub's macOS runners can't run the Redis containers, so the macOS
+  # library is built and checked to load; the Go unit tests run without a
+  # server (integration tests skip).
+  macos:
+    name: darwin-arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Build
+        working-directory: go
+        run: make build VERSION="$VERSION"
+
+      - name: Test
+        working-directory: go
+        run: |
+          go test -count=1 ./...
+          file build/libadbc_driver_redis.dylib | grep -q arm64
+          python3 -c "import ctypes; ctypes.CDLL('build/libadbc_driver_redis.dylib').AdbcDriverInit"
+
+      - name: Package
+        run: |
+          name="adbc_driver_redis-$VERSION-darwin-arm64"
+          mkdir -p "dist/$name"
+          cp go/build/libadbc_driver_redis.dylib go/build/libadbc_driver_redis.h README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          rm -r "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: darwin-arm64
+          path: dist/
+
+  upload:
+    if: github.event_name != 'pull_request'
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$VERSION" dist/* --clobber --repo "$GITHUB_REPOSITORY"
