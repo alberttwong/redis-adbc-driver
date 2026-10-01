@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"slices"
 	"strings"
@@ -103,6 +104,9 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		return execResult{affected: n}, err
 	case *DeleteStmt:
 		n, err := e.runDelete(ctx, st, params)
+		return execResult{affected: n}, err
+	case *MergeStmt:
+		n, err := e.runMerge(ctx, st, params)
 		return execResult{affected: n}, err
 	case *CreateTableStmt:
 		if st.AsSelect != nil {
@@ -298,22 +302,9 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 	if err != nil {
 		return 0, err
 	}
-	targets := make([]int, 0, len(meta.Columns))
-	if len(st.Columns) == 0 {
-		for i := range meta.Columns {
-			targets = append(targets, i)
-		}
-	} else {
-		for _, name := range st.Columns {
-			i, ok := meta.resolve(name)
-			if !ok {
-				return 0, errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", name, meta.Name)
-			}
-			if slices.Contains(targets, i) {
-				return 0, errorf(adbc.StatusInvalidArgument, "column %q specified more than once", name)
-			}
-			targets = append(targets, i)
-		}
+	targets, err := insertTargets(meta, st.Columns)
+	if err != nil {
+		return 0, err
 	}
 	if st.Select != nil {
 		return e.insertSelect(ctx, st, meta, targets)
@@ -324,28 +315,69 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 		if len(exprs) != len(targets) {
 			return 0, errorf(adbc.StatusInvalidArgument, "INSERT has %d target columns but %d values", len(targets), len(exprs))
 		}
-		row := make([]Value, len(meta.Columns))
-		for i, c := range meta.Columns {
-			row[i] = nullValue(c.Type)
-		}
-		for j, expr := range exprs {
+		for _, expr := range exprs {
 			if _, err := e.bindIn(ctx, expr, nil, ""); err != nil {
 				return 0, err
 			}
-			v, err := env.eval(expr)
-			if err != nil {
-				return 0, invalidArg(err)
-			}
-			col := meta.Columns[targets[j]]
-			cv, err := Coerce(v, col.Type)
-			if err != nil {
-				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
-			}
-			row[targets[j]] = cv
+		}
+		row, err := insertRow(env, meta, targets, exprs)
+		if err != nil {
+			return 0, err
 		}
 		rows = append(rows, row)
 	}
 	return e.store.insertRows(ctx, meta, rows)
+}
+
+// insertTargets resolves an INSERT column list (all columns if empty) to
+// column indexes.
+func insertTargets(meta *tableMeta, cols []string) ([]int, error) {
+	targets := make([]int, 0, len(meta.Columns))
+	if len(cols) == 0 {
+		for i := range meta.Columns {
+			targets = append(targets, i)
+		}
+		return targets, nil
+	}
+	for _, name := range cols {
+		i, ok := meta.resolve(name)
+		if !ok {
+			return nil, errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", name, meta.Name)
+		}
+		if slices.Contains(targets, i) {
+			return nil, errorf(adbc.StatusInvalidArgument, "column %q specified more than once", name)
+		}
+		targets = append(targets, i)
+	}
+	return targets, nil
+}
+
+// insertRow evaluates the values of one inserted row into a full row ordered
+// like meta.Columns (columns not listed are NULL), coerced to the column
+// types and checked against NOT NULL.
+func insertRow(env *evalEnv, meta *tableMeta, targets []int, exprs []Expr) ([]Value, error) {
+	row := make([]Value, len(meta.Columns))
+	for i, c := range meta.Columns {
+		row[i] = nullValue(c.Type)
+	}
+	for j, expr := range exprs {
+		v, err := env.eval(expr)
+		if err != nil {
+			return nil, invalidArg(err)
+		}
+		col := meta.Columns[targets[j]]
+		cv, err := Coerce(v, col.Type)
+		if err != nil {
+			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
+		}
+		row[targets[j]] = cv
+	}
+	for i, c := range meta.Columns {
+		if row[i].Null && !c.Nullable {
+			return nil, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
+		}
+	}
+	return row, nil
 }
 
 // insertSelect implements INSERT INTO … SELECT.
@@ -422,18 +454,11 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		e.paramTypes = paramTypes
 	}
 	plan := &selectPlan{sel: sel}
-	if len(sel.With) > 0 {
-		defs := map[string]*CTE{}
-		for i := range sel.With {
-			key := strings.ToLower(sel.With[i].Name)
-			if _, dup := defs[key]; dup {
-				return nil, errorf(adbc.StatusInvalidArgument, "WITH query name %q specified more than once", sel.With[i].Name)
-			}
-			defs[key] = &sel.With[i]
-		}
-		e.ctes = append(e.ctes, defs)
-		defer func() { e.ctes = e.ctes[:len(e.ctes)-1] }()
+	pop, err := e.pushCTEs(sel.With)
+	if err != nil {
+		return nil, err
 	}
+	defer pop()
 	if sel.SetOp != nil {
 		return e.planSetOp(ctx, sel, plan)
 	}
@@ -766,83 +791,174 @@ func collectAggregates(e Expr, out *[]*Func) {
 }
 
 // ---- UPDATE / DELETE ----
+//
+// UPDATE, DELETE and MERGE (dml.go) first find their rows and compute and
+// check every new value (casts, column types, NOT NULL), and only then write.
+// Writes are pipelined, pipelineChunk commands per round trip, each touching
+// a single row key, so they work on a cluster, where a table's rows are
+// spread over hash slots. There is no transaction: if a write fails part-way
+// (say the connection drops), the chunks already sent stay applied.
 
 func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value) (int64, error) {
+	pop, err := e.pushCTEs(st.With)
+	if err != nil {
+		return 0, err
+	}
+	defer pop()
+	if len(st.From) > 0 {
+		return e.runUpdateFrom(ctx, st, params)
+	}
 	meta, err := e.loadTable(ctx, st.Table)
 	if err != nil {
 		return 0, err
 	}
+	name := st.Alias
+	if name == "" {
+		name = meta.Name
+	}
+	cols, err := setTargets(meta, name, st.Sets)
+	if err != nil {
+		return 0, err
+	}
 	need := map[string]bool{}
-	targets := make([]int, len(st.Sets))
-	for i, s := range st.Sets {
-		idx, ok := meta.resolve(s.Column)
-		if !ok {
-			return 0, errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", s.Column, meta.Name)
-		}
-		targets[i] = idx
-		needs, err := e.bindIn(ctx, s.Expr, meta, meta.Name)
+	for _, s := range st.Sets {
+		needs, err := e.bindIn(ctx, s.Expr, meta, name)
 		if err != nil {
 			return 0, err
 		}
 		columnRefs(s.Expr, need)
-		for k := range needs {
-			need[k] = true
-		}
+		maps.Copy(need, needs)
 	}
-	keys, rows, err := e.matchRows(ctx, meta, st.Where, params, need)
+	keys, rows, err := e.matchRows(ctx, meta, name, st.Where, params, need)
 	if err != nil {
 		return 0, err
 	}
 	env := e.newEnv(ctx, meta.types(), params)
-	for start := 0; start < len(keys); start += pipelineChunk {
-		end := min(start+pipelineChunk, len(keys))
-		pipe := e.store.client.Pipeline()
-		for r := start; r < end; r++ {
-			env.row = rows[r]
-			var set []any
-			var del []string
-			for i, s := range st.Sets {
-				col := meta.Columns[targets[i]]
-				v, err := env.eval(s.Expr)
-				if err != nil {
-					return 0, invalidArg(err)
-				}
-				cv, err := Coerce(v, col.Type)
-				if err != nil {
-					return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
-				}
-				if cv.Null {
-					if !col.Nullable {
-						return 0, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", col.Name)
-					}
-					del = append(del, col.field())
-				} else {
-					set = append(set, col.field(), encodeStored(cv))
-				}
-			}
-			if len(set) > 0 {
-				pipe.HSet(ctx, keys[r], set...)
-			}
-			if len(del) > 0 {
-				pipe.HDel(ctx, keys[r], del...)
-			}
+	changes := make([]rowChange, len(keys))
+	for r, key := range keys {
+		env.row = rows[r]
+		vals, err := setValues(env, meta, cols, st.Sets)
+		if err != nil {
+			return 0, err
 		}
-		if _, err := pipe.Exec(ctx); err != nil {
-			return 0, wrapRedis(err, "failed to update rows")
-		}
+		changes[r] = newRowChange(meta, key, cols, vals)
+	}
+	if err := e.writeUpdates(ctx, changes); err != nil {
+		return 0, err
 	}
 	return int64(len(keys)), nil
 }
 
 func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value) (int64, error) {
+	pop, err := e.pushCTEs(st.With)
+	if err != nil {
+		return 0, err
+	}
+	defer pop()
+	if len(st.Using) > 0 {
+		return e.runDeleteUsing(ctx, st, params)
+	}
 	meta, err := e.loadTable(ctx, st.Table)
 	if err != nil {
 		return 0, err
 	}
-	keys, _, err := e.matchRows(ctx, meta, st.Where, params, nil)
+	name := st.Alias
+	if name == "" {
+		name = meta.Name
+	}
+	keys, _, err := e.matchRows(ctx, meta, name, st.Where, params, nil)
 	if err != nil {
 		return 0, err
 	}
+	if err := e.deleteKeys(ctx, keys); err != nil {
+		return 0, err
+	}
+	return int64(len(keys)), nil
+}
+
+// setTargets resolves the columns of a SET list in the target table. A
+// qualified column (`t.col`) must name the target by its alias or name.
+func setTargets(meta *tableMeta, alias string, sets []SetClause) ([]int, error) {
+	cols := make([]int, len(sets))
+	for i, s := range sets {
+		if s.Qualifier != "" && !strings.EqualFold(s.Qualifier, alias) && !strings.EqualFold(s.Qualifier, meta.Name) {
+			return nil, errorf(adbc.StatusInvalidArgument, "SET column %s.%s is not in the table being updated (%q)", s.Qualifier, s.Column, alias)
+		}
+		idx, ok := meta.resolve(s.Column)
+		if !ok {
+			return nil, errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", s.Column, meta.Name)
+		}
+		cols[i] = idx
+	}
+	return cols, nil
+}
+
+// setValues evaluates a SET list for the row in env: the new value of each
+// target column, coerced to its type and checked against NOT NULL.
+func setValues(env *evalEnv, meta *tableMeta, cols []int, sets []SetClause) ([]Value, error) {
+	vals := make([]Value, len(sets))
+	for i, s := range sets {
+		col := meta.Columns[cols[i]]
+		v, err := env.eval(s.Expr)
+		if err != nil {
+			return nil, invalidArg(err)
+		}
+		cv, err := Coerce(v, col.Type)
+		if err != nil {
+			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
+		}
+		if cv.Null && !col.Nullable {
+			return nil, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", col.Name)
+		}
+		vals[i] = cv
+	}
+	return vals, nil
+}
+
+// rowChange is a pending update of one row HASH: fields to set (HSET) and
+// the fields of columns set to NULL (HDEL).
+type rowChange struct {
+	key string
+	set []any
+	del []string
+}
+
+func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChange {
+	ch := rowChange{key: key}
+	for i, v := range vals {
+		col := meta.Columns[cols[i]]
+		if v.Null {
+			ch.del = append(ch.del, col.field())
+		} else {
+			ch.set = append(ch.set, col.field(), encodeStored(v))
+		}
+	}
+	return ch
+}
+
+// writeUpdates applies row changes with pipelined HSET / HDEL. The index
+// follows the HASHes by itself.
+func (e *executor) writeUpdates(ctx context.Context, changes []rowChange) error {
+	for start := 0; start < len(changes); start += pipelineChunk {
+		end := min(start+pipelineChunk, len(changes))
+		pipe := e.store.client.Pipeline()
+		for _, ch := range changes[start:end] {
+			if len(ch.set) > 0 {
+				pipe.HSet(ctx, ch.key, ch.set...)
+			}
+			if len(ch.del) > 0 {
+				pipe.HDel(ctx, ch.key, ch.del...)
+			}
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return wrapRedis(err, "failed to update rows")
+		}
+	}
+	return nil
+}
+
+// deleteKeys deletes row HASHes with pipelined DELs.
+func (e *executor) deleteKeys(ctx context.Context, keys []string) error {
 	for start := 0; start < len(keys); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(keys))
 		// One DEL per key: rows live in different hash slots.
@@ -851,8 +967,8 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 			pipe.Del(ctx, k)
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
-			return 0, wrapRedis(err, "failed to delete rows")
+			return wrapRedis(err, "failed to delete rows")
 		}
 	}
-	return int64(len(keys)), nil
+	return nil
 }

@@ -265,20 +265,75 @@ type DropTableStmt struct {
 	IfExists bool
 }
 
+// SetClause is one `column = expr` of a SET list. Qualifier is the optional
+// target table or alias written before the column (`t.col = …`).
 type SetClause struct {
-	Column string
-	Expr   Expr
+	Qualifier string
+	Column    string
+	Expr      Expr
 }
 
+// UpdateStmt is [WITH …] UPDATE t [[AS] alias] SET … [FROM …] [WHERE …].
 type UpdateStmt struct {
+	With  []CTE
 	Table TableName
+	Alias string
 	Sets  []SetClause
+	// From holds the items of UPDATE … FROM, as in a SELECT's FROM clause:
+	// the first has an empty Kind, the rest are joins or comma items.
+	From  []JoinClause
 	Where Expr
 }
 
+// DeleteStmt is [WITH …] DELETE FROM t [[AS] alias] [USING …] [WHERE …];
+// Using holds the items like UpdateStmt.From.
 type DeleteStmt struct {
+	With  []CTE
 	Table TableName
+	Alias string
+	Using []JoinClause
 	Where Expr
+}
+
+// MergeStmt is [WITH …] MERGE INTO t [[AS] alias] USING source ON cond
+// followed by WHEN clauses. Source is a FROM item (Kind is empty).
+type MergeStmt struct {
+	With    []CTE
+	Table   TableName
+	Alias   string
+	Source  JoinClause
+	On      Expr
+	Clauses []MergeClause
+}
+
+// MergeMatch says which rows a WHEN clause applies to.
+type MergeMatch int
+
+const (
+	MergeMatched            MergeMatch = iota // WHEN MATCHED
+	MergeNotMatched                           // WHEN NOT MATCHED [BY TARGET]
+	MergeNotMatchedBySource                   // WHEN NOT MATCHED BY SOURCE
+)
+
+type MergeAction int
+
+const (
+	MergeDoNothing MergeAction = iota
+	MergeUpdate
+	MergeDelete
+	MergeInsert
+)
+
+// MergeClause is WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND Cond] THEN
+// UPDATE SET … | DELETE | INSERT [(Columns)] VALUES (…) | INSERT DEFAULT
+// VALUES | DO NOTHING.
+type MergeClause struct {
+	Match   MergeMatch
+	Cond    Expr
+	Action  MergeAction
+	Sets    []SetClause
+	Columns []string
+	Values  []Expr // nil for INSERT DEFAULT VALUES
 }
 
 type CreateSchemaStmt struct {
@@ -307,6 +362,7 @@ func (*CreateTableStmt) stmtNode()  {}
 func (*DropTableStmt) stmtNode()    {}
 func (*UpdateStmt) stmtNode()       {}
 func (*DeleteStmt) stmtNode()       {}
+func (*MergeStmt) stmtNode()        {}
 func (*CreateSchemaStmt) stmtNode() {}
 func (*DropSchemaStmt) stmtNode()   {}
 func (*CreateViewStmt) stmtNode()   {}
@@ -644,7 +700,37 @@ func (p *parser) parseTableName() (TableName, error) {
 
 func (p *parser) parseStatement() (Stmt, error) {
 	switch {
-	case p.isKeyword("SELECT"), p.isKeyword("WITH"), p.isOp("("):
+	case p.isKeyword("WITH"):
+		// WITH … SELECT, or WITH … UPDATE / DELETE / MERGE.
+		with, err := p.parseWith()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case p.isKeyword("UPDATE"):
+			st, err := p.parseUpdate()
+			if err != nil {
+				return nil, err
+			}
+			st.With = with
+			return st, nil
+		case p.isKeyword("DELETE"):
+			st, err := p.parseDelete()
+			if err != nil {
+				return nil, err
+			}
+			st.With = with
+			return st, nil
+		case p.isKeyword("MERGE"):
+			st, err := p.parseMerge()
+			if err != nil {
+				return nil, err
+			}
+			st.With = with
+			return st, nil
+		}
+		return p.parseSelectBody(with)
+	case p.isKeyword("SELECT"), p.isOp("("):
 		return p.parseSelect()
 	case p.isKeyword("INSERT"):
 		return p.parseInsert()
@@ -656,6 +742,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseUpdate()
 	case p.isKeyword("DELETE"):
 		return p.parseDelete()
+	case p.isKeyword("MERGE"):
+		return p.parseMerge()
 	case p.isKeyword("ALTER"):
 		return p.parseAlter()
 	case p.isKeyword("TRUNCATE"):
@@ -703,18 +791,23 @@ func (p *parser) parseFromItem() (*TableName, *SelectStmt, string, error) {
 		}
 		table = &t
 	}
-	alias := ""
-	if p.acceptKeyword("AS") {
-		a, err := p.parseIdent()
-		if err != nil {
-			return nil, nil, "", err
-		}
-		alias = a
-	} else if t := p.peek(); t.kind == tokQuotedIdent || (t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)]) {
-		p.pos++
-		alias = t.text
+	alias, err := p.parseAlias()
+	if err != nil {
+		return nil, nil, "", err
 	}
 	return table, sub, alias, nil
+}
+
+// parseAlias parses an optional `[AS] alias` after a table or FROM item.
+func (p *parser) parseAlias() (string, error) {
+	if p.acceptKeyword("AS") {
+		return p.parseIdent()
+	}
+	if t := p.peek(); t.kind == tokQuotedIdent || (t.kind == tokIdent && !reservedAfterExpr[strings.ToUpper(t.text)]) {
+		p.pos++
+		return t.text, nil
+	}
+	return "", nil
 }
 
 // parseSubquery parses `SELECT … )` after an opening parenthesis.
@@ -730,49 +823,63 @@ func (p *parser) parseSubquery() (*SelectStmt, error) {
 }
 
 func (p *parser) parseSelect() (Stmt, error) {
+	with, err := p.parseWith()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseSelectBody(with)
+}
+
+// parseWith parses an optional WITH list (nil if there is none).
+func (p *parser) parseWith() ([]CTE, error) {
+	if !p.acceptKeyword("WITH") {
+		return nil, nil
+	}
+	if p.acceptKeyword("RECURSIVE") {
+		return nil, &sqlError{msg: "WITH RECURSIVE is not supported"}
+	}
 	var with []CTE
-	if p.acceptKeyword("WITH") {
-		if p.acceptKeyword("RECURSIVE") {
-			return nil, &sqlError{msg: "WITH RECURSIVE is not supported"}
+	for {
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
 		}
-		for {
-			name, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			cte := CTE{Name: name}
-			if p.acceptOp("(") {
-				for {
-					c, err := p.parseIdent()
-					if err != nil {
-						return nil, err
-					}
-					cte.Columns = append(cte.Columns, c)
-					if !p.acceptOp(",") {
-						break
-					}
-				}
-				if err := p.expectOp(")"); err != nil {
+		cte := CTE{Name: name}
+		if p.acceptOp("(") {
+			for {
+				c, err := p.parseIdent()
+				if err != nil {
 					return nil, err
 				}
+				cte.Columns = append(cte.Columns, c)
+				if !p.acceptOp(",") {
+					break
+				}
 			}
-			if err := p.expectKeyword("AS"); err != nil {
+			if err := p.expectOp(")"); err != nil {
 				return nil, err
-			}
-			if err := p.expectOp("("); err != nil {
-				return nil, err
-			}
-			body, err := p.parseSubquery()
-			if err != nil {
-				return nil, err
-			}
-			cte.Select = body
-			with = append(with, cte)
-			if !p.acceptOp(",") {
-				break
 			}
 		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		body, err := p.parseSubquery()
+		if err != nil {
+			return nil, err
+		}
+		cte.Select = body
+		with = append(with, cte)
+		if !p.acceptOp(",") {
+			return with, nil
+		}
 	}
+}
+
+// parseSelectBody parses a query after its WITH list.
+func (p *parser) parseSelectBody(with []CTE) (Stmt, error) {
 	body, err := p.parseSetExpr()
 	if err != nil {
 		return nil, err
@@ -944,65 +1051,12 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 		}
 	}
 	if p.acceptKeyword("FROM") {
-		table, sub, alias, err := p.parseFromItem()
+		items, err := p.parseFromList()
 		if err != nil {
 			return nil, err
 		}
-		sel.From, sel.FromSelect, sel.FromAlias = table, sub, alias
-		for {
-			kind := ""
-			switch {
-			case p.acceptOp(","):
-				kind = "CROSS"
-			case p.acceptKeyword("CROSS", "JOIN"):
-				kind = "CROSS"
-			case p.acceptKeyword("INNER", "JOIN"), p.acceptKeyword("JOIN"):
-				kind = "INNER"
-			case p.acceptKeyword("LEFT", "OUTER", "JOIN"), p.acceptKeyword("LEFT", "JOIN"):
-				kind = "LEFT"
-			case p.acceptKeyword("RIGHT", "OUTER", "JOIN"), p.acceptKeyword("RIGHT", "JOIN"):
-				kind = "RIGHT"
-			case p.acceptKeyword("FULL", "OUTER", "JOIN"), p.acceptKeyword("FULL", "JOIN"):
-				kind = "FULL"
-			case p.isKeyword("NATURAL"):
-				return nil, &sqlError{msg: "NATURAL JOIN is not supported; use USING or ON"}
-			}
-			if kind == "" {
-				break
-			}
-			jc := JoinClause{Kind: kind}
-			if jc.Table, jc.Select, jc.Alias, err = p.parseFromItem(); err != nil {
-				return nil, err
-			}
-			if kind != "CROSS" {
-				switch {
-				case p.acceptKeyword("ON"):
-					if jc.On, err = p.parseExpr(); err != nil {
-						return nil, err
-					}
-				case p.acceptKeyword("USING"):
-					if err := p.expectOp("("); err != nil {
-						return nil, err
-					}
-					for {
-						c, err := p.parseIdent()
-						if err != nil {
-							return nil, err
-						}
-						jc.Using = append(jc.Using, c)
-						if !p.acceptOp(",") {
-							break
-						}
-					}
-					if err := p.expectOp(")"); err != nil {
-						return nil, err
-					}
-				default:
-					return nil, syntaxErr("%s JOIN requires ON or USING", kind)
-				}
-			}
-			sel.Joins = append(sel.Joins, jc)
-		}
+		sel.From, sel.FromSelect, sel.FromAlias = items[0].Table, items[0].Select, items[0].Alias
+		sel.Joins = items[1:]
 	}
 	if p.acceptKeyword("WHERE") {
 		e, err := p.parseExpr()
@@ -1033,6 +1087,72 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 	return sel, nil
 }
 
+// parseFromList parses the items of a FROM clause: the first item (with an
+// empty Kind), then any number of `, item`, `CROSS JOIN item` and
+// `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…)`.
+func (p *parser) parseFromList() ([]JoinClause, error) {
+	var first JoinClause
+	var err error
+	if first.Table, first.Select, first.Alias, err = p.parseFromItem(); err != nil {
+		return nil, err
+	}
+	items := []JoinClause{first}
+	for {
+		kind := ""
+		switch {
+		case p.acceptOp(","):
+			kind = "CROSS"
+		case p.acceptKeyword("CROSS", "JOIN"):
+			kind = "CROSS"
+		case p.acceptKeyword("INNER", "JOIN"), p.acceptKeyword("JOIN"):
+			kind = "INNER"
+		case p.acceptKeyword("LEFT", "OUTER", "JOIN"), p.acceptKeyword("LEFT", "JOIN"):
+			kind = "LEFT"
+		case p.acceptKeyword("RIGHT", "OUTER", "JOIN"), p.acceptKeyword("RIGHT", "JOIN"):
+			kind = "RIGHT"
+		case p.acceptKeyword("FULL", "OUTER", "JOIN"), p.acceptKeyword("FULL", "JOIN"):
+			kind = "FULL"
+		case p.isKeyword("NATURAL"):
+			return nil, &sqlError{msg: "NATURAL JOIN is not supported; use USING or ON"}
+		}
+		if kind == "" {
+			return items, nil
+		}
+		jc := JoinClause{Kind: kind}
+		if jc.Table, jc.Select, jc.Alias, err = p.parseFromItem(); err != nil {
+			return nil, err
+		}
+		if kind != "CROSS" {
+			switch {
+			case p.acceptKeyword("ON"):
+				if jc.On, err = p.parseExpr(); err != nil {
+					return nil, err
+				}
+			case p.acceptKeyword("USING"):
+				if err := p.expectOp("("); err != nil {
+					return nil, err
+				}
+				for {
+					c, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					jc.Using = append(jc.Using, c)
+					if !p.acceptOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, syntaxErr("%s JOIN requires ON or USING", kind)
+			}
+		}
+		items = append(items, jc)
+	}
+}
+
 func (p *parser) parseCount() (int64, error) {
 	t := p.next()
 	if t.kind != tokNumber {
@@ -1055,18 +1175,8 @@ func (p *parser) parseInsert() (Stmt, error) {
 	}
 	ins := &InsertStmt{Table: t}
 	// `INSERT INTO t (SELECT …)`: a parenthesized query, not a column list.
-	if !p.isParenQueryStart() && p.acceptOp("(") {
-		for {
-			c, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			ins.Columns = append(ins.Columns, c)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-		if err := p.expectOp(")"); err != nil {
+	if !p.isParenQueryStart() {
+		if ins.Columns, err = p.parseColumnList(); err != nil {
 			return nil, err
 		}
 	}
@@ -1416,7 +1526,8 @@ func (p *parser) parseTruncate() (Stmt, error) {
 	return st, nil
 }
 
-func (p *parser) parseUpdate() (Stmt, error) {
+// parseUpdate parses UPDATE t [[AS] alias] SET … [FROM …] [WHERE …].
+func (p *parser) parseUpdate() (*UpdateStmt, error) {
 	if err := p.expectKeyword("UPDATE"); err != nil {
 		return nil, err
 	}
@@ -1425,37 +1536,58 @@ func (p *parser) parseUpdate() (Stmt, error) {
 		return nil, err
 	}
 	st := &UpdateStmt{Table: t}
+	if st.Alias, err = p.parseAlias(); err != nil {
+		return nil, err
+	}
 	if err := p.expectKeyword("SET"); err != nil {
 		return nil, err
 	}
+	if st.Sets, err = p.parseSetList(); err != nil {
+		return nil, err
+	}
+	if p.acceptKeyword("FROM") {
+		if st.From, err = p.parseFromList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.acceptKeyword("WHERE") {
+		if st.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	return st, nil
+}
+
+// parseSetList parses `[qualifier.]column = expr, …`.
+func (p *parser) parseSetList() ([]SetClause, error) {
+	var sets []SetClause
 	for {
 		col, err := p.parseIdent()
 		if err != nil {
 			return nil, err
 		}
+		s := SetClause{Column: col}
+		if p.acceptOp(".") {
+			if s.Column, err = p.parseIdent(); err != nil {
+				return nil, err
+			}
+			s.Qualifier = col
+		}
 		if err := p.expectOp("="); err != nil {
 			return nil, err
 		}
-		e, err := p.parseExpr()
-		if err != nil {
+		if s.Expr, err = p.parseExpr(); err != nil {
 			return nil, err
 		}
-		st.Sets = append(st.Sets, SetClause{Column: col, Expr: e})
+		sets = append(sets, s)
 		if !p.acceptOp(",") {
-			break
+			return sets, nil
 		}
 	}
-	if p.acceptKeyword("WHERE") {
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		st.Where = e
-	}
-	return st, nil
 }
 
-func (p *parser) parseDelete() (Stmt, error) {
+// parseDelete parses DELETE FROM t [[AS] alias] [USING …] [WHERE …].
+func (p *parser) parseDelete() (*DeleteStmt, error) {
 	if err := p.expectKeyword("DELETE", "FROM"); err != nil {
 		return nil, err
 	}
@@ -1464,14 +1596,155 @@ func (p *parser) parseDelete() (Stmt, error) {
 		return nil, err
 	}
 	st := &DeleteStmt{Table: t}
+	if st.Alias, err = p.parseAlias(); err != nil {
+		return nil, err
+	}
+	if p.acceptKeyword("USING") {
+		if st.Using, err = p.parseFromList(); err != nil {
+			return nil, err
+		}
+	}
 	if p.acceptKeyword("WHERE") {
-		e, err := p.parseExpr()
+		if st.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	return st, nil
+}
+
+// parseMerge parses
+//
+//	MERGE [INTO] t [[AS] alias] USING source [[AS] alias] ON cond
+//	{ WHEN MATCHED [AND cond] THEN { UPDATE SET … | DELETE | DO NOTHING }
+//	| WHEN NOT MATCHED [BY TARGET] [AND cond] THEN
+//	    { INSERT [(cols)] { VALUES (…) | DEFAULT VALUES } | DO NOTHING }
+//	| WHEN NOT MATCHED BY SOURCE [AND cond] THEN { UPDATE SET … | DELETE | DO NOTHING } } …
+func (p *parser) parseMerge() (*MergeStmt, error) {
+	if err := p.expectKeyword("MERGE"); err != nil {
+		return nil, err
+	}
+	p.acceptKeyword("INTO")
+	t, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	st := &MergeStmt{Table: t}
+	if st.Alias, err = p.parseAlias(); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("USING"); err != nil {
+		return nil, err
+	}
+	if st.Source.Table, st.Source.Select, st.Source.Alias, err = p.parseFromItem(); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	if st.On, err = p.parseExpr(); err != nil {
+		return nil, err
+	}
+	for p.acceptKeyword("WHEN") {
+		var c MergeClause
+		switch {
+		case p.acceptKeyword("MATCHED"):
+			c.Match = MergeMatched
+		case p.acceptKeyword("NOT", "MATCHED"):
+			c.Match = MergeNotMatched
+			if p.acceptKeyword("BY", "SOURCE") {
+				c.Match = MergeNotMatchedBySource
+			} else {
+				p.acceptKeyword("BY", "TARGET")
+			}
+		default:
+			return nil, syntaxErr("expected MATCHED or NOT MATCHED after WHEN near %q", p.peek().text)
+		}
+		if p.acceptKeyword("AND") {
+			if c.Cond, err = p.parseExpr(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKeyword("THEN"); err != nil {
+			return nil, err
+		}
+		action := strings.ToUpper(p.peek().text)
+		switch {
+		case p.acceptKeyword("UPDATE"):
+			if err := p.expectKeyword("SET"); err != nil {
+				return nil, err
+			}
+			if c.Sets, err = p.parseSetList(); err != nil {
+				return nil, err
+			}
+			c.Action = MergeUpdate
+		case p.acceptKeyword("DELETE"):
+			c.Action = MergeDelete
+		case p.acceptKeyword("INSERT"):
+			c.Action = MergeInsert
+			if p.acceptKeyword("DEFAULT", "VALUES") {
+				break
+			}
+			if c.Columns, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("VALUES"); err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				c.Values = append(c.Values, e)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		case p.acceptKeyword("DO", "NOTHING"):
+			c.Action = MergeDoNothing
+		default:
+			return nil, syntaxErr("expected UPDATE, DELETE, INSERT or DO NOTHING after THEN near %q", p.peek().text)
+		}
+		switch {
+		case c.Action == MergeInsert && c.Match != MergeNotMatched:
+			return nil, syntaxErr("INSERT is only allowed in WHEN NOT MATCHED [BY TARGET] clauses")
+		case c.Action != MergeInsert && c.Action != MergeDoNothing && c.Match == MergeNotMatched:
+			return nil, syntaxErr("%s is not allowed in WHEN NOT MATCHED [BY TARGET] clauses (only INSERT or DO NOTHING)", action)
+		}
+		st.Clauses = append(st.Clauses, c)
+	}
+	if len(st.Clauses) == 0 {
+		return nil, syntaxErr("MERGE needs at least one WHEN clause near %q", p.peek().text)
+	}
+	return st, nil
+}
+
+// parseColumnList parses an optional parenthesized list of column names.
+func (p *parser) parseColumnList() ([]string, error) {
+	if !p.acceptOp("(") {
+		return nil, nil
+	}
+	var cols []string
+	for {
+		c, err := p.parseIdent()
 		if err != nil {
 			return nil, err
 		}
-		st.Where = e
+		cols = append(cols, c)
+		if !p.acceptOp(",") {
+			break
+		}
 	}
-	return st, nil
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return cols, nil
 }
 
 // parseTypeSpec parses a SQL type such as DOUBLE PRECISION, VARCHAR(10),
