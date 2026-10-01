@@ -287,6 +287,16 @@ type CreateSchemaStmt struct {
 type DropSchemaStmt struct {
 	Name     string
 	IfExists bool
+	// Cascade drops the schema's views and tables first; without it
+	// (RESTRICT, the default) a schema that still has any is not dropped.
+	Cascade bool
+}
+
+// TruncateStmt is TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY].
+type TruncateStmt struct {
+	Tables []TableName
+	// RestartIdentity restarts the row id sequence (__rowid) at 1.
+	RestartIdentity bool
 }
 
 func (*SelectStmt) stmtNode()       {}
@@ -299,6 +309,7 @@ func (*CreateSchemaStmt) stmtNode() {}
 func (*DropSchemaStmt) stmtNode()   {}
 func (*CreateViewStmt) stmtNode()   {}
 func (*DropViewStmt) stmtNode()     {}
+func (*TruncateStmt) stmtNode()     {}
 
 // CreateViewStmt is CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS
 // SELECT …; Text is the SELECT's source text, which is what gets stored.
@@ -645,6 +656,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseDelete()
 	case p.isKeyword("ALTER"):
 		return p.parseAlter()
+	case p.isKeyword("TRUNCATE"):
+		return p.parseTruncate()
 	}
 	return nil, &sqlError{msg: fmt.Sprintf("unsupported statement starting with %q", p.peek().text)}
 }
@@ -663,12 +676,18 @@ var reservedAfterExpr = map[string]bool{
 // isQueryStart reports whether the next token begins a (sub)query.
 func (p *parser) isQueryStart() bool { return p.isKeyword("SELECT") || p.isKeyword("WITH") }
 
+// isParenQueryStart reports whether the next tokens open a parenthesized
+// query: `(SELECT`, `(WITH`, or `((` (a parenthesized set operation branch).
+func (p *parser) isParenQueryStart() bool {
+	return p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH") ||
+		(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "("))
+}
+
 // parseFromItem parses `table [[AS] alias]` or `(SELECT …) [AS] alias`.
 func (p *parser) parseFromItem() (*TableName, *SelectStmt, string, error) {
 	var table *TableName
 	var sub *SelectStmt
-	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH") ||
-		(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(")) {
+	if p.isParenQueryStart() {
 		p.pos++
 		s, err := p.parseSubquery()
 		if err != nil {
@@ -882,8 +901,7 @@ func (p *parser) parseSetTerm() (*SelectStmt, error) {
 // parseSetPrimary parses a SELECT, or a parenthesized query (which may have
 // its own WITH, ORDER BY and LIMIT).
 func (p *parser) parseSetPrimary() (*SelectStmt, error) {
-	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH") ||
-		(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(")) {
+	if p.isParenQueryStart() {
 		p.pos++
 		return p.parseSubquery()
 	}
@@ -1034,7 +1052,8 @@ func (p *parser) parseInsert() (Stmt, error) {
 		return nil, err
 	}
 	ins := &InsertStmt{Table: t}
-	if p.acceptOp("(") {
+	// `INSERT INTO t (SELECT …)`: a parenthesized query, not a column list.
+	if !p.isParenQueryStart() && p.acceptOp("(") {
 		for {
 			c, err := p.parseIdent()
 			if err != nil {
@@ -1049,7 +1068,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, err
 		}
 	}
-	if p.isQueryStart() {
+	if p.isQueryStart() || p.isParenQueryStart() {
 		sel, err := p.parseSelect()
 		if err != nil {
 			return nil, err
@@ -1275,6 +1294,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if st.Column, err = p.parseIdent(); err != nil {
 			return nil, err
 		}
+		p.parseDropBehavior()
 		st.Action = AlterDropColumn
 	default:
 		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN)", p.peek().text)}
@@ -1316,6 +1336,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 			return nil, err
 		}
 		st.Name = name
+		p.parseDropBehavior()
 		return st, nil
 	}
 	if p.acceptKeyword("SCHEMA") {
@@ -1326,6 +1347,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 			return nil, err
 		}
 		st.Name = name
+		st.Cascade = p.parseDropBehavior()
 		return st, nil
 	}
 	if err := p.expectKeyword("TABLE"); err != nil {
@@ -1338,6 +1360,46 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return nil, err
 	}
 	st.Table = t
+	p.parseDropBehavior()
+	return st, nil
+}
+
+// parseDropBehavior accepts an optional CASCADE or RESTRICT and reports
+// whether it was CASCADE. Only DROP SCHEMA acts on it: the driver doesn't
+// track dependencies between tables and views, so dropping a table or view
+// never drops (or checks for) views that read it.
+func (p *parser) parseDropBehavior() bool {
+	if p.acceptKeyword("CASCADE") {
+		return true
+	}
+	p.acceptKeyword("RESTRICT")
+	return false
+}
+
+func (p *parser) parseTruncate() (Stmt, error) {
+	if err := p.expectKeyword("TRUNCATE"); err != nil {
+		return nil, err
+	}
+	p.acceptKeyword("TABLE")
+	p.acceptKeyword("ONLY")
+	st := &TruncateStmt{}
+	for {
+		t, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		st.Tables = append(st.Tables, t)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	switch {
+	case p.acceptKeyword("RESTART", "IDENTITY"):
+		st.RestartIdentity = true
+	case p.acceptKeyword("CONTINUE", "IDENTITY"):
+	}
+	// There are no foreign keys, so CASCADE and RESTRICT mean the same.
+	p.parseDropBehavior()
 	return st, nil
 }
 

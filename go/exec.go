@@ -132,12 +132,45 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 	case *CreateSchemaStmt:
 		return execResult{affected: -1}, e.store.createSchema(ctx, st.Name, st.IfNotExists)
 	case *DropSchemaStmt:
-		return execResult{affected: -1}, e.store.dropSchema(ctx, st.Name, st.IfExists)
+		return execResult{affected: -1}, e.store.dropSchema(ctx, st.Name, st.IfExists, st.Cascade)
+	case *TruncateStmt:
+		return execResult{affected: -1}, e.runTruncate(ctx, st)
 	}
 	return execResult{}, errorf(adbc.StatusNotImplemented, "unsupported statement %T", ps.Stmt)
 }
 
 // ---- DDL ----
+
+// runTruncate empties each table. Every name is resolved first, so a missing
+// table or a view in the list leaves all of them untouched.
+func (e *executor) runTruncate(ctx context.Context, st *TruncateStmt) error {
+	type target struct{ schema, name string }
+	var targets []target
+	for _, t := range st.Tables {
+		schema, name, err := e.resolveTable(t)
+		if err != nil {
+			return err
+		}
+		if isInfoSchema(schema) {
+			return infoSchemaReadOnly()
+		}
+		if isView, err := e.store.viewExists(ctx, schema, name); err != nil {
+			return err
+		} else if isView {
+			return errorf(adbc.StatusInvalidArgument, "cannot truncate %q.%q: it is a view", schema, name)
+		}
+		if _, err := e.store.getTable(ctx, schema, name); err != nil {
+			return err
+		}
+		targets = append(targets, target{schema, name})
+	}
+	for _, t := range targets {
+		if err := e.store.truncateTable(ctx, t.schema, t.name, st.RestartIdentity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) error {
 	schema, name, err := e.resolveTable(st.Table)

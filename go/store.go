@@ -574,14 +574,7 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	// left over from an interrupted CREATE/DROP and can be discarded.
 	_ = s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err()
 
-	args := []any{"FT.CREATE", meta.index(), "ON", "HASH", "PREFIX", 1, meta.prefix(),
-		"SKIPINITIALSCAN", "SCHEMA", rowIDField, "NUMERIC", "SORTABLE"}
-	for _, c := range meta.Columns {
-		if c.Indexed {
-			args = append(args, indexAttrArgs(c)...)
-		}
-	}
-	if err := s.searchDo(ctx, meta.index(), args...).Err(); err != nil {
+	if err := s.searchDo(ctx, meta.index(), indexCreateArgs(meta)...).Err(); err != nil {
 		release()
 		return false, wrapRedis(err, "failed to create search index")
 	}
@@ -593,6 +586,43 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		return false, wrapRedis(err, "failed to register table")
 	}
 	return true, nil
+}
+
+// indexCreateArgs is the FT.CREATE command for a table's index: every
+// indexed column, plus __rowid so all-NULL rows are still documents.
+func indexCreateArgs(meta *tableMeta) []any {
+	args := []any{"FT.CREATE", meta.index(), "ON", "HASH", "PREFIX", 1, meta.prefix(),
+		"SKIPINITIALSCAN", "SCHEMA", rowIDField, "NUMERIC", "SORTABLE"}
+	for _, c := range meta.Columns {
+		if c.Indexed {
+			args = append(args, indexAttrArgs(c)...)
+		}
+	}
+	return args
+}
+
+// truncateTable removes every row but keeps the table: its metadata, key
+// prefix and index name. Dropping the index with DD deletes every document
+// it knows about (as DROP TABLE does), and it is then recreated empty. Rows
+// written by another connection while this runs may be left unindexed.
+func (s *store) truncateTable(ctx context.Context, schema, table string, restartIdentity bool) error {
+	meta, err := s.getTable(ctx, schema, table)
+	if err != nil {
+		return err
+	}
+	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
+		!isUnknownIndex(err) {
+		return wrapRedis(err, "failed to truncate table")
+	}
+	if err := s.searchDo(ctx, meta.index(), indexCreateArgs(meta)...).Err(); err != nil {
+		return wrapRedis(err, "failed to recreate search index")
+	}
+	if restartIdentity {
+		if err := s.client.Del(ctx, seqKey(schema, table)).Err(); err != nil {
+			return wrapRedis(err, "failed to restart the row id sequence")
+		}
+	}
+	return nil
 }
 
 // dropTable removes the index, every row, and the table metadata.
@@ -671,7 +701,10 @@ func (s *store) createSchema(ctx context.Context, schema string, ifNotExists boo
 	return nil
 }
 
-func (s *store) dropSchema(ctx context.Context, schema string, ifExists bool) error {
+// dropSchema drops an empty schema or, with cascade, its views and tables
+// first. Views are dropped before tables; views in other schemas that read
+// these tables are not dropped (dependencies aren't tracked).
+func (s *store) dropSchema(ctx context.Context, schema string, ifExists, cascade bool) error {
 	exists, err := s.schemaExists(ctx, schema)
 	if err != nil {
 		return err
@@ -686,8 +719,26 @@ func (s *store) dropSchema(ctx context.Context, schema string, ifExists bool) er
 	if err != nil {
 		return err
 	}
-	if len(tables) > 0 {
-		return errorf(adbc.StatusInvalidState, "schema %q is not empty", schema)
+	views, err := s.listViews(ctx, schema)
+	if err != nil {
+		return err
+	}
+	if len(tables)+len(views) > 0 {
+		if !cascade {
+			return errorf(adbc.StatusInvalidState,
+				"schema %q is not empty (%d tables, %d views); use DROP SCHEMA … CASCADE to drop them too",
+				schema, len(tables), len(views))
+		}
+		for _, v := range views {
+			if err := s.dropView(ctx, schema, v, true); err != nil {
+				return err
+			}
+		}
+		for _, t := range tables {
+			if err := s.dropTable(ctx, schema, t, true); err != nil {
+				return err
+			}
+		}
 	}
 	if err := s.client.SRem(ctx, schemasKey, schema).Err(); err != nil {
 		return wrapRedis(err, "failed to drop schema")

@@ -352,6 +352,7 @@ How SQL is executed:
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
 | Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
@@ -386,12 +387,24 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 - `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [NOINDEX], …)`,
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
-  `DROP TABLE [IF EXISTS] t`, `CREATE/DROP SCHEMA`,
+  `DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]`,
+  `CREATE SCHEMA [IF NOT EXISTS] s`,
   `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS SELECT …`,
-  `DROP VIEW [IF EXISTS] v`
+  `DROP VIEW [IF EXISTS] v [CASCADE | RESTRICT]`
+- `DROP SCHEMA [IF EXISTS] s [CASCADE | RESTRICT]`: `RESTRICT` (the default)
+  refuses a schema that still has tables or views; `CASCADE` drops its views,
+  then its tables (indexes and rows), then the schema. Dependencies between
+  tables and views aren't tracked, so `CASCADE` / `RESTRICT` on `DROP TABLE`,
+  `DROP VIEW` and `DROP COLUMN` are accepted but don't drop or check views
+  that read the object (such a view fails when queried, as it does after a
+  plain `DROP`)
+- `TRUNCATE [TABLE] [ONLY] t [, …] [RESTART IDENTITY | CONTINUE IDENTITY]
+  [CASCADE | RESTRICT]` removes every row and keeps the table (metadata, key
+  prefix, index). Row ids continue unless `RESTART IDENTITY` is given. All
+  names are checked before any table is emptied
 - `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
   `RENAME [COLUMN] a TO b`, `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOINDEX]`,
-  `DROP [COLUMN] [IF EXISTS] c`. All of them only change metadata, so they
+  `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`. All of them only change metadata, so they
   take the same time at any table size:
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
     was created), so no row is touched.
@@ -403,7 +416,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     process exits first). A dropped column's values never reappear, even if
     a column with the same name is added later.
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals or `?` / `$n`
-  parameters, and `INSERT INTO t [(cols)] SELECT …`
+  parameters, and `INSERT INTO t [(cols)] SELECT …` (the query may be
+  parenthesized: `INSERT INTO t (SELECT …)`)
 - `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM item {, item |
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item}
   [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,

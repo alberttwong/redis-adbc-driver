@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1172,4 +1173,191 @@ func TestSQLScanAcrossCursorPages(t *testing.T) {
 	// Driver-side filter and aggregate over every page.
 	h.expectRows(`SELECT COUNT(*), SUM(id) FROM it_pages WHERE label LIKE '%5'`,
 		fmt.Sprintf("%d|%d", n/10, (5+n-5)*(n/10)/2))
+}
+
+// tablePrefix returns a table's row key prefix.
+func (h *sqlHarness) tablePrefix(c goredis.UniversalClient, schema, table string) string {
+	h.t.Helper()
+	meta, err := (&store{client: c}).getTable(h.ctx, schema, table)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return meta.prefix()
+}
+
+// prefixKeyCount counts the keys under a row key prefix (on every master of
+// a cluster), independently of any index.
+func (h *sqlHarness) prefixKeyCount(c goredis.UniversalClient, prefix string) int {
+	h.t.Helper()
+	var mu sync.Mutex
+	total := 0
+	count := func(ctx context.Context, n *goredis.Client) error {
+		keys, err := n.Keys(ctx, prefix+"*").Result()
+		mu.Lock()
+		total += len(keys)
+		mu.Unlock()
+		return err
+	}
+	var err error
+	if cc, ok := c.(*goredis.ClusterClient); ok {
+		err = cc.ForEachMaster(h.ctx, count)
+	} else {
+		err = count(h.ctx, c.(*goredis.Client))
+	}
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return total
+}
+
+func TestSQLInsertParenthesizedQuery(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() { h.exec("DROP TABLE IF EXISTS it_ins_paren") }
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_ins_paren (id BIGINT, s VARCHAR)")
+
+	// With and without a column list; the `(` after the table name is a query,
+	// not a column list, when SELECT / WITH / `(` follows it.
+	if n := h.exec("INSERT INTO it_ins_paren (id, s) (SELECT 1, 'a')"); n != 1 {
+		t.Errorf("rows affected = %d, want 1", n)
+	}
+	h.exec("INSERT INTO it_ins_paren (SELECT 2, 'b')")
+	h.exec("INSERT INTO it_ins_paren ((SELECT 3, 'c') UNION ALL (SELECT 4, 'd'))")
+	h.exec("INSERT INTO it_ins_paren (WITH x AS (SELECT 5 AS id, 'e' AS s) SELECT id, s FROM x)")
+	// dbt's incremental insert: a parenthesized SELECT from another relation.
+	if n := h.exec("INSERT INTO it_ins_paren (id, s) (SELECT id + 10, s FROM it_ins_paren WHERE id <= 2)"); n != 2 {
+		t.Errorf("rows affected = %d, want 2", n)
+	}
+	// Column lists and VALUES are unchanged.
+	h.exec("INSERT INTO it_ins_paren (s, id) VALUES ('f', 6)")
+	h.expectRows("SELECT id, s FROM it_ins_paren ORDER BY id",
+		"1|a", "2|b", "3|c", "4|d", "5|e", "6|f", "11|a", "12|b")
+
+	h.expectError("INSERT INTO it_ins_paren (SELECT 1)", "2 target columns but the query returns 1")
+	h.expectError("INSERT INTO it_ins_paren (id, s) (SELECT 1, 'x'", "syntax error")
+}
+
+func TestSQLTruncate(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_trunc_v")
+		h.exec("DROP TABLE IF EXISTS it_trunc")
+		h.exec("DROP TABLE IF EXISTS it_trunc2")
+	}
+	drop()
+	t.Cleanup(drop)
+	raw := h.rawClient()
+
+	h.exec("CREATE TABLE it_trunc (id BIGINT NOT NULL, name VARCHAR, note VARCHAR NOINDEX)")
+	h.exec("INSERT INTO it_trunc VALUES (1, 'a', 'x'), (2, 'b', NULL), (3, 'c', 'z')")
+	// The index is rebuilt from metadata, so columns added or renamed by
+	// ALTER TABLE must still be indexed afterwards.
+	h.exec("ALTER TABLE it_trunc ADD COLUMN qty INTEGER")
+	h.exec("ALTER TABLE it_trunc RENAME COLUMN name TO label")
+	h.exec("INSERT INTO it_trunc (id, label, qty) VALUES (4, 'd', 7)")
+	h.exec("CREATE TABLE it_trunc2 (k VARCHAR)")
+	h.exec("INSERT INTO it_trunc2 VALUES ('p'), ('q')")
+	h.exec("CREATE VIEW it_trunc_v AS SELECT id FROM it_trunc")
+
+	h.exec("TRUNCATE TABLE it_trunc")
+	h.expectRows("SELECT COUNT(*) FROM it_trunc", "0")
+	if n := h.prefixKeyCount(raw, h.tablePrefix(raw, "public", "it_trunc")); n != 0 {
+		t.Errorf("%d row keys left after TRUNCATE", n)
+	}
+	h.expectRows("SELECT COUNT(*) FROM it_trunc2", "2")
+	h.expectRows(`SELECT column_name, data_type, is_indexed FROM information_schema.columns
+		WHERE table_name = 'it_trunc' ORDER BY ordinal_position`,
+		"id|BIGINT|YES", "label|VARCHAR|YES", "note|VARCHAR|NO", "qty|INTEGER|YES")
+
+	// The table still works, filters still use the index, and row ids
+	// continue (CONTINUE IDENTITY is the default).
+	h.exec("INSERT INTO it_trunc (id, label, note, qty) VALUES (5, 'e', 'n', 1), (6, 'f', NULL, 9)")
+	h.expectRows("SELECT id, label, note, qty FROM it_trunc WHERE qty > 5 AND label = 'f'", "6|f|NULL|9")
+	h.expectRows("SELECT __rowid, id FROM it_trunc ORDER BY id", "5|5", "6|6")
+	h.expectRows("SELECT id FROM it_trunc_v ORDER BY id", "5", "6")
+
+	// RESTART IDENTITY, several tables at once, and no TABLE keyword.
+	h.exec("TRUNCATE it_trunc, it_trunc2 RESTART IDENTITY CASCADE")
+	h.expectRows("SELECT COUNT(*) FROM it_trunc2", "0")
+	h.exec("INSERT INTO it_trunc (id) VALUES (7)")
+	h.expectRows("SELECT __rowid, id FROM it_trunc", "1|7")
+
+	// A bad name anywhere in the list leaves every table untouched.
+	h.expectError("TRUNCATE it_trunc, it_trunc_missing", "does not exist")
+	h.expectRows("SELECT COUNT(*) FROM it_trunc", "1")
+	h.expectError("TRUNCATE it_trunc_v", "it is a view")
+	h.expectError("TRUNCATE information_schema.tables", "read-only")
+}
+
+func TestSQLDropSchemaCascade(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP SCHEMA IF EXISTS it_cascade CASCADE")
+		h.exec("DROP SCHEMA IF EXISTS it_cascade_v CASCADE")
+	}
+	drop()
+	t.Cleanup(drop)
+	raw := h.rawClient()
+
+	h.exec("CREATE SCHEMA it_cascade")
+	h.exec("CREATE TABLE it_cascade.t1 (id BIGINT, s VARCHAR)")
+	h.exec("INSERT INTO it_cascade.t1 VALUES (1, 'a'), (2, 'b')")
+	h.exec("CREATE TABLE it_cascade.t2 AS SELECT id FROM it_cascade.t1")
+	h.exec("CREATE VIEW it_cascade.v1 AS SELECT id FROM t1 WHERE id > 1")
+
+	// RESTRICT (the default) refuses a schema with tables or views.
+	h.expectError("DROP SCHEMA it_cascade", "is not empty (2 tables, 1 views)")
+	h.expectError("DROP SCHEMA it_cascade RESTRICT", "is not empty")
+	h.expectRows("SELECT id FROM it_cascade.v1", "2")
+
+	// A schema holding only a view is not empty either (it used to be
+	// dropped, leaving the view behind).
+	h.exec("CREATE SCHEMA it_cascade_v")
+	h.exec("CREATE VIEW it_cascade_v.only AS SELECT 1 AS a")
+	h.expectError("DROP SCHEMA it_cascade_v", "is not empty (0 tables, 1 views)")
+	h.exec("DROP SCHEMA it_cascade_v CASCADE")
+	h.expectRows("SELECT COUNT(*) FROM information_schema.views WHERE table_schema = 'it_cascade_v'", "0")
+	h.expectError("SELECT * FROM it_cascade_v.only", "does not exist")
+
+	// CASCADE drops the views, the tables (index and rows), then the schema.
+	prefix := h.tablePrefix(raw, "it_cascade", "t1")
+	if n := h.prefixKeyCount(raw, prefix); n != 2 {
+		t.Fatalf("it_cascade.t1 has %d row keys, want 2", n)
+	}
+	h.exec("DROP SCHEMA it_cascade CASCADE")
+	h.expectRows("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'it_cascade'", "0")
+	h.expectRows("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'it_cascade'", "0")
+	if n := h.prefixKeyCount(raw, prefix); n != 0 {
+		t.Errorf("%d row keys left after DROP SCHEMA … CASCADE", n)
+	}
+	h.expectError("SELECT * FROM it_cascade.t1", "does not exist")
+	h.expectError("DROP SCHEMA it_cascade CASCADE", "does not exist")
+	h.exec("DROP SCHEMA IF EXISTS it_cascade CASCADE")
+
+	// The names are free again.
+	h.exec("CREATE SCHEMA it_cascade")
+	h.exec("CREATE VIEW it_cascade.v1 AS SELECT 3 AS id")
+	h.expectRows("SELECT id FROM it_cascade.v1", "3")
+}
+
+func TestSQLDropBehaviorKeywords(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_dropkw_v")
+		h.exec("DROP TABLE IF EXISTS it_dropkw")
+	}
+	drop()
+	t.Cleanup(drop)
+
+	// dbt's default macros end DROP TABLE / DROP VIEW / DROP COLUMN with
+	// CASCADE; the keywords are accepted (dependencies aren't tracked).
+	h.exec("CREATE TABLE it_dropkw (a BIGINT, b VARCHAR)")
+	h.exec("CREATE VIEW it_dropkw_v AS SELECT a FROM it_dropkw")
+	h.exec("ALTER TABLE it_dropkw DROP COLUMN b CASCADE")
+	h.expectRows("SELECT column_name FROM information_schema.columns WHERE table_name = 'it_dropkw'", "a")
+	h.exec("DROP VIEW IF EXISTS it_dropkw_v RESTRICT")
+	h.exec("DROP TABLE IF EXISTS it_dropkw CASCADE")
+	h.expectRows("SELECT COUNT(*) FROM information_schema.tables WHERE table_name LIKE 'it_dropkw%'", "0")
+	h.expectError("DROP TABLE it_dropkw CASCADE extra", "syntax error")
 }
