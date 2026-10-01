@@ -58,6 +58,14 @@ QUERIES = [
      "SELECT c.country, COUNT(*) FROM sales s JOIN customers c ON s.customer_id = c.customer_id GROUP BY c.country"),
     ("correlated subquery (50 rows)",
      "SELECT c.name, (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.customer_id) FROM customers c"),
+    ("IN (SELECT …), half the rows",
+     "SELECT COUNT(*) FROM sales WHERE order_id IN (SELECT order_id FROM sales WHERE quantity > 10)"),
+    ("correlated EXISTS (semi-join)",
+     "SELECT COUNT(*) FROM sales s WHERE EXISTS "
+     "(SELECT 1 FROM sales r WHERE r.order_id = s.order_id AND r.quantity > 10)"),
+    ("correlated EXISTS, no inner rows",
+     "SELECT COUNT(*) FROM sales s WHERE EXISTS "
+     "(SELECT 1 FROM sales r WHERE r.order_id = s.order_id AND r.quantity > 20)"),
     ("UNION of two filters",
      "SELECT order_id FROM sales WHERE country = 'JPN' AND quantity = 20 "
      "UNION SELECT order_id FROM sales WHERE product = 'gizmo' AND quantity = 20"),

@@ -1018,11 +1018,16 @@ const maxUnionTerms = 1000
 
 // unionTerm turns a membership predicate on an indexed column into a
 // RediSearch union query: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`.
+// A semi-join (correlated EXISTS / IN) becomes one on its outer column.
 func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *evalEnv) (string, bool, error) {
 	var col *ColumnRef
 	var values []Value
 	switch x := c.(type) {
 	case *Subquery:
+		if x.semi != nil && !x.Not {
+			q, ok := e.semiJoinTerm(ctx, x, meta)
+			return q, ok, nil
+		}
 		if x.Kind != SubqueryIn || x.Not || x.correlated {
 			return "", false, nil
 		}

@@ -24,8 +24,9 @@ package redis
 //
 // Subqueries run through the same executor: uncorrelated ones once per
 // statement (cached), correlated ones once per distinct set of outer values
-// (memoised). CTEs and derived tables are run once and held in memory as a
-// relation that the regular driver-side filter/sort/group paths read.
+// (memoised), unless they can run once as a semi-join (semijoin.go). CTEs and
+// derived tables are run once and held in memory as a relation that the
+// regular driver-side filter/sort/group paths read.
 
 import (
 	"context"
@@ -54,7 +55,9 @@ type scope struct {
 // execCache holds per-statement results shared by nested executors.
 type execCache struct {
 	sub           map[*Subquery][][]Value
+	inSets        map[*Subquery]*inSet
 	memo          map[*Subquery]map[string][][]Value
+	semi          map[*Subquery]*semiResult
 	ctes          map[*CTE]*tableMeta
 	derived       map[*SelectStmt]*tableMeta
 	materializing map[any]bool
@@ -65,7 +68,9 @@ type execCache struct {
 func newExecCache() *execCache {
 	return &execCache{
 		sub:           map[*Subquery][][]Value{},
+		inSets:        map[*Subquery]*inSet{},
 		memo:          map[*Subquery]map[string][][]Value{},
+		semi:          map[*Subquery]*semiResult{},
 		ctes:          map[*CTE]*tableMeta{},
 		derived:       map[*SelectStmt]*tableMeta{},
 		materializing: map[any]bool{},
@@ -178,6 +183,7 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 						continue
 					}
 					sq.correlated = true
+					sq.outerUses++
 					ref := outerRef{name: col.Name, up: depth - k - 1}
 					if !containsRef(sq.outerRefs, ref) {
 						sq.outerRefs = append(sq.outerRefs, ref)
@@ -218,6 +224,7 @@ func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
 		one := int64(1)
 		sq.Select.Limit = &one
 	}
+	sq.outerUses, sq.semi = 0, nil
 	e.pendingSq = sq
 	plan, err := e.planSelect(ctx, sq.Select, e.paramTypes)
 	e.pendingSq = nil
@@ -228,6 +235,7 @@ func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
 		return errorf(adbc.StatusInvalidArgument, "subquery must return exactly one column, got %d", len(plan.items))
 	}
 	sq.plan = plan
+	e.planSemiJoin(ctx, sq)
 	return nil
 }
 
@@ -404,6 +412,7 @@ func (e *executor) subqueryRows(ctx context.Context, sq *Subquery, env *evalEnv)
 	if sq.correlated {
 		child.outer = env
 	}
+	subqueryStats.runs.Add(1)
 	rows, err := child.runSelect(ctx, sq.plan, e.params)
 	if err != nil {
 		return nil, err
@@ -441,6 +450,11 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 	if env.exec == nil {
 		return Value{}, fmt.Errorf("subqueries are not supported here")
 	}
+	if sq.semi != nil {
+		if v, ok, err := env.exec.evalSemiJoin(env, sq); ok || err != nil {
+			return v, err
+		}
+	}
 	rows, err := env.exec.subqueryRows(env.ctx, sq, env)
 	if err != nil {
 		return Value{}, err
@@ -462,29 +476,10 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	if len(rows) == 0 {
-		return boolValue(sq.Not), nil
+	set := &inSet{rows: rows, noIndex: true}
+	if !sq.correlated {
+		// The same rows for every outer row: probe a hash set.
+		set = env.exec.cachedInSet(sq, rows)
 	}
-	if x.Null {
-		return nullValue(typeBool), nil
-	}
-	found, sawNull := false, false
-	for _, row := range rows {
-		v := row[0]
-		if v.Null {
-			sawNull = true
-			continue
-		}
-		if c, ok := compareValues(x, v); ok && c == 0 {
-			found = true
-			break
-		}
-	}
-	switch {
-	case found:
-		return boolValue(!sq.Not), nil
-	case sawNull:
-		return nullValue(typeBool), nil
-	}
-	return boolValue(sq.Not), nil
+	return set.eval(x, sq.Not), nil
 }
