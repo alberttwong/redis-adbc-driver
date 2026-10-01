@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 )
@@ -182,6 +183,11 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		} else if ok {
 			terms = append(terms, term)
 			addResidual(c)
+			continue
+		}
+		if term, ok := likePrefixTerm(c, meta, env); ok {
+			terms = append(terms, term)
+			addResidual(c) // re-checked exactly on fetched rows
 			continue
 		}
 		colRef, op, other, ok := comparison(c)
@@ -1035,4 +1041,34 @@ func unionQuery(cm columnMeta, values []Value) (string, bool) {
 		return fmt.Sprintf("@%s:{%s}", cm.field(), strings.Join(parts, " | ")), true
 	}
 	return "(" + strings.Join(parts, " | ") + ")", true
+}
+
+// likePrefixTerm turns `col LIKE 'abc%'` on an indexed string column into a
+// TAG prefix query `@col:{abc*}` (RediSearch needs at least two characters).
+func likePrefixTerm(c Expr, meta *tableMeta, env *evalEnv) (string, bool) {
+	f, ok := c.(*Func)
+	if !ok || f.Name != "LIKE" || len(f.Args) != 2 {
+		return "", false
+	}
+	ref, ok := f.Args[0].(*ColumnRef)
+	if !ok || ref.Outer != 0 || !isConstant(f.Args[1]) {
+		return "", false
+	}
+	col, ok := meta.column(ref.Name)
+	if !ok || !col.Indexed || col.Type.Kind != KindString || !simpleName(col.field()) {
+		return "", false
+	}
+	pv, err := env.eval(f.Args[1])
+	if err != nil || pv.Null {
+		return "", false
+	}
+	pat := pv.Text()
+	if !strings.HasSuffix(pat, "%") {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(pat, "%")
+	if utf8.RuneCountInString(prefix) < 2 || strings.ContainsAny(prefix, "%_") || strings.Contains(prefix, tagSeparator) {
+		return "", false
+	}
+	return fmt.Sprintf("@%s:{%s*}", col.field(), escapeTag(prefix)), true
 }

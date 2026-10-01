@@ -344,6 +344,9 @@ func TestSQLDerivedTablesAndCTEs(t *testing.T) {
 	h.setupOrders()
 
 	// Derived tables.
+	// An IN list on a joined (alias-qualified) column.
+	h.expectRows(`SELECT o.id FROM it_orders o JOIN it_customers c ON c.id = o.customer_id
+		WHERE c.country IN ('GBR', 'XXX') ORDER BY o.id`, "1", "2")
 	h.expectRows(`SELECT tier, COUNT(*) FROM (
 			SELECT customer_id, CASE WHEN SUM(qty) > 5 THEN 'big' ELSE 'small' END AS tier
 			FROM it_orders GROUP BY customer_id) AS t
@@ -719,4 +722,68 @@ func TestSQLAlterCleanupResumes(t *testing.T) {
 		return !m
 	})
 	h2.expectRows(`SELECT id, v FROM it_resume ORDER BY id`, "1|1", "2|2", "3|3")
+}
+
+func TestSQLInformationSchema(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP VIEW IF EXISTS it_is_view")
+	h.exec(`CREATE VIEW it_is_view AS SELECT id, amount FROM it_orders WHERE qty > 1`)
+	t.Cleanup(func() { h.exec("DROP VIEW IF EXISTS it_is_view") })
+
+	h.expectRows(`SELECT schema_name FROM information_schema.schemata
+		WHERE schema_name IN ('public', 'information_schema') ORDER BY schema_name`,
+		"information_schema", "public")
+	h.expectRows(`SELECT table_name, table_type FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name LIKE 'it_%' ORDER BY table_name`,
+		"it_customers|BASE TABLE", "it_is_view|VIEW", "it_orders|BASE TABLE")
+	h.expectRows(`SELECT column_name, ordinal_position, data_type, is_nullable, numeric_precision, numeric_scale, is_indexed
+		FROM information_schema.columns WHERE table_name = 'it_orders' ORDER BY ordinal_position`,
+		"id|1|INTEGER|NO|32|0|YES",
+		"customer_id|2|INTEGER|YES|32|0|YES",
+		"amount|3|NUMERIC(10,2)|YES|10|2|YES",
+		"qty|4|INTEGER|YES|32|0|YES",
+		"status|5|VARCHAR|YES|NULL|NULL|YES")
+	h.expectRows(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'it_is_view' ORDER BY ordinal_position`,
+		"id|INTEGER", "amount|NUMERIC(10,2)")
+	h.expectRows(`SELECT view_definition FROM information_schema.views WHERE table_name = 'it_is_view'`,
+		"SELECT id, amount FROM it_orders WHERE qty > 1")
+
+	// Any SQL works: joins and grouping across information_schema tables.
+	h.expectRows(`SELECT t.table_type, COUNT(*) FROM information_schema.tables t
+		JOIN information_schema.columns c ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+		WHERE t.table_name IN ('it_orders', 'it_is_view') GROUP BY t.table_type ORDER BY t.table_type`,
+		"BASE TABLE|5", "VIEW|2")
+
+	// It reflects ALTER TABLE.
+	h.exec(`ALTER TABLE it_customers RENAME COLUMN name TO full_name`)
+	h.expectRows(`SELECT column_name FROM information_schema.columns WHERE table_name = 'it_customers' ORDER BY ordinal_position`,
+		"id", "full_name", "country")
+
+	// Read-only.
+	h.expectError(`CREATE TABLE information_schema.x (a INT)`, "read-only")
+	h.expectError(`CREATE VIEW information_schema.v AS SELECT 1 AS a`, "read-only")
+	h.expectError(`SELECT * FROM information_schema.nope`, "does not exist")
+}
+
+func TestSQLLike(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP TABLE IF EXISTS it_like")
+	h.exec("CREATE TABLE it_like (id INTEGER, s VARCHAR)")
+	h.exec(`INSERT INTO it_like VALUES (1, 'apple'), (2, 'Apricot'), (3, 'banana'), (4, '50% off'),
+		(5, 'a_b'), (6, 'axb'), (7, NULL), (8, 'ap'), (9, 'こんにちは')`)
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_like") })
+
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE 'ap%' ORDER BY id`, "1", "8") // prefix: index query
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE '%an%' ORDER BY id`, "3")
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE 'a_b' ORDER BY id`, "5", "6")        // _ is one character
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE 'a\_b' ESCAPE '\' ORDER BY id`, "5") // escaped _
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE '%\%%' ESCAPE '\'`, "4")
+	h.expectRows(`SELECT id FROM it_like WHERE s ILIKE 'ap%' ORDER BY id`, "1", "2", "8")
+	// No lowercase 'a' (LIKE is case-sensitive); NULL is neither LIKE nor NOT LIKE.
+	h.expectRows(`SELECT id FROM it_like WHERE s NOT LIKE '%a%' ORDER BY id`, "2", "4", "9")
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE 'こん%'`, "9")
+	h.expectRows(`SELECT id FROM it_like WHERE s LIKE '%'  ORDER BY id`, "1", "2", "3", "4", "5", "6", "8", "9")
+	h.expectRows(`SELECT 'abc' LIKE 'a%c', 'abc' LIKE 'b%', NULL LIKE 'a'`, "true|false|NULL")
 }

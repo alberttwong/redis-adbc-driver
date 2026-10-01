@@ -345,6 +345,22 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			b.WriteString(a.Text())
 		}
 		return stringValue(b.String()), nil
+	case "LIKE", "ILIKE":
+		if len(args) < 2 || len(args) > 3 {
+			return Value{}, fmt.Errorf("%s expects a pattern", f.Name)
+		}
+		esc := ""
+		if len(args) == 3 {
+			esc = args[2].Text()
+			if utf8.RuneCountInString(esc) > 1 {
+				return Value{}, fmt.Errorf("ESCAPE must be a single character")
+			}
+		}
+		s, pat := args[0].Text(), args[1].Text()
+		if f.Name == "ILIKE" {
+			s, pat, esc = strings.ToLower(s), strings.ToLower(pat), strings.ToLower(esc)
+		}
+		return boolValue(likeMatch(s, pat, esc)), nil
 	case "ABS":
 		if err := need(1); err != nil {
 			return Value{}, err
@@ -548,6 +564,8 @@ func inferFuncType(f *Func, args []ColType) ColType {
 	switch f.Name {
 	case "COUNT", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LEN":
 		return typeInt64
+	case "LIKE", "ILIKE":
+		return typeBool
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
 		return typeBinary
 	case "TO_HEX", "HEX", "LOWER", "LCASE", "UPPER", "UCASE", "CONCAT":
@@ -691,4 +709,47 @@ func commonType(a, b ColType) ColType {
 		return a
 	}
 	return typeString
+}
+
+// likeMatch implements SQL LIKE: '%' matches any run of characters, '_' one
+// character, and esc (if set) makes the next character literal.
+func likeMatch(s, pat, esc string) bool {
+	sr, pr := []rune(s), []rune(pat)
+	var escR rune = -1
+	if esc != "" {
+		escR = []rune(esc)[0]
+	}
+	// Iterative matching with backtracking on the last '%'.
+	si, pi, star, mark := 0, 0, -1, 0
+	for si < len(sr) {
+		if pi < len(pr) {
+			c, literal := pr[pi], false
+			if c == escR && pi+1 < len(pr) {
+				c, literal = pr[pi+1], true
+			}
+			switch {
+			case !literal && c == '%':
+				star, mark = pi, si
+				pi++
+				continue
+			case (!literal && c == '_') || c == sr[si]:
+				si++
+				if literal {
+					pi += 2
+				} else {
+					pi++
+				}
+				continue
+			}
+		}
+		if star < 0 {
+			return false
+		}
+		mark++
+		si, pi = mark, star+1
+	}
+	for pi < len(pr) && pr[pi] == '%' && rune('%') != escR {
+		pi++
+	}
+	return pi == len(pr)
 }

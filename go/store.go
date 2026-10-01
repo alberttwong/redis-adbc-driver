@@ -494,6 +494,9 @@ func (s *store) tableExists(ctx context.Context, schema, table string) (bool, er
 // createTable registers the table metadata and creates its search index.
 // It returns false (and no error) if the table exists and ifNotExists is set.
 func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bool) (bool, error) {
+	if isInfoSchema(meta.Schema) {
+		return false, infoSchemaReadOnly()
+	}
 	if len(meta.Columns) == 0 {
 		return false, errorf(adbc.StatusInvalidArgument, "table %q must have at least one column", meta.Name)
 	}
@@ -648,6 +651,12 @@ func (s *store) schemaExists(ctx context.Context, schema string) (bool, error) {
 func (s *store) createSchema(ctx context.Context, schema string, ifNotExists bool) error {
 	if schema == "" {
 		return errorf(adbc.StatusInvalidArgument, "schema name must not be empty")
+	}
+	if isInfoSchema(schema) {
+		if ifNotExists {
+			return nil
+		}
+		return errorf(adbc.StatusAlreadyExists, "schema %q already exists", schema)
 	}
 	n, err := s.client.SAdd(ctx, schemasKey, schema).Result()
 	if err != nil {
