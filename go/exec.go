@@ -606,7 +606,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 				return nil, err
 			}
 			for _, c := range cols {
-				plan.items = append(plan.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.field(), typ: c.Type})
+				plan.items = append(plan.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.outputName(), typ: c.Type})
 			}
 			continue
 		}
@@ -629,7 +629,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 					}
 				case plan.meta != nil:
 					if col, ok := plan.meta.column(c.Name); ok {
-						name = col.field()
+						name = col.outputName()
 					}
 				}
 			} else {

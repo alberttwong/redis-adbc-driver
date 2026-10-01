@@ -107,12 +107,25 @@ type columnMeta struct {
 	// in defaults.go). MissingThrough is 0 when there were none.
 	Missing        string `json:"missing,omitempty"`
 	MissingThrough int64  `json:"missing_through,omitempty"`
+	// label is the name a result column takes from the column when it
+	// differs from Name: joined relations name columns alias.column but
+	// output them as column.
+	label string
 }
 
 // field returns the HASH field and index attribute name of the column.
 func (c columnMeta) field() string {
 	if c.Field != "" {
 		return c.Field
+	}
+	return c.Name
+}
+
+// outputName returns the name of a result column that selects the column.
+// It is not field(): a renamed column keeps its original HASH field.
+func (c columnMeta) outputName() string {
+	if c.label != "" {
+		return c.label
 	}
 	return c.Name
 }
