@@ -272,6 +272,24 @@ func (e *executor) materialize(ctx context.Context, key any, name string, sel *S
 	return memTable(name, plan.columns(), rows, rename)
 }
 
+// pushCTEs makes a statement's WITH list visible while it is planned; the
+// returned function removes it again.
+func (e *executor) pushCTEs(with []CTE) (func(), error) {
+	if len(with) == 0 {
+		return func() {}, nil
+	}
+	defs := map[string]*CTE{}
+	for i := range with {
+		key := strings.ToLower(with[i].Name)
+		if _, dup := defs[key]; dup {
+			return nil, errorf(adbc.StatusInvalidArgument, "WITH query name %q specified more than once", with[i].Name)
+		}
+		defs[key] = &with[i]
+	}
+	e.ctes = append(e.ctes, defs)
+	return func() { e.ctes = e.ctes[:len(e.ctes)-1] }, nil
+}
+
 // lookupCTE finds a CTE visible from the current query.
 func (e *executor) lookupCTE(name string) *CTE {
 	for i := len(e.ctes) - 1; i >= 0; i-- {

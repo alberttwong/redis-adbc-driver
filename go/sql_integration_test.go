@@ -1649,3 +1649,386 @@ func TestSQLScalarFunctionBind(t *testing.T) {
 		t.Errorf("bound parameters: got %q, want %q", got, want)
 	}
 }
+
+// expectAffected runs a statement and checks the number of rows it affected.
+func (h *sqlHarness) expectAffected(sql string, want int64) {
+	h.t.Helper()
+	if n := h.exec(sql); n != want {
+		h.t.Errorf("%s\n affected %d rows, want %d", sql, n, want)
+	}
+}
+
+func TestSQLMerge(t *testing.T) {
+	h := newSQLHarness(t)
+	tables := []string{"it_m_tgt", "it_m_src", "it_m_log", "it_m_n"}
+	drop := func() {
+		h.exec("DROP VIEW IF EXISTS it_m_v")
+		for _, n := range tables {
+			h.exec("DROP TABLE IF EXISTS " + n)
+		}
+	}
+	drop()
+	t.Cleanup(drop)
+	h.exec("CREATE TABLE it_m_tgt (id INTEGER NOT NULL, name VARCHAR, qty INTEGER, note VARCHAR)")
+	h.exec("CREATE TABLE it_m_src (id INTEGER, name VARCHAR, qty INTEGER, op VARCHAR)")
+	h.exec(`INSERT INTO it_m_src VALUES
+		(2, 'B', 21, 'upd'), (3, 'C', 99, 'del'), (4, 'D', 1, 'upd'), (5, 'e', 50, 'ins'), (6, 'f', 60, 'skip')`)
+	reset := func() {
+		h.exec("DELETE FROM it_m_tgt")
+		h.exec("INSERT INTO it_m_tgt VALUES (1, 'a', 10, NULL), (2, 'b', 20, NULL), (3, 'c', 30, NULL), (4, 'd', 40, NULL)")
+	}
+	const all = "SELECT id, name, qty, note FROM it_m_tgt ORDER BY id"
+	original := []string{"1|a|10|NULL", "2|b|20|NULL", "3|c|30|NULL", "4|d|40|NULL"}
+
+	// Every clause type. Within each kind the first clause whose condition
+	// holds applies: row 3 satisfies the DELETE and the UPDATE conditions and
+	// is deleted; row 4 satisfies neither and falls through to DO NOTHING.
+	reset()
+	h.expectAffected(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED AND s.op = 'del' THEN DELETE
+		WHEN MATCHED AND s.qty > t.qty THEN UPDATE SET name = s.name, qty = s.qty, note = 'updated'
+		WHEN MATCHED THEN DO NOTHING
+		WHEN NOT MATCHED AND s.op = 'skip' THEN DO NOTHING
+		WHEN NOT MATCHED THEN INSERT (id, name, qty) VALUES (s.id, s.name, s.qty)`, 3)
+	h.expectRows(all, "1|a|10|NULL", "2|B|21|updated", "4|d|40|NULL", "5|e|50|NULL")
+	// The index follows: TAG and range lookups see the new values.
+	h.expectRows(`SELECT id FROM it_m_tgt WHERE name = 'B'`, "2")
+	h.expectRows(`SELECT id FROM it_m_tgt WHERE name = 'b'`)
+	h.expectRows(`SELECT id FROM it_m_tgt WHERE qty >= 21 ORDER BY qty`, "2", "4", "5")
+	h.expectRows(`SELECT COUNT(*) FROM it_m_tgt WHERE id = 3`, "0")
+	// Running it again: rows 2 and 5 now match and nothing is newer.
+	h.expectAffected(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED AND s.qty > t.qty THEN UPDATE SET qty = s.qty
+		WHEN NOT MATCHED AND s.op <> 'skip' THEN INSERT VALUES (s.id, s.name, s.qty, s.op)`, 1)
+	h.expectRows(all, "1|a|10|NULL", "2|B|21|updated", "3|C|99|del", "4|d|40|NULL", "5|e|50|NULL")
+
+	// The issue's example: a one-row upsert from a subquery, inserting first
+	// and updating the second time.
+	reset()
+	upsert := `MERGE INTO it_m_tgt AS d USING (SELECT 7 AS id) AS s ON d.id = s.id
+		WHEN MATCHED THEN UPDATE SET qty = d.qty + 1
+		WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s.id, 0)`
+	h.expectAffected(upsert, 1)
+	h.expectAffected(upsert, 1)
+	h.expectRows(`SELECT id, qty FROM it_m_tgt WHERE id = 7`, "7|1")
+
+	// WHEN NOT MATCHED BY SOURCE (and the optional BY TARGET), with a
+	// subquery source.
+	reset()
+	h.expectAffected(`MERGE INTO it_m_tgt t USING (SELECT id, qty FROM it_m_src WHERE op = 'upd') s ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET qty = s.qty
+		WHEN NOT MATCHED BY TARGET THEN INSERT (id, qty) VALUES (s.id, s.qty)
+		WHEN NOT MATCHED BY SOURCE AND t.qty >= 30 THEN DELETE
+		WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 'stale'`, 4)
+	h.expectRows(all, "1|a|10|stale", "2|b|21|NULL", "4|d|1|NULL")
+
+	// dbt's insert_overwrite shape: ON FALSE matches nothing, so every source
+	// row is inserted and every target row is "not matched by source".
+	reset()
+	h.expectAffected(`MERGE INTO it_m_tgt AS DBT_INTERNAL_DEST
+		USING (SELECT id, name FROM it_m_src WHERE op = 'ins') AS DBT_INTERNAL_SOURCE
+		ON FALSE
+		WHEN NOT MATCHED BY SOURCE AND DBT_INTERNAL_DEST.qty < 25 THEN DELETE
+		WHEN NOT MATCHED THEN INSERT (id, name) VALUES (id, name)`, 3)
+	h.expectRows(all, "3|c|30|NULL", "4|d|40|NULL", "5|e|NULL|NULL")
+	h.expectAffected(`MERGE INTO it_m_tgt t USING it_m_src s ON 1 = 0
+		WHEN MATCHED THEN DELETE WHEN NOT MATCHED AND s.id > 5 THEN INSERT (id) VALUES (s.id)`, 1)
+	h.expectRows(`SELECT id FROM it_m_tgt ORDER BY id`, "3", "4", "5", "6")
+
+	// Sources: a CTE (unqualified names in WHEN NOT MATCHED refer to the
+	// source, the only relation it can see), a view, and a table without an
+	// alias.
+	reset()
+	h.expectAffected(`WITH s AS (SELECT id + 10 AS id, name FROM it_m_src WHERE op = 'ins')
+		MERGE INTO it_m_tgt t USING s ON t.id = s.id
+		WHEN NOT MATCHED THEN INSERT (id, name) VALUES (id, name)`, 1)
+	h.exec(`CREATE VIEW it_m_v AS SELECT id, name FROM it_m_src WHERE op IN ('skip', 'upd')`)
+	h.expectAffected(`MERGE INTO it_m_tgt USING it_m_v v ON it_m_tgt.id = v.id
+		WHEN MATCHED THEN UPDATE SET name = v.name
+		WHEN NOT MATCHED THEN INSERT (id, name) VALUES (v.id, v.name)`, 3)
+	h.expectAffected(`MERGE INTO it_m_tgt USING it_m_src ON it_m_tgt.id = it_m_src.id
+		WHEN MATCHED AND it_m_src.op = 'del' THEN UPDATE SET it_m_tgt.note = it_m_src.op`, 1)
+	h.expectRows(all, "1|a|10|NULL", "2|B|20|NULL", "3|c|30|del", "4|D|40|NULL", "6|f|NULL|NULL", "15|e|NULL|NULL")
+
+	// A target row may be changed only once. Nothing is written when the
+	// check fails, not even the rows processed before it.
+	reset()
+	h.expectError(`MERGE INTO it_m_tgt t USING (SELECT 2 AS id, 1 AS v UNION ALL SELECT 2, 2 UNION ALL SELECT 99, 0) s
+		ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET qty = s.v
+		WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)`, "MERGE command cannot affect row a second time")
+	h.expectError(`MERGE INTO it_m_tgt t USING (SELECT 1 AS id UNION ALL SELECT 1) s ON t.id = s.id
+		WHEN MATCHED THEN DELETE`, "cannot affect row a second time")
+	h.expectRows(all, original...)
+	// Matching twice is fine as long as only one match changes the row.
+	h.expectAffected(`MERGE INTO it_m_tgt t USING (SELECT 2 AS id, 1 AS v UNION ALL SELECT 2, 2) s ON t.id = s.id
+		WHEN MATCHED AND s.v = 2 THEN UPDATE SET qty = s.v
+		WHEN MATCHED THEN DO NOTHING`, 1)
+	h.expectRows(`SELECT qty FROM it_m_tgt WHERE id = 2`, "2")
+
+	// Everything is checked before anything is written: a NOT NULL violation
+	// or a bad value in a later row leaves the earlier rows untouched.
+	reset()
+	h.expectError(`MERGE INTO it_m_tgt t USING (SELECT 1 AS id, 5 AS q UNION ALL SELECT NULL, 6) s ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET qty = s.q
+		WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s.id, s.q)`, `NULL value in column "id" violates not-null constraint`)
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED AND s.op = 'del' THEN UPDATE SET qty = 'many'
+		WHEN MATCHED THEN UPDATE SET qty = s.qty`, `column "qty"`)
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET id = NULL`, "not-null constraint")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN NOT MATCHED THEN INSERT DEFAULT VALUES`, "not-null constraint")
+	h.expectRows(all, original...)
+
+	// Casts follow the column types; INSERT DEFAULT VALUES inserts NULLs.
+	h.exec("CREATE TABLE it_m_log (k INTEGER, v VARCHAR, amount NUMERIC(6,2))")
+	h.expectAffected(`MERGE INTO it_m_log l USING (SELECT '7' AS k, 3 AS v, '1.005' AS a) s ON FALSE
+		WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v, s.a)`, 1)
+	h.expectAffected(`MERGE INTO it_m_log l USING (SELECT 1 AS x) s ON FALSE WHEN NOT MATCHED THEN INSERT DEFAULT VALUES`, 1)
+	h.expectRows(`SELECT k + 1, v || '!', amount FROM it_m_log ORDER BY k`, "8|3!|1.01", "NULL|NULL|NULL")
+
+	// NULL keys never match: a NULL source key is inserted, a NULL target
+	// key is "not matched by source".
+	h.exec("CREATE TABLE it_m_n (k INTEGER, v VARCHAR)")
+	h.exec("INSERT INTO it_m_n VALUES (1, 'one'), (NULL, 'null-t')")
+	h.expectAffected(`MERGE INTO it_m_n t USING (SELECT 1 AS k, 'x' AS v UNION ALL SELECT NULL, 'null-s') s ON t.k = s.k
+		WHEN MATCHED THEN UPDATE SET v = s.v
+		WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)
+		WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = t.v || '!'`, 3)
+	h.expectRows(`SELECT k, v FROM it_m_n ORDER BY v`, "NULL|null-s", "NULL|null-t!", "1|x")
+
+	// Errors.
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN NOT MATCHED THEN INSERT (id) VALUES (t.id)`, "WHEN NOT MATCHED clauses can only refer to the source")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = s.qty`, "WHEN NOT MATCHED BY SOURCE clauses can only refer to the target")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED THEN INSERT (id) VALUES (s.id)`, "INSERT is only allowed in WHEN NOT MATCHED")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN NOT MATCHED THEN DELETE`, "DELETE is not allowed in WHEN NOT MATCHED")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id`, "at least one WHEN clause")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id)`, "2 target columns but 1 values")
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET nope = 1`, `column "nope" does not exist`)
+	h.expectError(`MERGE INTO it_m_tgt t USING it_m_src s ON t.id = s.id
+		WHEN MATCHED THEN UPDATE SET s.qty = 1`, "is not in the table being updated")
+	h.expectError(`MERGE INTO it_m_tgt s USING it_m_src s ON s.id = s.id WHEN MATCHED THEN DELETE`, "specified more than once")
+	h.expectError(`MERGE INTO it_m_v t USING it_m_src s ON t.id = s.id WHEN MATCHED THEN DELETE`, "does not exist")
+	h.expectError(`MERGE INTO it_m_tgt t USING (SELECT 1 AS id) ON TRUE WHEN MATCHED THEN DELETE`, "must have an alias")
+	h.expectRows(all, original...)
+}
+
+func TestSQLUpdateFromDeleteUsing(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.exec("DROP TABLE IF EXISTS it_regions")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_regions") })
+	h.exec("CREATE TABLE it_regions (country VARCHAR, region VARCHAR)")
+	h.exec("INSERT INTO it_regions VALUES ('GBR', 'Europe'), ('USA', 'Americas'), (NULL, 'Nowhere')")
+	const customers = "SELECT id, name, country FROM it_customers ORDER BY id"
+
+	// SET reads the FROM item; a WHERE predicate on the target alone runs in
+	// its index scan. Order 6's customer doesn't exist, so it isn't updated.
+	h.expectAffected(`UPDATE it_orders AS o SET status = c.country FROM it_customers c
+		WHERE c.id = o.customer_id AND o.qty > 1`, 3)
+	h.expectRows(`SELECT id, status FROM it_orders ORDER BY id`,
+		"1|shipped", "2|GBR", "3|USA", "4|USA", "5|returned", "6|shipped")
+	h.expectRows(`SELECT id FROM it_orders WHERE status = 'USA' ORDER BY id`, "3", "4")
+
+	// SET reading the target's own columns, from a derived table; the
+	// target named by its table name.
+	h.expectAffected(`UPDATE it_orders SET qty = it_orders.qty + d.extra FROM (SELECT 1 AS cid, 100 AS extra) d
+		WHERE it_orders.customer_id = d.cid`, 2)
+	h.expectRows(`SELECT id, qty FROM it_orders WHERE customer_id = 1 ORDER BY id`, "1|101", "2|103")
+
+	// A FROM list with a join of its own, and a comma item.
+	h.setupOrders()
+	h.expectAffected(`UPDATE it_customers AS c SET country = r.region || '/' || x.tag
+		FROM it_orders o JOIN it_regions r ON r.country = 'USA', (SELECT 'z' AS tag) x
+		WHERE o.customer_id = c.id AND o.status = 'returned'`, 1)
+	h.expectRows(customers, "1|Ada|GBR", "2|Bo|USA", "3|Cy|Americas/z", "4|Di|NULL")
+
+	// A target row matching several FROM rows is updated once, if they all
+	// give the same values; if they don't, it's an error and nothing changes.
+	h.setupOrders()
+	h.expectAffected(`UPDATE it_customers c SET name = 'has orders' FROM it_orders o WHERE o.customer_id = c.id`, 3)
+	h.expectRows(customers, "1|has orders|GBR", "2|has orders|USA", "3|has orders|USA", "4|Di|NULL")
+	h.setupOrders()
+	h.expectError(`UPDATE it_customers c SET name = o.status FROM it_orders o WHERE o.customer_id = c.id`,
+		`a row of "it_customers" matches more than one FROM row, and they set column "name" to different values`)
+	h.expectRows(customers, "1|Ada|GBR", "2|Bo|USA", "3|Cy|USA", "4|Di|NULL")
+
+	// NULL keys never match (Di's country is NULL, as is a region's).
+	h.expectAffected(`UPDATE it_customers c SET name = r.region FROM it_regions r WHERE r.country = c.country`, 3)
+	h.expectRows(customers, "1|Europe|GBR", "2|Americas|USA", "3|Americas|USA", "4|Di|NULL")
+
+	// A CTE as the FROM item, and a correlated subquery in SET reading it.
+	h.setupOrders()
+	h.expectAffected(`WITH t AS (SELECT customer_id, SUM(qty) AS units FROM it_orders GROUP BY customer_id)
+		UPDATE it_customers SET name = name || ':' || CAST(t.units AS VARCHAR) FROM t WHERE t.customer_id = it_customers.id`, 3)
+	h.expectAffected(`UPDATE it_customers c
+		SET country = (SELECT MAX(o.status) FROM it_orders o WHERE o.customer_id = r.cid)
+		FROM (SELECT 3 AS cid) r WHERE c.id = r.cid`, 1)
+	h.expectRows(customers, "1|Ada:4|GBR", "2|Bo:12|USA", "3|Cy:1|returned", "4|Di|NULL")
+
+	// Aliases also work without FROM / USING.
+	h.setupOrders()
+	h.expectAffected(`UPDATE it_orders AS o SET qty = o.qty * 2 WHERE o.id = 1`, 1)
+	h.expectAffected(`DELETE FROM it_orders o WHERE o.qty > 5`, 1)
+	h.expectRows(`SELECT id, qty FROM it_orders ORDER BY id`, "1|2", "2|3", "3|2", "5|1", "6|4")
+
+	// DELETE … USING, with a target-only filter, a join in the USING list,
+	// and a target row matching several USING rows (deleted once).
+	h.setupOrders()
+	h.expectAffected(`DELETE FROM it_orders o USING it_customers c WHERE o.customer_id = c.id AND c.country = 'USA'`, 3)
+	h.expectRows(`SELECT id FROM it_orders ORDER BY id`, "1", "2", "6")
+	h.expectAffected(`DELETE FROM it_customers AS c USING it_orders o JOIN it_regions r ON r.region = 'Europe'
+		WHERE o.customer_id = c.id AND c.country = r.country`, 1)
+	h.expectAffected(`WITH gone AS (SELECT id FROM it_customers WHERE country IS NULL)
+		DELETE FROM it_customers USING gone WHERE gone.id = it_customers.id`, 1)
+	h.expectRows(customers, "2|Bo|USA", "3|Cy|USA")
+	h.setupOrders()
+	h.expectAffected(`DELETE FROM it_customers c USING it_orders o WHERE o.customer_id = c.id`, 3)
+	h.expectRows(customers, "4|Di|NULL")
+
+	// Errors.
+	h.setupOrders()
+	h.expectError(`UPDATE it_orders SET qty = 1 FROM it_orders`, "specified more than once")
+	h.expectError(`UPDATE it_orders o SET c.qty = 1 FROM it_customers c`, "is not in the table being updated")
+	h.expectError(`UPDATE it_orders o SET qty = id FROM it_customers c WHERE c.id = o.customer_id`, "ambiguous")
+	h.expectError(`UPDATE it_orders o SET qty = 1 FROM it_customers c WHERE COUNT(*) > 1`, "aggregates are not allowed")
+	h.expectError(`DELETE FROM it_orders o USING it_customers c WHERE c.nope = o.id`, "does not exist")
+	h.expectRows(`SELECT COUNT(*) FROM it_orders`, "6")
+}
+
+// The statements dbt generates for the merge incremental strategy and for
+// snapshots.
+func TestSQLMergeDbt(t *testing.T) {
+	h := newSQLHarness(t)
+	tables := []string{"it_dbt_inc", "it_dbt_inc__dbt_tmp", "it_snap", "it_snap__dbt_tmp"}
+	drop := func() {
+		for _, n := range tables {
+			h.exec("DROP TABLE IF EXISTS " + n)
+		}
+	}
+	drop()
+	t.Cleanup(drop)
+
+	// Incremental model, merge strategy (default__get_merge_sql). dbt-core
+	// writes the INSERT values unqualified; adapters often qualify them.
+	h.exec(`CREATE TABLE it_dbt_inc (id INTEGER, name VARCHAR, updated_at TIMESTAMP)`)
+	h.exec(`INSERT INTO it_dbt_inc VALUES (1, 'a', '2024-01-01'), (2, 'b', '2024-01-01')`)
+	h.exec(`CREATE TABLE it_dbt_inc__dbt_tmp AS
+		SELECT 2 AS id, 'b2' AS name, TIMESTAMP '2024-01-02' AS updated_at
+		UNION ALL SELECT 3, 'c', TIMESTAMP '2024-01-02'`)
+	h.expectAffected(`merge into "redis"."public"."it_dbt_inc" as DBT_INTERNAL_DEST
+        using "redis"."public"."it_dbt_inc__dbt_tmp" as DBT_INTERNAL_SOURCE
+        on (DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id)
+
+    when matched then update set
+        "id" = DBT_INTERNAL_SOURCE."id","name" = DBT_INTERNAL_SOURCE."name","updated_at" = DBT_INTERNAL_SOURCE."updated_at"
+
+    when not matched then insert
+        ("id", "name", "updated_at")
+    values
+        (DBT_INTERNAL_SOURCE."id", DBT_INTERNAL_SOURCE."name", DBT_INTERNAL_SOURCE."updated_at")
+`, 2)
+	h.exec(`DELETE FROM it_dbt_inc__dbt_tmp`)
+	h.exec(`INSERT INTO it_dbt_inc__dbt_tmp VALUES (3, 'c3', '2024-01-03'), (4, 'd', '2024-01-03')`)
+	h.expectAffected(`merge into "redis"."public"."it_dbt_inc" as DBT_INTERNAL_DEST
+        using "redis"."public"."it_dbt_inc__dbt_tmp" as DBT_INTERNAL_SOURCE
+        on (DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id)
+    when matched then update set
+        "id" = DBT_INTERNAL_SOURCE."id","name" = DBT_INTERNAL_SOURCE."name","updated_at" = DBT_INTERNAL_SOURCE."updated_at"
+    when not matched then insert
+        ("id", "name", "updated_at")
+    values
+        ("id", "name", "updated_at")
+`, 2)
+	h.expectRows(`SELECT id, name, CAST(updated_at AS DATE) FROM it_dbt_inc ORDER BY id`,
+		"1|a|2024-01-01", "2|b2|2024-01-02", "3|c3|2024-01-03", "4|d|2024-01-03")
+
+	// Snapshot. The staging table holds dbt's change rows: a changed record
+	// (an 'update' row closing the current version h1 and an 'insert' row for
+	// the new one), a hard delete (h3), a new record (h4), and an 'update' for
+	// an already closed version (h0), which must be left alone.
+	snapCols := `id INTEGER, name VARCHAR, dbt_scd_id VARCHAR, dbt_updated_at TIMESTAMP,
+		dbt_valid_from TIMESTAMP, dbt_valid_to TIMESTAMP`
+	resetSnapshot := func() {
+		h.exec(`DROP TABLE IF EXISTS it_snap`)
+		h.exec(`CREATE TABLE it_snap (` + snapCols + `)`)
+		h.exec(`INSERT INTO it_snap VALUES
+			(1, 'a0', 'h0', '2024-01-01', '2024-01-01', '2024-01-05'),
+			(1, 'a', 'h1', '2024-01-05', '2024-01-05', NULL),
+			(2, 'b', 'h2', '2024-01-05', '2024-01-05', NULL),
+			(3, 'c', 'h3', '2024-01-05', '2024-01-05', NULL)`)
+	}
+	h.exec(`CREATE TABLE it_snap__dbt_tmp (dbt_change_type VARCHAR, ` + snapCols + `)`)
+	h.exec(`INSERT INTO it_snap__dbt_tmp VALUES
+		('insert', 1, 'a2', 'h1b', '2024-01-09', '2024-01-09', NULL),
+		('update', 1, 'a2', 'h1', '2024-01-09', '2024-01-05', '2024-01-09'),
+		('delete', 3, 'c', 'h3', '2024-01-05', '2024-01-05', '2024-01-09'),
+		('insert', 4, 'd', 'h4', '2024-01-09', '2024-01-09', NULL),
+		('update', 1, 'x', 'h0', '2024-01-09', '2024-01-01', '2024-01-09')`)
+	const snapshot = `SELECT dbt_scd_id, id, name, CAST(dbt_valid_to AS DATE) FROM it_snap ORDER BY dbt_scd_id`
+	want := []string{"h0|1|a0|2024-01-05", "h1|1|a|2024-01-09", "h1b|1|a2|NULL", "h2|2|b|NULL", "h3|3|c|2024-01-09", "h4|4|d|NULL"}
+
+	// dbt-postgres's snapshot_merge_sql: UPDATE … FROM with `::text` casts
+	// and the target referenced by its full name, then INSERT … SELECT.
+	resetSnapshot()
+	update := `update "redis"."public"."it_snap"
+    set dbt_valid_to = DBT_INTERNAL_SOURCE.dbt_valid_to
+    from "it_snap__dbt_tmp" as DBT_INTERNAL_SOURCE
+    where DBT_INTERNAL_SOURCE.dbt_scd_id::text = "redis"."public"."it_snap".dbt_scd_id::text
+      and DBT_INTERNAL_SOURCE.dbt_change_type::text in ('update', 'delete')
+        and "redis"."public"."it_snap".dbt_valid_to is null;`
+	insert := `insert into "redis"."public"."it_snap" ("id", "name", "dbt_scd_id", "dbt_updated_at", "dbt_valid_from", "dbt_valid_to")
+    select DBT_INTERNAL_SOURCE."id",DBT_INTERNAL_SOURCE."name",DBT_INTERNAL_SOURCE."dbt_scd_id",DBT_INTERNAL_SOURCE."dbt_updated_at",DBT_INTERNAL_SOURCE."dbt_valid_from",DBT_INTERNAL_SOURCE."dbt_valid_to"
+    from "it_snap__dbt_tmp" as DBT_INTERNAL_SOURCE
+    where DBT_INTERNAL_SOURCE.dbt_change_type::text = 'insert';`
+	h.expectAffected(update, 2)
+	h.expectAffected(insert, 2)
+	h.expectRows(snapshot, want...)
+	// The same two statements as one script, as dbt sends them.
+	resetSnapshot()
+	h.expectAffected(update+"\n\n"+insert, 2)
+	h.expectRows(snapshot, want...)
+
+	// dbt-core's default snapshot_merge_sql: the same change as one MERGE.
+	resetSnapshot()
+	h.expectAffected(`merge into "redis"."public"."it_snap" as DBT_INTERNAL_DEST
+    using "it_snap__dbt_tmp" as DBT_INTERNAL_SOURCE
+    on DBT_INTERNAL_SOURCE.dbt_scd_id = DBT_INTERNAL_DEST.dbt_scd_id
+
+    when matched
+     and DBT_INTERNAL_DEST.dbt_valid_to is null
+     and DBT_INTERNAL_SOURCE.dbt_change_type in ('update', 'delete')
+        then update
+        set dbt_valid_to = DBT_INTERNAL_SOURCE.dbt_valid_to
+
+    when not matched
+     and DBT_INTERNAL_SOURCE.dbt_change_type = 'insert'
+        then insert ("id", "name", "dbt_scd_id", "dbt_updated_at", "dbt_valid_from", "dbt_valid_to")
+        values ("id", "name", "dbt_scd_id", "dbt_updated_at", "dbt_valid_from", "dbt_valid_to")
+    ;`, 4)
+	h.expectRows(snapshot, want...)
+}
+
+// `x::type` is shorthand for CAST(x AS type) and binds tighter than any
+// operator.
+func TestSQLCastShorthand(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupOrders()
+	h.expectRows(`SELECT '42'::integer + 1, 7::text || 'x', '2024-02-29'::date + 1, '12.345'::numeric(5,2),
+			- '5'::int, '1'::int::text || '!', (2 + 3)::text, 3::double precision / 2,
+			'2024-01-01 10:00'::timestamp with time zone`,
+		"43|7x|2024-03-01|12.35|-5|1!|5|1.5|2024-01-01T10:00:00Z")
+	h.expectRows(`SELECT id FROM it_orders WHERE id::text = '3'`, "3")
+	h.expectRows(`SELECT id FROM it_orders WHERE status::text = 'pending' AND qty = '3'::int`, "2")
+	h.expectRows(`SELECT o.id FROM it_orders o JOIN it_customers c ON c.name::text = 'Bo' AND o.customer_id::text = c.id::text
+		ORDER BY o.id`, "3", "4")
+	h.expectError(`SELECT 'x'::integer`, "invalid")
+	h.expectError(`SELECT 1::nosuchtype`, "unsupported SQL type NOSUCHTYPE")
+}

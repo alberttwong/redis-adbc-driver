@@ -956,14 +956,14 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 // ---- UPDATE / DELETE ----
 
 // matchRows returns the keys and requested values of the rows matching a
-// WHERE clause.
-func (e *executor) matchRows(ctx context.Context, meta *tableMeta, where Expr, params []Value, need map[string]bool) ([]string, []map[string]Value, error) {
+// WHERE clause; name is the table's name or alias in the statement.
+func (e *executor) matchRows(ctx context.Context, meta *tableMeta, name string, where Expr, params []Value, need map[string]bool) ([]string, []map[string]Value, error) {
 	need = maps.Clone(need)
 	if need == nil {
 		need = map[string]bool{}
 	}
 	if where != nil {
-		needs, err := e.bindIn(ctx, where, meta, meta.Name)
+		needs, err := e.bindIn(ctx, where, meta, name)
 		if err != nil {
 			return nil, nil, err
 		}

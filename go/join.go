@@ -56,6 +56,12 @@ type joinItem struct {
 
 	pushed []Expr // predicates on this table alone, applied in its scan
 	extra  []Expr // WHERE predicates attached as join conditions here
+
+	// tag, if set, names a value added to each of this item's rows: the
+	// row's HASH key for a table, TRUE for an in-memory relation. MERGE,
+	// UPDATE … FROM and DELETE … USING use it to find the target row of a
+	// joined row, and to tell which side of an outer join a row came from.
+	tag string
 }
 
 type joinPlan struct {
@@ -66,40 +72,57 @@ type joinPlan struct {
 // joined relation (column names "alias.column") and the scope relations.
 func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, []relation, *joinPlan, error) {
 	jp := &joinPlan{}
-	add := func(kind string, table *TableName, sub *SelectStmt, alias string) error {
-		meta, name, err := e.resolveFromItem(ctx, table, sub, alias)
-		if err != nil {
-			return err
-		}
-		if meta.view != nil {
-			// Joins read each item fully; compute the view now.
-			rows, err := e.runView(ctx, meta.view, nil, nil, e.params)
-			if err != nil {
-				return err
-			}
-			m := *meta
-			m.view, m.mem = nil, rows
-			meta = &m
-		}
-		if name == "" {
-			return errorf(adbc.StatusInvalidArgument, "a subquery in FROM must have an alias")
-		}
-		for _, it := range jp.items {
-			if strings.EqualFold(it.alias, name) {
-				return errorf(adbc.StatusInvalidArgument, "table name %q specified more than once; use aliases", name)
-			}
-		}
-		jp.items = append(jp.items, &joinItem{alias: name, base: meta, prefix: name + ".", kind: kind})
-		return nil
-	}
-	if err := add("", sel.From, sel.FromSelect, sel.FromAlias); err != nil {
+	if err := e.addJoinItem(ctx, jp, "", sel.From, sel.FromSelect, sel.FromAlias); err != nil {
 		return nil, nil, nil, err
 	}
 	for _, jc := range sel.Joins {
-		if err := add(jc.Kind, jc.Table, jc.Select, jc.Alias); err != nil {
+		if err := e.addJoinItem(ctx, jp, jc.Kind, jc.Table, jc.Select, jc.Alias); err != nil {
 			return nil, nil, nil, err
 		}
 	}
+	joined, rels := jp.finish()
+	return joined, rels, jp, nil
+}
+
+// addJoinItem resolves a FROM item (table, view, CTE or derived table) and
+// adds it to the join.
+func (e *executor) addJoinItem(ctx context.Context, jp *joinPlan, kind string, table *TableName, sub *SelectStmt, alias string) error {
+	meta, name, err := e.resolveFromItem(ctx, table, sub, alias)
+	if err != nil {
+		return err
+	}
+	if meta.view != nil {
+		// Joins read each item fully; compute the view now.
+		rows, err := e.runView(ctx, meta.view, nil, nil, e.params)
+		if err != nil {
+			return err
+		}
+		m := *meta
+		m.view, m.mem = nil, rows
+		meta = &m
+	}
+	if name == "" {
+		return errorf(adbc.StatusInvalidArgument, "a subquery in FROM must have an alias")
+	}
+	_, err = jp.add(kind, meta, name)
+	return err
+}
+
+// add appends a resolved relation to the join under a unique alias.
+func (jp *joinPlan) add(kind string, meta *tableMeta, alias string) (*joinItem, error) {
+	for _, it := range jp.items {
+		if strings.EqualFold(it.alias, alias) {
+			return nil, errorf(adbc.StatusInvalidArgument, "table name %q specified more than once; use aliases", alias)
+		}
+	}
+	it := &joinItem{alias: alias, base: meta, prefix: alias + ".", kind: kind}
+	jp.items = append(jp.items, it)
+	return it, nil
+}
+
+// finish works out which items are NULL-supplying and returns the joined
+// relation and the scope relations.
+func (jp *joinPlan) finish() (*tableMeta, []relation) {
 	// Nullability: LEFT makes the new item nullable, RIGHT the items before
 	// it, FULL both.
 	for i, it := range jp.items {
@@ -127,7 +150,7 @@ func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, [
 		}
 		rels[i] = relation{name: it.alias, meta: it.base, prefix: it.prefix}
 	}
-	return joined, rels, jp, nil
+	return joined, rels
 }
 
 // bindJoin binds the ON / USING conditions in the query's scope (called with
@@ -514,14 +537,25 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 			left = nil
 			continue
 		}
+		if k > 0 && innerLike {
+			never, err := neverTrue(env, filters)
+			if err != nil {
+				return nil, err
+			}
+			if never {
+				// A condition such as ON FALSE matches no row of this item, so
+				// it isn't read: an inner join is empty, and a left join keeps
+				// the left rows with this item's columns NULL.
+				if st.kind != "LEFT" {
+					left = nil
+				}
+				continue
+			}
+		}
 		if k > 0 && innerLike && wp.keys == nil && !view.isMem {
 			// Index lookup join: fetch only rows whose key matches the left.
 			for _, p := range pairs {
-				ref, ok := p.right.(*ColumnRef)
-				if !ok {
-					continue
-				}
-				cm, ok := view.column(ref.Name)
+				cm, ok := lookupColumn(view, p.right)
 				if !ok || !cm.Indexed || !simpleName(cm.field()) {
 					continue
 				}
@@ -551,9 +585,18 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 				break
 			}
 		}
-		_, right, err := e.scan(ctx, scanRequest{meta: view, where: wp, need: itemNeed}, params)
+		keys, right, err := e.scan(ctx, scanRequest{meta: view, where: wp, need: itemNeed}, params)
 		if err != nil {
 			return nil, err
+		}
+		if it.tag != "" {
+			for r, row := range right {
+				if keys != nil {
+					row[it.tag] = stringValue(keys[r])
+				} else {
+					row[it.tag] = boolValue(true)
+				}
+			}
 		}
 		if k == 0 {
 			// Conditions on the first table alone that could not be pushed.
@@ -571,6 +614,43 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 		}
 	}
 	return left, nil
+}
+
+// lookupColumn returns the column a join key expression reads unchanged: a
+// column reference, or a cast of one to the column's own type (dbt writes
+// `a.id::text = b.id::text` for text columns).
+func lookupColumn(view *tableMeta, x Expr) (columnMeta, bool) {
+	cast, isCast := x.(*Cast)
+	if isCast {
+		x = cast.X
+	}
+	ref, ok := x.(*ColumnRef)
+	if !ok {
+		return columnMeta{}, false
+	}
+	cm, ok := view.column(ref.Name)
+	if !ok || (isCast && cast.T != cm.Type) {
+		return columnMeta{}, false
+	}
+	return cm, true
+}
+
+// neverTrue reports whether one of conds has no column references (such as
+// ON FALSE) and is not true, so that no pair of rows can satisfy them all.
+func neverTrue(env *evalEnv, conds []Expr) (bool, error) {
+	for _, c := range conds {
+		if !isConstant(c) {
+			continue
+		}
+		v, err := env.eval(c)
+		if err != nil {
+			return false, invalidArg(err)
+		}
+		if b, ok := truthy(v); !ok || !b {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func within(idx []int, set map[int]bool) bool {
@@ -646,9 +726,17 @@ func (e *executor) joinRows(env *evalEnv, kind string, left, right []map[string]
 		}
 		return true, nil
 	}
+	// A constant condition that isn't true (ON FALSE) matches nothing; don't
+	// try every pair.
+	never, err := neverTrue(env, filters)
+	if err != nil {
+		return nil, err
+	}
 	for _, l := range left {
 		var candidates []int
-		if len(pairs) > 0 {
+		switch {
+		case never:
+		case len(pairs) > 0:
 			k, ok, err := keyOf(l, leftSide)
 			if err != nil {
 				return nil, err
@@ -656,7 +744,7 @@ func (e *executor) joinRows(env *evalEnv, kind string, left, right []map[string]
 			if ok {
 				candidates = buckets[k]
 			}
-		} else {
+		default:
 			candidates = make([]int, len(right))
 			for j := range right {
 				candidates[j] = j

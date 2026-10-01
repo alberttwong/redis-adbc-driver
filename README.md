@@ -365,6 +365,7 @@ How SQL is executed:
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
 | Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
+| `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
 Pushed down into the index: numeric range/equality predicates on indexed
@@ -437,9 +438,9 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   where an item is a table, a CTE, or `(SELECT …)`, each with an optional
   alias (`t.col` qualifies a column),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
-  `CAST`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `CAST(x AS type)` / `x::type`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
-  `UPDATE`/`DELETE`),
+  `UPDATE`/`DELETE`/`MERGE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS/CONCAT`, `from_hex`
 - `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` (`INTERSECT` binds
   tighter; parenthesized branches may have their own `ORDER BY`/`LIMIT`).
@@ -529,7 +530,32 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   (`ordinal_position`, `data_type`, `is_nullable`, `numeric_precision`,
   `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
   (`view_definition`). Any SQL works on them, including joins
-- `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`
+- `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
+  `[WITH …] DELETE FROM t [[AS] a] [USING item, …] [WHERE …]` (the Postgres
+  forms). The FROM / USING items are written like a SELECT's FROM clause
+  (tables, views, CTEs and `(SELECT …)`, with commas or joins) and are
+  joined with the target; SET and WHERE can read all of them. A target row
+  that matches several FROM / USING rows is updated or deleted once. For
+  UPDATE the matches must give the same new values, otherwise it's an error
+  (Postgres silently uses one of them)
+- `[WITH …] MERGE INTO t [[AS] a] USING item [[AS] s] ON cond` followed by
+  any number of
+  - `WHEN MATCHED [AND cond] THEN UPDATE SET … | DELETE | DO NOTHING`
+  - `WHEN NOT MATCHED [BY TARGET] [AND cond] THEN INSERT [(cols)] VALUES (…)
+    | INSERT DEFAULT VALUES | DO NOTHING`
+  - `WHEN NOT MATCHED BY SOURCE [AND cond] THEN UPDATE SET … | DELETE | DO NOTHING`
+
+  The source is a table, view, CTE or `(SELECT …)`. Each source row with
+  its matching target row, each unmatched source row and (with `BY SOURCE`
+  clauses) each unmatched target row takes the first clause of its kind
+  whose condition holds, as in Postgres. `WHEN NOT MATCHED` clauses see only
+  the source's columns (so `VALUES (id, name)` reads the source), `BY
+  SOURCE` clauses only the target's. Changing a target row for more than one
+  source row is an error ("MERGE command cannot affect row a second time");
+  matching more than one is fine if only one match changes it. NULL keys
+  never match. The result is the number of rows inserted, updated and
+  deleted. `INSERT DEFAULT VALUES` inserts NULLs (column defaults aren't
+  stored)
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
   comparisons, window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
@@ -538,7 +564,13 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 
 Tables can be qualified as `schema.table` or `redis.schema.table`. Schemas
 are key namespaces (default `public`). There are no transactions (autocommit
-only).
+only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
+every change first (new values and casts, `NOT NULL`, MERGE's
+one-change-per-row rule), so such an error leaves the table untouched. Then
+they write, in pipelined batches of up to 1,000 rows (`MERGE`: updates, then
+deletes, then inserts). If a write fails part-way, for example because the
+connection drops, the batches already written stay written, and other
+clients can see a partly applied statement.
 
 ## Options
 
