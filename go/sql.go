@@ -255,6 +255,7 @@ func (*AlterTableStmt) stmtNode() {}
 type CreateTableStmt struct {
 	Table       TableName
 	IfNotExists bool
+	Temporary   bool
 	Columns     []ColumnDef
 	// AsSelect is set for CREATE TABLE … AS SELECT.
 	AsSelect *SelectStmt
@@ -369,8 +370,9 @@ func (*CreateViewStmt) stmtNode()   {}
 func (*DropViewStmt) stmtNode()     {}
 func (*TruncateStmt) stmtNode()     {}
 
-// CreateViewStmt is CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(cols)] AS
-// SELECT …; Text is the SELECT's source text, which is what gets stored.
+// CreateViewStmt is CREATE [OR REPLACE] [TEMP] VIEW [IF NOT EXISTS] v
+// [(cols)] AS SELECT …; Text is the SELECT's source text, which is what gets
+// stored.
 type CreateViewStmt struct {
 	Name        TableName
 	Columns     []string
@@ -378,6 +380,7 @@ type CreateViewStmt struct {
 	Text        string
 	OrReplace   bool
 	IfNotExists bool
+	Temporary   bool
 }
 
 type DropViewStmt struct {
@@ -1232,11 +1235,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return st, nil
 	}
 	orReplace := p.acceptKeyword("OR", "REPLACE")
-	if p.acceptKeyword("TEMPORARY") || p.acceptKeyword("TEMP") {
-		return nil, &sqlError{msg: "temporary tables and views are not supported"}
-	}
+	temporary := p.acceptKeyword("TEMPORARY") || p.acceptKeyword("TEMP")
 	if p.acceptKeyword("VIEW") {
-		st := &CreateViewStmt{OrReplace: orReplace}
+		st := &CreateViewStmt{OrReplace: orReplace, Temporary: temporary}
 		st.IfNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
 		name, err := p.parseTableName()
 		if err != nil {
@@ -1276,7 +1277,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
-	st := &CreateTableStmt{}
+	st := &CreateTableStmt{Temporary: temporary}
 	st.IfNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
 	t, err := p.parseTableName()
 	if err != nil {

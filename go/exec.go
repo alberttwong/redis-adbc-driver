@@ -42,6 +42,9 @@ type executor struct {
 	pendingSq  *Subquery
 	ctes       []map[string]*CTE
 	now        time.Time // CURRENT_TIMESTAMP etc., fixed per statement
+	// noTemp stops unqualified names from resolving to temporary objects
+	// (inside permanent views).
+	noTemp bool
 }
 
 // execResult is the outcome of one statement.
@@ -60,15 +63,67 @@ func invalidArg(err error) error {
 	return errorf(adbc.StatusInvalidArgument, "%v", err)
 }
 
+// resolveTable returns the schema and name a table or view is stored under.
+// An unqualified name is this connection's temporary table or view if it has
+// one by that name, and otherwise in the current schema; pg_temp.<name> is
+// always the temporary one.
 func (e *executor) resolveTable(t TableName) (string, string, error) {
+	schema := t.Schema
+	if t.Catalog != "" && t.Catalog != catalogName {
+		if schema == "" {
+			schema = e.schema
+		}
+		return "", "", tableNotFound(schema, t.Name)
+	}
+	switch {
+	case schema == "":
+		if !e.noTemp && e.store.isTempObject(t.Name) {
+			e.markTemp()
+			return e.store.tempSchema(), t.Name, nil
+		}
+		return e.schema, t.Name, nil
+	case isTempAlias(schema):
+		e.markTemp()
+		return e.store.tempSchema(), t.Name, nil
+	case isTempSchema(schema):
+		// Temporary schemas are only reachable as pg_temp by their owner.
+		return "", "", errorf(adbc.StatusNotFound, "table %q.%q does not exist", schema, t.Name)
+	}
+	return schema, t.Name, nil
+}
+
+// resolveCreate returns the schema and name of a table or view being
+// created: the connection's temporary schema (created on first use) for
+// CREATE TEMP and for pg_temp.<name>, otherwise the given or current schema.
+// Unlike resolveTable, an unqualified name never means a temporary object.
+func (e *executor) resolveCreate(ctx context.Context, t TableName, temporary bool) (string, string, error) {
+	if t.Catalog != "" && t.Catalog != catalogName {
+		return "", "", errorf(adbc.StatusNotFound, "catalog %q does not exist", t.Catalog)
+	}
+	if temporary || isTempAlias(t.Schema) {
+		if t.Schema != "" && !isTempAlias(t.Schema) {
+			return "", "", errorf(adbc.StatusInvalidArgument,
+				"cannot create a temporary table or view in schema %q (temporary objects are in pg_temp)", t.Schema)
+		}
+		schema, err := e.store.ensureTempSchema(ctx)
+		return schema, t.Name, err
+	}
+	if isTempSchema(t.Schema) {
+		return "", "", errorf(adbc.StatusInvalidArgument, "schema name %q is reserved for temporary tables and views", t.Schema)
+	}
 	schema := t.Schema
 	if schema == "" {
 		schema = e.schema
 	}
-	if t.Catalog != "" && t.Catalog != catalogName {
-		return "", "", tableNotFound(schema, t.Name)
-	}
 	return schema, t.Name, nil
+}
+
+// markTemp records that the statement being planned refers to a temporary
+// object (a permanent view must not).
+func (e *executor) markTemp() {
+	if e.cache != nil {
+		e.cache.usedTemp = true
+	}
 }
 
 func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, error) {
@@ -161,7 +216,7 @@ func (e *executor) runTruncate(ctx context.Context, st *TruncateStmt) error {
 		if isView, err := e.store.viewExists(ctx, schema, name); err != nil {
 			return err
 		} else if isView {
-			return errorf(adbc.StatusInvalidArgument, "cannot truncate %q.%q: it is a view", schema, name)
+			return errorf(adbc.StatusInvalidArgument, "cannot truncate %q.%q: it is a view", displaySchema(schema), name)
 		}
 		if _, err := e.store.getTable(ctx, schema, name); err != nil {
 			return err
@@ -177,7 +232,7 @@ func (e *executor) runTruncate(ctx context.Context, st *TruncateStmt) error {
 }
 
 func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) error {
-	schema, name, err := e.resolveTable(st.Table)
+	schema, name, err := e.resolveCreate(ctx, st.Table, st.Temporary)
 	if err != nil {
 		return err
 	}
@@ -200,7 +255,7 @@ func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) erro
 // take the names and types of the query's result, and the result rows are
 // inserted. It returns the number of rows inserted.
 func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (int64, error) {
-	schema, name, err := e.resolveTable(st.Table)
+	schema, name, err := e.resolveCreate(ctx, st.Table, st.Temporary)
 	if err != nil {
 		return 0, err
 	}

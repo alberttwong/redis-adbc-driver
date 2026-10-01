@@ -39,7 +39,8 @@ class RedisQuirks(model.DriverQuirks):
         statement_bulk_ingest=True,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=True,
-        statement_bulk_ingest_temporary=False,
+        # Temporary tables are per connection, in a schema it sees as pg_temp.
+        statement_bulk_ingest_temporary=True,
         statement_execute_schema=True,
         statement_get_parameter_schema=False,
         statement_prepare=True,
@@ -67,6 +68,10 @@ class RedisQuirks(model.DriverQuirks):
         if "does not exist" not in message:
             return False
         return table_name is None or table_name in message
+
+    def qualify_temp_table(self, cursor, name: str) -> list[str]:
+        # A connection's temporary tables and views are in its pg_temp schema.
+        return [self.features.current_catalog, "pg_temp", name]
 
     def split_statement(self, statement: str) -> list[str]:
         # The driver executes ';'-separated scripts itself.

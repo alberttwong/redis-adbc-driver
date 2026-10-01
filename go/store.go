@@ -42,6 +42,8 @@ package redis
 //	adbc:{meta}:tables:<schema>          SET    table names
 //	adbc:{meta}:schemas                  SET    schema names
 //
+// Temporary tables and views live in per-connection schemas (see temp.go).
+//
 // Schema and table names are percent-escaped in key names so that ':' in a
 // name cannot make two tables share a key prefix, and '{' / '}' cannot form
 // a hash tag.
@@ -344,7 +346,7 @@ func (s *store) updateTable(ctx context.Context, schema, table string, fn func(*
 		}
 		return wrapRedis(err, "failed to update table metadata")
 	}
-	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", schema, table)
+	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", displaySchema(schema), table)
 }
 
 // ---- errors ----
@@ -354,7 +356,7 @@ func errorf(code adbc.Status, format string, args ...any) error {
 }
 
 func tableNotFound(schema, table string) error {
-	return errorf(adbc.StatusNotFound, "table %q.%q does not exist", schema, table)
+	return errorf(adbc.StatusNotFound, "table %q.%q does not exist", displaySchema(schema), table)
 }
 
 func wrapRedis(err error, context string) error {
@@ -378,6 +380,9 @@ type store struct {
 	// Background dropped-column cleanups running on this connection.
 	mu       sync.Mutex
 	cleaning map[string]bool
+
+	// The connection's temporary tables and views (see temp.go).
+	temp tempSpace
 }
 
 // search returns the connection used for FT.* commands. On a cluster every
@@ -497,8 +502,8 @@ func (s *store) tableExists(ctx context.Context, schema, table string) (bool, er
 // createTable registers the table metadata and creates its search index.
 // It returns false (and no error) if the table exists and ifNotExists is set.
 func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bool) (bool, error) {
-	if isInfoSchema(meta.Schema) {
-		return false, infoSchemaReadOnly()
+	if err := s.checkWritableSchema(meta.Schema); err != nil {
+		return false, err
 	}
 	if len(meta.Columns) == 0 {
 		return false, errorf(adbc.StatusInvalidArgument, "table %q must have at least one column", meta.Name)
@@ -526,7 +531,7 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		if ifNotExists {
 			return false, nil
 		}
-		return false, errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", meta.Schema, meta.Name)
+		return false, errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", displaySchema(meta.Schema), meta.Name)
 	}
 	ok, err := s.client.SetNX(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Result()
 	if err != nil {
@@ -536,7 +541,7 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		if ifNotExists {
 			return false, nil
 		}
-		return false, errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", meta.Schema, meta.Name)
+		return false, errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", displaySchema(meta.Schema), meta.Name)
 	}
 
 	// Reserve a key prefix and index name no other table uses (a renamed
@@ -580,11 +585,14 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	}
 	pipe := s.client.TxPipeline()
 	pipe.SAdd(ctx, tablesKey(meta.Schema), meta.Name)
-	pipe.SAdd(ctx, schemasKey, meta.Schema)
+	if !isTempSchema(meta.Schema) {
+		pipe.SAdd(ctx, schemasKey, meta.Schema)
+	}
 	pipe.Del(ctx, seqKey(meta.Schema, meta.Name))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return false, wrapRedis(err, "failed to register table")
 	}
+	s.trackTemp(meta.Schema, meta.Name, true)
 	return true, nil
 }
 
@@ -649,6 +657,7 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 	if _, err := pipe.Exec(ctx); err != nil {
 		return wrapRedis(err, "failed to drop table")
 	}
+	s.trackTemp(schema, table, false)
 	return nil
 }
 
@@ -663,6 +672,8 @@ func (s *store) listSchemas(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, wrapRedis(err, "failed to list schemas")
 	}
+	// Temporary schemas are never registered; skip them all the same.
+	members = slices.DeleteFunc(members, reservedSchema)
 	if !slices.Contains(members, defaultSchema) {
 		members = append(members, defaultSchema)
 	}
@@ -673,6 +684,9 @@ func (s *store) listSchemas(ctx context.Context) ([]string, error) {
 func (s *store) schemaExists(ctx context.Context, schema string) (bool, error) {
 	if schema == defaultSchema {
 		return true, nil
+	}
+	if reservedSchema(schema) {
+		return false, nil
 	}
 	ok, err := s.client.SIsMember(ctx, schemasKey, schema).Result()
 	if err != nil {
@@ -690,6 +704,9 @@ func (s *store) createSchema(ctx context.Context, schema string, ifNotExists boo
 			return nil
 		}
 		return errorf(adbc.StatusAlreadyExists, "schema %q already exists", schema)
+	}
+	if reservedSchema(schema) {
+		return errorf(adbc.StatusInvalidArgument, "schema name %q is reserved for temporary tables and views", schema)
 	}
 	n, err := s.client.SAdd(ctx, schemasKey, schema).Result()
 	if err != nil {

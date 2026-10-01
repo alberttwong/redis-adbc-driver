@@ -43,17 +43,32 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 		return -1, errorf(adbc.StatusInvalidState, "bulk ingest requires data to be bound")
 	}
 	defer s.clearParams()
-	if opts.Temporary {
-		return -1, errorf(adbc.StatusNotImplemented, "temporary tables are not supported")
-	}
 	if opts.CatalogName != "" && opts.CatalogName != catalogName {
 		return -1, errorf(adbc.StatusNotFound, "catalog %q does not exist", opts.CatalogName)
 	}
+	st := s.conn.store
+	// adbc.ingest.temporary (or schema pg_temp) targets the connection's
+	// temporary table; otherwise the target is always a permanent table,
+	// even if a temporary table of the same name shadows it in SQL.
 	schemaName := opts.SchemaName
-	if schemaName == "" {
+	switch {
+	case opts.Temporary || isTempAlias(schemaName):
+		if schemaName != "" && !isTempAlias(schemaName) {
+			return -1, errorf(adbc.StatusInvalidState, "cannot specify a schema name for a temporary table")
+		}
+		if opts.Mode == adbc.OptionValueIngestModeAppend {
+			schemaName = st.tempSchema()
+		} else {
+			var err error
+			if schemaName, err = st.ensureTempSchema(ctx); err != nil {
+				return -1, err
+			}
+		}
+	case isTempSchema(schemaName):
+		return -1, errorf(adbc.StatusNotFound, "schema %q does not exist", schemaName)
+	case schemaName == "":
 		schemaName = s.conn.schema
 	}
-	st := s.conn.store
 	arrowSchema := s.params.Schema()
 	wanted, err := metaFromArrow(schemaName, opts.TableName, arrowSchema)
 	if err != nil {
