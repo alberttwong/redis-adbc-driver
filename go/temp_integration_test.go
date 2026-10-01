@@ -709,3 +709,52 @@ func TestSQLTempIngest(t *testing.T) {
 		t.Errorf("creating an existing temporary table: %v", err)
 	}
 }
+
+// MERGE, UPDATE … FROM and DELETE … USING with temporary tables as targets
+// and as sources (dbt's merge strategy stages new rows in a temporary table).
+func TestSQLTempDML(t *testing.T) {
+	h := newSQLHarness(t)
+	other := newSQLHarness(t)
+	drop := func() { h.exec("DROP TABLE IF EXISTS public.it_tdml") }
+	drop()
+	t.Cleanup(drop)
+
+	h.exec("CREATE TABLE it_tdml (id BIGINT, v VARCHAR)")
+	h.exec("INSERT INTO it_tdml VALUES (1, 'a'), (2, 'b')")
+
+	// dbt: stage in a temporary table, then MERGE into the permanent target.
+	h.exec("CREATE TEMPORARY TABLE it_tdml__dbt_tmp AS SELECT 2 AS id, 'B' AS v UNION ALL SELECT 3, 'c'")
+	if n := h.exec(`MERGE INTO it_tdml AS d USING it_tdml__dbt_tmp AS s ON s.id = d.id
+		WHEN MATCHED THEN UPDATE SET v = s.v
+		WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)`); n != 2 {
+		t.Errorf("MERGE affected %d rows, want 2", n)
+	}
+	h.expectRows("SELECT id, v FROM it_tdml ORDER BY id", "1|a", "2|B", "3|c")
+
+	// A temporary table as the target, with a permanent source.
+	h.exec("CREATE TEMP TABLE it_tdml_t (id BIGINT, v VARCHAR)")
+	h.exec("INSERT INTO it_tdml_t VALUES (1, 'x'), (9, 'z')")
+	h.exec(`MERGE INTO it_tdml_t USING it_tdml s ON s.id = it_tdml_t.id
+		WHEN MATCHED THEN UPDATE SET v = s.v
+		WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)`)
+	h.expectRows("SELECT id, v FROM it_tdml_t ORDER BY id", "1|a", "2|B", "3|c", "9|z")
+	h.exec("UPDATE it_tdml_t SET v = s.v || '!' FROM it_tdml s WHERE s.id = it_tdml_t.id AND s.id = 3")
+	h.exec("DELETE FROM it_tdml_t USING it_tdml s WHERE s.id = it_tdml_t.id AND s.id <= 2")
+	h.expectRows("SELECT id, v FROM it_tdml_t ORDER BY id", "3|c!", "9|z")
+
+	// A temporary table as the USING item of a permanent target.
+	h.exec("DELETE FROM it_tdml USING it_tdml_t t WHERE t.id = it_tdml.id")
+	h.expectRows("SELECT id FROM it_tdml ORDER BY id", "1", "2")
+
+	// A temporary table that shadows the permanent one; pg_temp and the
+	// schema name pick each explicitly.
+	h.exec("CREATE TEMP TABLE it_tdml (id BIGINT, v VARCHAR)")
+	h.exec(`MERGE INTO it_tdml USING public.it_tdml p ON p.id = it_tdml.id
+		WHEN NOT MATCHED THEN INSERT (id, v) VALUES (p.id, 'copied')`)
+	h.expectRows("SELECT id, v FROM pg_temp.it_tdml ORDER BY id", "1|copied", "2|copied")
+	h.expectRows("SELECT id, v FROM public.it_tdml ORDER BY id", "1|a", "2|B")
+
+	// Another connection sees only the permanent table.
+	other.expectRows("SELECT id, v FROM it_tdml ORDER BY id", "1|a", "2|B")
+	other.expectError("MERGE INTO it_tdml_t USING it_tdml s ON s.id = it_tdml_t.id WHEN MATCHED THEN DELETE", "does not exist")
+}
