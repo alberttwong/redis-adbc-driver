@@ -264,17 +264,15 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 		info := driverbase.TableInfo{TableName: ent.name, TableType: ent.kind}
 		if includeColumns {
 			var cols []columnMeta
+			var meta *tableMeta
 			var err error
 			if ent.kind == "VIEW" {
 				var v *viewMeta
 				if v, err = c.store.getView(ctx, schema, ent.name); err == nil {
 					cols = v.Columns
 				}
-			} else {
-				var meta *tableMeta
-				if meta, err = c.store.getTable(ctx, schema, ent.name); err == nil {
-					cols = meta.Columns
-				}
+			} else if meta, err = c.store.getTable(ctx, schema, ent.name); err == nil {
+				cols = meta.Columns
 			}
 			if err != nil {
 				var ae adbc.Error
@@ -313,7 +311,18 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 				}
 				info.TableColumns = append(info.TableColumns, ci)
 			}
+			// CHECK constraints are the only ones kept (see check.go).
 			info.TableConstraints = []driverbase.ConstraintInfo{}
+			if meta != nil {
+				for _, chk := range meta.Checks {
+					name := chk.Name
+					info.TableConstraints = append(info.TableConstraints, driverbase.ConstraintInfo{
+						ConstraintName:        &name,
+						ConstraintType:        "CHECK",
+						ConstraintColumnNames: driverbase.RequiredList(checkColumns(meta, chk.Expr)),
+					})
+				}
+			}
 		}
 		out = append(out, info)
 	}

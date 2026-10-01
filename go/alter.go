@@ -17,7 +17,8 @@ package redis
 // ALTER TABLE.
 //
 // Every change is a metadata update (WATCH/MULTI on the table's metadata key),
-// so it takes the same time at any table size:
+// so it takes the same time at any table size (except where a CHECK
+// constraint is added, which reads the rows first):
 //
 //   - RENAME TO: the table keeps its key prefix and index (fixed at creation
 //     and reserved in a registry), so no row is touched. With the option
@@ -37,6 +38,10 @@ package redis
 //     indexed column's attribute stays in the index, unused.
 //   - ALTER COLUMN … SET / DROP DEFAULT: only rows inserted later see the
 //     change.
+//   - ADD COLUMN … CHECK and ADD CONSTRAINT … CHECK check the existing rows
+//     against the new constraint, then add it; DROP CONSTRAINT removes one
+//     (see check.go). DROP COLUMN drops the constraints that read the column,
+//     and RENAME COLUMN rewrites them.
 
 import (
 	"context"
@@ -97,6 +102,10 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 		return e.dropColumn(ctx, meta, st.Column, st.IfColumnExists)
 	case AlterSetDefault, AlterDropDefault:
 		return e.setDefault(ctx, meta, st.Column, st.Def)
+	case AlterAddConstraint:
+		return e.addConstraint(ctx, meta, st.Check)
+	case AlterDropConstraint:
+		return e.dropConstraint(ctx, meta, st.Constraint, st.IfConstraintExists)
 	}
 	return errorf(adbc.StatusNotImplemented, "unsupported ALTER TABLE action")
 }
@@ -205,10 +214,21 @@ func (e *executor) renameColumn(ctx context.Context, meta *tableMeta, from, to s
 		if j, ok := m.resolve(to); ok && j != i {
 			return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", to, m.Name)
 		}
+		old := m.Columns[i].Name
 		m.Columns[i].Field = m.Columns[i].field()
 		m.Columns[i].Name = to
 		if m.Columns[i].Field == to {
 			m.Columns[i].Field = ""
+		}
+		// CHECK constraints name the column in their text.
+		for j, c := range m.Checks {
+			if checkReads(c.Expr, old) {
+				text, err := renameInCheck(c.Expr, old, to)
+				if err != nil {
+					return err
+				}
+				m.Checks[j].Expr = text
+			}
 		}
 		return nil
 	}, nil)
@@ -264,6 +284,26 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 	if f := freeField(meta, def.Name); f != def.Name {
 		col.Field = f
 	}
+	// CHECK constraints are defined on the table with the new column, and
+	// the existing rows, which read its missing value, must pass them.
+	with := *meta
+	with.Columns = append(slices.Clone(meta.Columns), col)
+	var checks []checkMeta
+	if len(def.Checks) > 0 {
+		var err error
+		if checks, err = e.defineChecks(ctx, &with, def.Checks); err != nil {
+			return err
+		}
+		v := nullValue(col.Type)
+		if missing {
+			if v, err = decodeStored(col.Missing, col.Type); err != nil {
+				return err
+			}
+		}
+		if err := e.validateChecks(ctx, meta, &with, checks, col.Name, v); err != nil {
+			return err
+		}
+	}
 	indexed := 0
 	for _, c := range meta.Columns {
 		if c.Indexed {
@@ -302,6 +342,9 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 			c.MissingThrough = lastRowID
 		}
 		m.Columns = append(m.Columns, c)
+		if len(checks) > 0 {
+			return addChecks(&with, m, checks)
+		}
 		return nil
 	}
 	if !missing {
@@ -357,6 +400,9 @@ func (e *executor) dropColumn(ctx context.Context, meta *tableMeta, name string,
 		if m.Columns[i].MissingThrough > 0 {
 			m.PendingCleanup = append(m.PendingCleanup, nullMarker(f))
 		}
+		// As in Postgres, the CHECK constraints that read the column go too.
+		dropped := m.Columns[i].Name
+		m.Checks = slices.DeleteFunc(m.Checks, func(c checkMeta) bool { return checkReads(c.Expr, dropped) })
 		m.Columns = slices.Delete(m.Columns, i, i+1)
 		m.RetiredFields = append(m.RetiredFields, f)
 		m.PendingCleanup = append(m.PendingCleanup, f)

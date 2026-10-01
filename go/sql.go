@@ -413,6 +413,17 @@ type ColumnDef struct {
 	DefaultText string
 	// Comment is the text of a COMMENT 'text' clause (MySQL / Snowflake).
 	Comment string
+	// Checks are the column's CHECK constraints (ADD COLUMN only: CREATE
+	// TABLE moves them to CreateTableStmt.Checks).
+	Checks []CheckDef
+}
+
+// CheckDef is a CHECK constraint: its CONSTRAINT name ("" if it has none),
+// its expression, and the text the table metadata stores (see check.go).
+type CheckDef struct {
+	Name string
+	Expr Expr
+	Text string
 }
 
 type AlterAction int
@@ -424,6 +435,8 @@ const (
 	AlterDropColumn
 	AlterSetDefault
 	AlterDropDefault
+	AlterAddConstraint
+	AlterDropConstraint
 )
 
 type AlterTableStmt struct {
@@ -438,6 +451,12 @@ type AlterTableStmt struct {
 	Def               ColumnDef // ADD COLUMN; SET DEFAULT (only the default)
 	IfColumnExists    bool
 	IfColumnNotExists bool
+	// Check is the CHECK of ADD CONSTRAINT (nil for the PRIMARY KEY, UNIQUE
+	// and FOREIGN KEY constraints, which are accepted and ignored).
+	// Constraint is the name DROP CONSTRAINT drops.
+	Check              *CheckDef
+	Constraint         string
+	IfConstraintExists bool
 }
 
 func (*AlterTableStmt) stmtNode() {}
@@ -447,6 +466,9 @@ type CreateTableStmt struct {
 	IfNotExists bool
 	Temporary   bool
 	Columns     []ColumnDef
+	// Checks are the CHECK constraints, column and table ones, in the order
+	// written (which is the order their default names are chosen in).
+	Checks []CheckDef
 	// AsSelect is set for CREATE TABLE … AS SELECT.
 	AsSelect *SelectStmt
 	// Comment is the text of a table-level COMMENT [=] 'text' clause.
@@ -836,6 +858,16 @@ type parser struct {
 	pos       int
 	numParams int
 	nextParam int
+	// refs, when set, collects where each column reference is written (for
+	// CHECK expressions, see check.go).
+	refs *[]refSpan
+}
+
+// refSpan is where a column reference is written in the source: bytes
+// [start, end), with its last part (the column's name) from name on.
+type refSpan struct {
+	ref              *ColumnRef
+	start, name, end int
 }
 
 // ParseScript parses one or more ';'-separated statements.
@@ -1848,17 +1880,21 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return nil, err
 	}
 	for {
-		// Table-level constraints are accepted and ignored.
-		if p.isKeyword("PRIMARY") || p.isKeyword("UNIQUE") || p.isKeyword("CONSTRAINT") ||
-			p.isKeyword("FOREIGN") || p.isKeyword("CHECK") {
-			if err := p.skipBalanced(); err != nil {
+		if p.isTableConstraint() {
+			chk, err := p.parseTableConstraint(false)
+			if err != nil {
 				return nil, err
+			}
+			if chk != nil {
+				st.Checks = append(st.Checks, *chk)
 			}
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
 				return nil, err
 			}
+			st.Checks = append(st.Checks, col.Checks...)
+			col.Checks = nil
 			st.Columns = append(st.Columns, col)
 		}
 		if !p.acceptOp(",") {
@@ -1888,7 +1924,47 @@ func (p *parser) parseCommentText() (string, error) {
 	return t.text, nil
 }
 
-// parseColumnDef parses `name TYPE [constraints]`.
+// isTableConstraint reports whether a table constraint starts here (in
+// CREATE TABLE's list, or after ALTER TABLE … ADD).
+func (p *parser) isTableConstraint() bool {
+	return p.isKeyword("PRIMARY") || p.isKeyword("UNIQUE") || p.isKeyword("CONSTRAINT") ||
+		p.isKeyword("FOREIGN") || p.isKeyword("CHECK")
+}
+
+// parseTableConstraint parses a table constraint, `[CONSTRAINT name] CHECK
+// (expr)` or one of the PRIMARY KEY, UNIQUE and FOREIGN KEY constraints,
+// which are accepted and ignored: everything up to the next ',' or ')' (in
+// ALTER TABLE … ADD, the end of the statement) is skipped. It returns the
+// CHECK, or nil for the others.
+func (p *parser) parseTableConstraint(inAlter bool) (*CheckDef, error) {
+	name := ""
+	if p.acceptKeyword("CONSTRAINT") {
+		var err error
+		if name, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		if !p.isKeyword("CHECK") && !p.isKeyword("PRIMARY") && !p.isKeyword("UNIQUE") &&
+			!p.isKeyword("FOREIGN") && !p.isKeyword("EXCLUDE") {
+			return nil, syntaxErr("expected a constraint after CONSTRAINT %s near %q", name, p.peek().text)
+		}
+	}
+	if !p.acceptKeyword("CHECK") {
+		return nil, p.skipBalanced(inAlter)
+	}
+	chk, err := p.parseCheck(name)
+	if err != nil {
+		return nil, err
+	}
+	// Postgres's NO INHERIT and NOT VALID (which CREATE TABLE ignores) mean
+	// nothing here.
+	for p.acceptKeyword("NO", "INHERIT") || p.acceptKeyword("NOT", "VALID") {
+	}
+	return &chk, nil
+}
+
+// parseColumnDef parses `name TYPE [constraint …]`, where each constraint
+// may be named with CONSTRAINT name. PRIMARY KEY, UNIQUE and REFERENCES are
+// accepted and ignored.
 func (p *parser) parseColumnDef() (ColumnDef, error) {
 	name, err := p.parseIdent()
 	if err != nil {
@@ -1904,15 +1980,30 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	}
 	col := ColumnDef{Name: name, Type: ct}
 	for {
+		named, constraint := "", false
+		if p.acceptKeyword("CONSTRAINT") {
+			if named, err = p.parseIdent(); err != nil {
+				return ColumnDef{}, err
+			}
+			constraint = true
+		}
 		switch {
 		case p.acceptKeyword("NOT", "NULL"):
 			col.NotNull = true
 		case p.acceptKeyword("NULL"):
+		case p.acceptKeyword("CHECK"):
+			chk, err := p.parseCheck(named)
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			p.acceptKeyword("NO", "INHERIT")
+			col.Checks = append(col.Checks, chk)
 		case p.acceptKeyword("PRIMARY", "KEY"):
 		case p.acceptKeyword("UNIQUE"):
-		case p.acceptKeyword("NOINDEX"):
-			col.NoIndex = true
-		case p.acceptKeyword("INDEX"):
+		case p.acceptKeyword("REFERENCES"):
+			if err := p.parseReferences(); err != nil {
+				return ColumnDef{}, err
+			}
 		case p.acceptKeyword("DEFAULT"):
 			if col.Default != nil {
 				return ColumnDef{}, &sqlError{msg: fmt.Sprintf("multiple default values specified for column %q", name)}
@@ -1920,6 +2011,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if col.Default, col.DefaultText, err = p.parseDefault(); err != nil {
 				return ColumnDef{}, err
 			}
+		case constraint:
+			return ColumnDef{}, syntaxErr("expected a constraint after CONSTRAINT %s near %q", named, p.peek().text)
+		case p.acceptKeyword("NOINDEX"):
+			col.NoIndex = true
+		case p.acceptKeyword("INDEX"):
 		case p.acceptKeyword("COMMENT"):
 			if col.Comment, err = p.parseCommentText(); err != nil {
 				return ColumnDef{}, err
@@ -1930,10 +2026,101 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	}
 }
 
+// parseCheck parses the `(expr)` of a CHECK constraint named name ("" for
+// none). The text kept for the table metadata is the expression as written,
+// except that qualified column references lose their qualifier (t.a becomes
+// a), so that it still works after RENAME TO.
+func (p *parser) parseCheck(name string) (CheckDef, error) {
+	if err := p.expectOp("("); err != nil {
+		return CheckDef{}, err
+	}
+	saved := p.refs
+	var refs []refSpan
+	p.refs = &refs
+	start := p.peek().pos
+	x, err := p.parseExpr()
+	p.refs = saved
+	if err != nil {
+		return CheckDef{}, err
+	}
+	end := p.toks[p.pos-1].end
+	if err := p.expectOp(")"); err != nil {
+		return CheckDef{}, err
+	}
+	text := rewriteRefs(p.src[start:end], start, refs, func(r refSpan) (string, bool) {
+		if r.name == r.start {
+			return "", false
+		}
+		return p.src[r.name:r.end], true
+	})
+	return CheckDef{Name: name, Expr: x, Text: text}, nil
+}
+
+// parseReferences parses what follows REFERENCES in a column definition:
+// t [(column)] [MATCH {FULL | PARTIAL | SIMPLE}] [ON DELETE action] [ON
+// UPDATE action], as in Postgres. Foreign keys aren't enforced, so nothing
+// is kept, and the table needn't exist.
+func (p *parser) parseReferences() error {
+	if _, err := p.parseTableName(); err != nil {
+		return err
+	}
+	if p.acceptOp("(") {
+		n := 0
+		for {
+			if _, err := p.parseIdent(); err != nil {
+				return err
+			}
+			n++
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return err
+		}
+		if n != 1 {
+			return &sqlError{msg: "number of referencing and referenced columns for foreign key disagree"}
+		}
+	}
+	if p.acceptKeyword("MATCH") && !p.acceptKeyword("FULL") && !p.acceptKeyword("PARTIAL") && !p.acceptKeyword("SIMPLE") {
+		return syntaxErr("expected FULL, PARTIAL or SIMPLE after MATCH near %q", p.peek().text)
+	}
+	seen := map[string]bool{}
+	for p.isKeyword("ON") && (p.isKeywordAt(1, "DELETE") || p.isKeywordAt(1, "UPDATE")) {
+		event := strings.ToUpper(p.peekAt(1).text)
+		if seen[event] {
+			return syntaxErr("ON %s specified more than once", event)
+		}
+		seen[event] = true
+		p.pos += 2
+		switch {
+		case p.acceptKeyword("NO", "ACTION"), p.acceptKeyword("RESTRICT"), p.acceptKeyword("CASCADE"):
+		case p.acceptKeyword("SET", "NULL"), p.acceptKeyword("SET", "DEFAULT"):
+			// Postgres 15 can name the columns: SET NULL (a, b).
+			if p.acceptOp("(") {
+				for {
+					if _, err := p.parseIdent(); err != nil {
+						return err
+					}
+					if !p.acceptOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return err
+				}
+			}
+		default:
+			return syntaxErr("expected NO ACTION, RESTRICT, CASCADE, SET NULL or SET DEFAULT near %q", p.peek().text)
+		}
+	}
+	return nil
+}
+
 // parseAlter parses ALTER TABLE [IF EXISTS] t followed by one of
 // RENAME TO u | RENAME [COLUMN] a TO b | ADD [COLUMN] [IF NOT EXISTS] def |
 // DROP [COLUMN] [IF EXISTS] c | ALTER [COLUMN] c {SET DEFAULT expr | DROP
-// DEFAULT}.
+// DEFAULT} | ADD table_constraint | DROP CONSTRAINT [IF EXISTS] name.
 func (p *parser) parseAlter() (Stmt, error) {
 	if err := p.expectKeyword("ALTER"); err != nil {
 		return nil, err
@@ -1970,12 +2157,26 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		st.Action = AlterRenameColumn
 	case p.acceptKeyword("ADD"):
+		if p.isTableConstraint() {
+			if st.Check, err = p.parseTableConstraint(true); err != nil {
+				return nil, err
+			}
+			st.Action = AlterAddConstraint
+			break
+		}
 		p.acceptKeyword("COLUMN")
 		st.IfColumnNotExists = p.acceptKeyword("IF", "NOT", "EXISTS")
 		if st.Def, err = p.parseColumnDef(); err != nil {
 			return nil, err
 		}
 		st.Action = AlterAddColumn
+	case p.acceptKeyword("DROP", "CONSTRAINT"):
+		st.IfConstraintExists = p.acceptKeyword("IF", "EXISTS")
+		if st.Constraint, err = p.parseIdent(); err != nil {
+			return nil, err
+		}
+		p.parseDropBehavior()
+		st.Action = AlterDropConstraint
 	case p.acceptKeyword("DROP"):
 		p.acceptKeyword("COLUMN")
 		st.IfColumnExists = p.acceptKeyword("IF", "EXISTS")
@@ -2004,7 +2205,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if st.View {
 			return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER VIEW action near %q (supported: RENAME TO)", p.peek().text)}
 		}
-		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN, ALTER COLUMN)", p.peek().text)}
+		return nil, &sqlError{msg: fmt.Sprintf("unsupported ALTER TABLE action near %q (supported: RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN, ALTER COLUMN, ADD CONSTRAINT, DROP CONSTRAINT)", p.peek().text)}
 	}
 	if st.View && st.Action != AlterRenameTable {
 		return nil, &sqlError{msg: "ALTER VIEW supports only RENAME TO"}
@@ -2012,12 +2213,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 	return st, nil
 }
 
-// skipBalanced skips tokens up to the next top-level ',' or ')'.
-func (p *parser) skipBalanced() error {
+// skipBalanced skips tokens up to the next top-level ',' or ')', or with
+// toEnd set, up to the end of the statement.
+func (p *parser) skipBalanced(toEnd bool) error {
 	depth := 0
 	for {
 		t := p.peek()
 		switch {
+		case toEnd && depth == 0 && (t.kind == tokEOF || (t.kind == tokOp && t.text == ";")):
+			return nil
 		case t.kind == tokEOF:
 			return syntaxErr("unexpected end of input")
 		case t.kind == tokOp && t.text == "(":
@@ -3527,10 +3731,11 @@ func (p *parser) parseTrim() (Expr, error) {
 func (p *parser) parseDateArith(name string) (Expr, error) {
 	var first Expr
 	bare := ""
+	var bareTok token
 	if t := p.peek(); t.kind == tokIdent && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "," {
 		if _, ok := datePartOf(t.text); ok {
 			p.pos++
-			bare = t.text
+			bare, bareTok = t.text, t
 			first = &Literal{V: stringValue(strings.ToLower(t.text))}
 		}
 	}
@@ -3552,7 +3757,11 @@ func (p *parser) parseDateArith(name string) (Expr, error) {
 		if iv, ok := f.Args[1].(*Func); ok && iv.Name == "__INTERVAL" {
 			x := f.Args[0]
 			if bare != "" {
-				x = &ColumnRef{Name: bare} // a column named like a date part
+				ref := &ColumnRef{Name: bare} // a column named like a date part
+				if p.refs != nil {
+					*p.refs = append(*p.refs, refSpan{ref: ref, start: bareTok.pos, name: bareTok.pos, end: bareTok.end})
+				}
+				x = ref
 			}
 			return &Func{Name: name, Args: []Expr{iv.Args[1], iv.Args[0], x}}, nil
 		}
@@ -3566,6 +3775,7 @@ func (p *parser) parseDateArith(name string) (Expr, error) {
 // parseColumnRef parses the rest of [schema.][table.]column after its first
 // part; the part just before the column is kept as the qualifier.
 func (p *parser) parseColumnRef(first string) (Expr, error) {
+	start := p.toks[p.pos-1].pos
 	parts := []string{first}
 	for p.acceptOp(".") {
 		n, err := p.parseIdent()
@@ -3577,6 +3787,10 @@ func (p *parser) parseColumnRef(first string) (Expr, error) {
 	ref := &ColumnRef{Name: parts[len(parts)-1]}
 	if len(parts) > 1 {
 		ref.Qualifier = parts[len(parts)-2]
+	}
+	if p.refs != nil {
+		last := p.toks[p.pos-1]
+		*p.refs = append(*p.refs, refSpan{ref: ref, start: start, name: last.pos, end: last.end})
 	}
 	return ref, nil
 }

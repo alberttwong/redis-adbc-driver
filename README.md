@@ -430,7 +430,8 @@ Stop Redis with `docker compose down`.
     not see them at all. Earlier versions of the driver don't raise levels
     when they write.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
-  (column types, defaults, missing values, string levels and comments as JSON), `adbc:{meta}:seq:*` (row ids),
+  (column types, defaults, missing values, string levels, comments and
+  `CHECK` constraints as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
   `adbc:{meta}:view:<schema>:<view>` (the SELECT text, its columns and comments) and
   `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
@@ -498,7 +499,7 @@ How SQL is executed:
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
-| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
+| `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
 | Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING` |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
@@ -546,9 +547,13 @@ field, even if later rows have it.
 
 ## Supported SQL
 
-- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [DEFAULT expr] [NOINDEX] [COMMENT 'text'], …)
-  [COMMENT [=] 'text']` (the `COMMENT` clauses, MySQL / Snowflake style, set
-  the same comments as `COMMENT ON`),
+- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [column_constraint …] [NOINDEX] [COMMENT 'text'], …
+  [, table_constraint, …]) [COMMENT [=] 'text']`, where a column constraint
+  is `[CONSTRAINT name] {NOT NULL | NULL | CHECK (expr) | DEFAULT expr |
+  PRIMARY KEY | UNIQUE | REFERENCES …}` and a table constraint is
+  `[CONSTRAINT name] {CHECK (expr) | PRIMARY KEY (cols) | UNIQUE (cols) |
+  FOREIGN KEY (cols) REFERENCES …}` (see Constraints below; the `COMMENT`
+  clauses, MySQL / Snowflake style, set the same comments as `COMMENT ON`),
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
   `DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]`,
@@ -605,11 +610,14 @@ field, even if later rows have it.
   names are checked before any table is emptied
 - `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
   `RENAME [COLUMN] a TO b`,
-  `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOT NULL] [DEFAULT expr] [NOINDEX] [COMMENT 'text']`,
+  `ADD [COLUMN] [IF NOT EXISTS] c TYPE [column_constraint …] [NOINDEX] [COMMENT 'text']`,
   `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`,
-  `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`. All of them only change metadata, so they
+  `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`,
+  `ADD table_constraint`,
+  `DROP CONSTRAINT [IF EXISTS] name [CASCADE | RESTRICT]`. All of them only change metadata, so they
   take the same time at any table size (except `RENAME TO` with
-  `adbc.redis.rename_rekey`):
+  `adbc.redis.rename_rekey`, and adding a `CHECK`, which reads every row
+  first):
   - `RENAME TO` keeps the table's row keys and index (fixed when the table
     was created), so no row is touched. A table that dbt builds as
     `t__dbt_tmp` and renames to `t` keeps the keys `public:t__dbt_tmp:<rowid>`
@@ -670,6 +678,10 @@ field, even if later rows have it.
     a column with the same name is added later.
   - `ALTER COLUMN … SET DEFAULT` / `DROP DEFAULT` only change what rows
     inserted later get; existing rows keep their values.
+  - `ADD COLUMN … CHECK (…)` and `ADD [CONSTRAINT name] CHECK (…)` check
+    every existing row first (see Constraints below). `DROP CONSTRAINT`
+    removes a `CHECK`; the other constraints aren't kept, so it can't name
+    them.
 - `COMMENT ON {TABLE | VIEW | COLUMN} name IS 'text' | NULL`, as in
   Postgres (dbt's `persist_docs` runs it). A column is named `t.col`,
   `schema.t.col` or `redis.schema.t.col`, and names resolve as elsewhere
@@ -715,6 +727,76 @@ field, even if later rows have it.
   - `information_schema.columns.column_default` and `GetObjects`'
     `xdbc_column_def` show the default as written. `CREATE TABLE … AS`
     copies values, not defaults
+- Constraints, written as in Postgres. `NOT NULL` and `CHECK` are enforced;
+  `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` are not:
+  - **Accepted:** on a column (in `CREATE TABLE` and `ADD COLUMN`), any
+    number of `NOT NULL`, `NULL`, `CHECK (expr)`, `DEFAULT expr`, `PRIMARY
+    KEY`, `UNIQUE` and `REFERENCES t [(col)] [MATCH {FULL | PARTIAL |
+    SIMPLE}] [ON DELETE action] [ON UPDATE action]`, in any order, each
+    optionally named with `CONSTRAINT name`. As a table constraint (in
+    `CREATE TABLE` and `ALTER TABLE … ADD`), `[CONSTRAINT name]` followed by
+    `CHECK (expr)`, `PRIMARY KEY (cols)`, `UNIQUE (cols)` or `FOREIGN KEY
+    (cols) REFERENCES t [(cols)] …`. A column `CHECK` means the same as a
+    table one: a condition on the whole row, which may read any column.
+  - **Not enforced:** `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` /
+    `REFERENCES` are accepted and ignored. Nothing is kept, so duplicate
+    keys and rows without a parent are inserted, the referenced table
+    needn't exist, and `GetObjects` doesn't list them.
+  - **`CHECK`, when written:** the expression is checked as in Postgres. It
+    may read the table's columns (`col` or `t.col`) but not `__rowid` or
+    another table, may not use subqueries, parameters, aggregates or window
+    functions, and must be boolean. The errors are `column "x" does not
+    exist in table "t"`, `system column "__rowid" reference in check
+    constraint is invalid`, `missing FROM-clause entry for table "u"`,
+    `cannot use subquery in check constraint`, `cannot use parameter in
+    check constraint`, `aggregate functions are not allowed in check
+    constraints`, `window functions are not allowed in check constraints`
+    and `argument of CHECK must be type boolean, not type integer`. A
+    function the driver doesn't know is only reported when a row is
+    written.
+  - **Names:** `CONSTRAINT name` is used as written. Without one, the name
+    is Postgres's: `<table>_<column>_check` if the expression reads exactly
+    one column (`t_amount_check`, also for a table constraint such as
+    `CHECK (id > 0)`), otherwise `<table>_check`, with `1`, `2`, … appended
+    to a name the table already uses (`t_amount_check1`). Two constraints
+    of a table can't have the same name (`check constraint "c" already
+    exists`; `ADD`: `constraint "c" for relation "t" already exists`).
+  - **Enforcement:** every write checks each new or changed row: `INSERT …
+    VALUES`, `INSERT … SELECT`, `INSERT … DEFAULT VALUES`, `UPDATE` (also
+    with `FROM`), both branches of `MERGE`, and bulk ingest. As in SQL, a
+    row fails only if the expression is FALSE; NULL passes. The row is
+    checked after its defaults are filled in and after `NOT NULL`, with
+    the error `new row for relation "t" violates check constraint
+    "t_amount_check"`. Like `NOT NULL`, this happens while the statement
+    computes its changes, so a statement with a failing row writes
+    nothing; a bulk ingest is checked one Arrow batch at a time, so the
+    batches before a failing one stay written. As in Postgres, the
+    constraints are checked in name order, so a row that fails several
+    reports the first, and an `UPDATE` checks every constraint, also those
+    that don't read the columns it sets (it reads the columns they use).
+  - **Existing rows:** `ADD COLUMN … CHECK` and `ADD [CONSTRAINT name] CHECK`
+    check every row first, with the new column at its default, and fail
+    with `check constraint "c" of relation "t" is violated by some row`.
+    Rows that other connections write while that runs aren't checked
+    against the new constraint.
+  - **Lifetime:** the constraints are part of the table's metadata (an
+    optional `checks` field holding each name and expression, so older
+    metadata reads unchanged). `RENAME TO` (also with
+    `adbc.redis.rename_rekey`) and `TRUNCATE` keep them, with their names;
+    errors name the table as it is now. `RENAME COLUMN` rewrites the
+    expressions that read the column. `DROP COLUMN` drops the constraints
+    that read it, also those that read other columns too, and `DROP
+    CONSTRAINT [IF EXISTS] name` drops one. Temporary tables have them in
+    the same way; `CREATE TABLE … AS` copies none.
+  - **Reading them back:** `GetObjects`' `table_constraints` lists each
+    `CHECK`, with type `CHECK` and the columns its expression reads.
+  - **Upgrading:** clients on v0.0.6 and earlier ignore the new metadata.
+    They don't check the constraints, and a change they make to a table's
+    metadata (an `ALTER TABLE`, a `COMMENT ON`, and some writes) removes
+    them, so upgrade every client of a database together. Earlier versions
+    accepted table-level `CHECK`s without storing them, so tables they
+    created don't enforce theirs; add them again with `ALTER TABLE … ADD
+    CHECK (…)`.
 - `[WITH [RECURSIVE] name [(cols)] AS (SELECT …), …] SELECT [ALL | DISTINCT | DISTINCT ON (…)] … FROM item {, item |
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item |
   NATURAL [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item}
@@ -1208,7 +1290,7 @@ Tables can be qualified as `schema.table` or `redis.schema.table`, and
 Postgres. Schemas are key
 namespaces (default `public`). There are no transactions (autocommit
 only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
-every change first (new values and casts, `NOT NULL`, MERGE's
+every change first (new values and casts, `NOT NULL`, `CHECK`, MERGE's
 one-change-per-row rule, `RETURNING`), so such an error leaves the table untouched. Then
 they write, in pipelined batches of up to 1,000 rows (`MERGE`: updates, then
 deletes, then inserts). If a write fails part-way, for example because the

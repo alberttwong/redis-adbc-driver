@@ -123,7 +123,12 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 		}
 		mapping[i], given[idx] = idx, true
 	}
-	defs := s.executor().columnDefaults(ctx, meta)
+	e := s.executor()
+	defs := e.columnDefaults(ctx, meta)
+	checks, err := e.tableChecks(ctx, meta)
+	if err != nil {
+		return -1, err
+	}
 
 	var total int64
 	for s.params.Next() {
@@ -150,6 +155,12 @@ func (s *statementImpl) executeIngest(ctx context.Context) (int64, error) {
 					return -1, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 				}
 				rows[r][mapping[c]] = cv
+			}
+		}
+		// Each batch is checked whole before any of it is written.
+		for _, row := range rows {
+			if err := checkNewRow(meta, checks, row); err != nil {
+				return -1, err
 			}
 		}
 		written, err := st.insertRows(ctx, meta, rows)

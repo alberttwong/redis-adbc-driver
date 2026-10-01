@@ -196,6 +196,8 @@ type tableMeta struct {
 	PrefixGen int64  `json:"prefix_gen,omitempty"`
 	// Comment is the table's COMMENT ON text (see comment.go).
 	Comment string `json:"comment,omitempty"`
+	// Checks are the table's CHECK constraints (see check.go).
+	Checks []checkMeta `json:"checks,omitempty"`
 	// readAt is when the metadata was read (or last found not to be moving),
 	// for the checks in rekey.go.
 	readAt time.Time
