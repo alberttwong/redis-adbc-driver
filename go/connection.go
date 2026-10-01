@@ -168,6 +168,9 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	fields := make([]arrow.Field, len(meta.Columns))
 	for i, col := range meta.Columns {
 		fields[i] = arrow.Field{Name: col.Name, Type: col.Type.ArrowType(), Nullable: col.Nullable}
+		if col.Comment != "" {
+			fields[i].Metadata = arrow.NewMetadata([]string{remarksKey}, []string{col.Comment})
+		}
 	}
 	return arrow.NewSchema(fields, nil), nil
 }
@@ -303,6 +306,10 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 				if col.Default != "" {
 					def := col.Default
 					ci.XdbcColumnDef = &def
+				}
+				if col.Comment != "" {
+					remarks := col.Comment
+					ci.Remarks = &remarks
 				}
 				info.TableColumns = append(info.TableColumns, ci)
 			}

@@ -241,7 +241,7 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 		}
 		return errorf(adbc.StatusAlreadyExists, "column %q already exists in table %q", def.Name, meta.Name)
 	}
-	col := columnMeta{Name: def.Name, Type: def.Type, Nullable: !def.NotNull}
+	col := columnMeta{Name: def.Name, Type: def.Type, Nullable: !def.NotNull, Comment: def.Comment}
 	missing := false
 	if def.Default != nil {
 		// Existing rows read the default as it is now, so it must be the

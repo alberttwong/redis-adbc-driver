@@ -411,6 +411,8 @@ type ColumnDef struct {
 	// its source text, which is what the table metadata stores.
 	Default     Expr
 	DefaultText string
+	// Comment is the text of a COMMENT 'text' clause (MySQL / Snowflake).
+	Comment string
 }
 
 type AlterAction int
@@ -447,6 +449,8 @@ type CreateTableStmt struct {
 	Columns     []ColumnDef
 	// AsSelect is set for CREATE TABLE … AS SELECT.
 	AsSelect *SelectStmt
+	// Comment is the text of a table-level COMMENT [=] 'text' clause.
+	Comment string
 }
 
 type DropTableStmt struct {
@@ -554,6 +558,25 @@ type TruncateStmt struct {
 	RestartIdentity bool
 }
 
+// CommentObject is the kind of object a COMMENT ON statement names.
+type CommentObject int
+
+const (
+	CommentOnTable CommentObject = iota + 1
+	CommentOnView
+	CommentOnColumn
+)
+
+// CommentStmt is COMMENT ON {TABLE | VIEW | COLUMN} name IS 'text' | NULL.
+// For a column, Table is its table or view and Column its name. Text is ""
+// for NULL or an empty string, which removes the comment.
+type CommentStmt struct {
+	Object CommentObject
+	Table  TableName
+	Column string
+	Text   string
+}
+
 func (*SelectStmt) stmtNode()       {}
 func (*InsertStmt) stmtNode()       {}
 func (*CreateTableStmt) stmtNode()  {}
@@ -566,6 +589,7 @@ func (*DropSchemaStmt) stmtNode()   {}
 func (*CreateViewStmt) stmtNode()   {}
 func (*DropViewStmt) stmtNode()     {}
 func (*TruncateStmt) stmtNode()     {}
+func (*CommentStmt) stmtNode()      {}
 
 // CreateViewStmt is CREATE [OR REPLACE] [TEMP] VIEW [IF NOT EXISTS] v
 // [(cols)] AS SELECT …; Text is the SELECT's source text, which is what gets
@@ -704,6 +728,20 @@ func lex(src string) ([]token, error) {
 				i++
 			}
 			toks = append(toks, token{kind: tokParam, text: src[start+1 : i], pos: start, end: i})
+		case c == '$':
+			// A dollar-quoted string, $$…$$ or $tag$…$tag$, as in Postgres
+			// (dbt quotes comments this way). Its contents are taken as they
+			// are.
+			n := dollarTag(src[i:])
+			if n == 0 {
+				return nil, syntaxErr("unexpected character %q at offset %d", c, i)
+			}
+			body := strings.Index(src[i+n:], src[i:i+n])
+			if body < 0 {
+				return nil, syntaxErr("unterminated dollar-quoted string")
+			}
+			toks = append(toks, token{kind: tokString, text: src[i+n : i+n+body], pos: i, end: i + 2*n + body})
+			i += 2*n + body
 		case isIdentStart(src[i:]):
 			start := i
 			for i < len(src) {
@@ -749,6 +787,24 @@ func lex(src string) ([]token, error) {
 func isIdentStart(s string) bool {
 	r, _ := utf8.DecodeRuneInString(s)
 	return r == '_' || unicode.IsLetter(r)
+}
+
+// dollarTag returns the length of the delimiter that opens a dollar-quoted
+// string at the start of s: $$, or $tag$ with a tag written like an
+// identifier but without '$'. It is 0 if s starts with no such delimiter.
+func dollarTag(s string) int {
+	for i := 1; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == '$':
+			return i + 1
+		case r == '_' || unicode.IsLetter(r) || (i > 1 && unicode.IsDigit(r)):
+			i += size
+		default:
+			return 0
+		}
+	}
+	return 0
 }
 
 // lexQuoted reads a quoted token starting at s[0] (the quote character), with
@@ -889,27 +945,45 @@ func (p *parser) parseIdent() (string, error) {
 	return "", syntaxErr("expected identifier near %q", t.text)
 }
 
-func (p *parser) parseTableName() (TableName, error) {
+// parseDottedName parses identifiers separated by '.'.
+func (p *parser) parseDottedName() ([]string, error) {
 	var parts []string
 	for {
 		id, err := p.parseIdent()
 		if err != nil {
-			return TableName{}, err
+			return nil, err
 		}
 		parts = append(parts, id)
 		if !p.acceptOp(".") {
-			break
+			return parts, nil
 		}
 	}
+}
+
+// tableNameOf makes a table name of [[catalog.]schema.]name; ok is false
+// for more parts.
+func tableNameOf(parts []string) (TableName, bool) {
 	switch len(parts) {
 	case 1:
-		return TableName{Name: parts[0]}, nil
+		return TableName{Name: parts[0]}, true
 	case 2:
-		return TableName{Schema: parts[0], Name: parts[1]}, nil
+		return TableName{Schema: parts[0], Name: parts[1]}, true
 	case 3:
-		return TableName{Catalog: parts[0], Schema: parts[1], Name: parts[2]}, nil
+		return TableName{Catalog: parts[0], Schema: parts[1], Name: parts[2]}, true
 	}
-	return TableName{}, syntaxErr("invalid table name %s", strings.Join(parts, "."))
+	return TableName{}, false
+}
+
+func (p *parser) parseTableName() (TableName, error) {
+	parts, err := p.parseDottedName()
+	if err != nil {
+		return TableName{}, err
+	}
+	t, ok := tableNameOf(parts)
+	if !ok {
+		return TableName{}, syntaxErr("invalid table name %s", strings.Join(parts, "."))
+	}
+	return t, nil
 }
 
 func (p *parser) parseStatement() (Stmt, error) {
@@ -962,6 +1036,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseAlter()
 	case p.isKeyword("TRUNCATE"):
 		return p.parseTruncate()
+	case p.isKeyword("COMMENT"):
+		return p.parseComment()
 	}
 	return nil, &sqlError{msg: fmt.Sprintf("unsupported statement starting with %q", p.peek().text)}
 }
@@ -1792,7 +1868,24 @@ func (p *parser) parseCreate() (Stmt, error) {
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
 	}
+	// A table comment, MySQL / Snowflake style.
+	if p.acceptKeyword("COMMENT") {
+		p.acceptOp("=")
+		if st.Comment, err = p.parseCommentText(); err != nil {
+			return nil, err
+		}
+	}
 	return st, nil
+}
+
+// parseCommentText parses the string of a COMMENT clause in CREATE TABLE.
+func (p *parser) parseCommentText() (string, error) {
+	t := p.peek()
+	if t.kind != tokString {
+		return "", syntaxErr("expected a string after COMMENT near %q", t.text)
+	}
+	p.pos++
+	return t.text, nil
 }
 
 // parseColumnDef parses `name TYPE [constraints]`.
@@ -1825,6 +1918,10 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return ColumnDef{}, &sqlError{msg: fmt.Sprintf("multiple default values specified for column %q", name)}
 			}
 			if col.Default, col.DefaultText, err = p.parseDefault(); err != nil {
+				return ColumnDef{}, err
+			}
+		case p.acceptKeyword("COMMENT"):
+			if col.Comment, err = p.parseCommentText(); err != nil {
 				return ColumnDef{}, err
 			}
 		default:
@@ -1974,6 +2071,53 @@ func (p *parser) parseDrop() (Stmt, error) {
 	}
 	st.Table = t
 	p.parseDropBehavior()
+	return st, nil
+}
+
+// parseComment parses COMMENT ON {TABLE | VIEW | COLUMN} name IS 'text' |
+// NULL, where a column is named [[catalog.]schema.]relation.column.
+func (p *parser) parseComment() (Stmt, error) {
+	if err := p.expectKeyword("COMMENT"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	st := &CommentStmt{}
+	switch {
+	case p.acceptKeyword("TABLE"):
+		st.Object = CommentOnTable
+	case p.acceptKeyword("VIEW"):
+		st.Object = CommentOnView
+	case p.acceptKeyword("COLUMN"):
+		st.Object = CommentOnColumn
+	default:
+		return nil, &sqlError{msg: fmt.Sprintf("unsupported COMMENT ON object %q (supported: TABLE, VIEW, COLUMN)", p.peek().text)}
+	}
+	parts, err := p.parseDottedName()
+	if err != nil {
+		return nil, err
+	}
+	rel := parts
+	if st.Object == CommentOnColumn {
+		if len(parts) == 1 {
+			return nil, &sqlError{msg: "column name must be qualified"}
+		}
+		rel, st.Column = parts[:len(parts)-1], parts[len(parts)-1]
+	}
+	var ok bool
+	if st.Table, ok = tableNameOf(rel); !ok {
+		return nil, &sqlError{msg: "improper qualified name (too many dotted names): " + strings.Join(parts, ".")}
+	}
+	if err := p.expectKeyword("IS"); err != nil {
+		return nil, err
+	}
+	if t := p.peek(); t.kind == tokString {
+		p.pos++
+		st.Text = t.text
+	} else if !p.acceptKeyword("NULL") {
+		return nil, syntaxErr("expected a string or NULL near %q", t.text)
+	}
 	return st, nil
 }
 

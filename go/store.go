@@ -115,6 +115,8 @@ type columnMeta struct {
 	// of tables created before it was recorded are checked once.
 	TagValues   string `json:"tag_values,omitempty"`
 	TagsChecked bool   `json:"tags_checked,omitempty"`
+	// Comment is the column's COMMENT ON text (see comment.go).
+	Comment string `json:"comment,omitempty"`
 	// label is the name a result column takes from the column when it
 	// differs from Name: joined relations name columns alias.column but
 	// output them as column.
@@ -192,6 +194,8 @@ type tableMeta struct {
 	// key prefix had been released when the table took it (see rekey.go).
 	RekeyTo   string `json:"rekey_to,omitempty"`
 	PrefixGen int64  `json:"prefix_gen,omitempty"`
+	// Comment is the table's COMMENT ON text (see comment.go).
+	Comment string `json:"comment,omitempty"`
 	// readAt is when the metadata was read (or last found not to be moving),
 	// for the checks in rekey.go.
 	readAt time.Time
@@ -208,13 +212,16 @@ type tableMeta struct {
 }
 
 // resolve finds a column by name: exact match first, then case-insensitive.
-func (t *tableMeta) resolve(name string) (int, bool) {
-	for i, c := range t.Columns {
+func (t *tableMeta) resolve(name string) (int, bool) { return resolveColumn(t.Columns, name) }
+
+// resolveColumn is resolve for a list of columns (a table's or a view's).
+func resolveColumn(cols []columnMeta, name string) (int, bool) {
+	for i, c := range cols {
 		if c.Name == name {
 			return i, true
 		}
 	}
-	for i, c := range t.Columns {
+	for i, c := range cols {
 		if strings.EqualFold(c.Name, name) {
 			return i, true
 		}

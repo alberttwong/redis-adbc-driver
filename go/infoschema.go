@@ -20,18 +20,19 @@ package redis
 //
 //	schemata (catalog_name, schema_name)
 //	tables   (table_catalog, table_schema, table_name, table_type,
-//	          key_prefix, index_name)
+//	          key_prefix, index_name, comment)
 //	columns  (table_catalog, table_schema, table_name, column_name,
 //	          ordinal_position, column_default, data_type, is_nullable,
 //	          numeric_precision, numeric_scale, datetime_precision,
-//	          is_indexed)
+//	          is_indexed, comment)
 //	views    (table_catalog, table_schema, table_name, view_definition)
 //
 // The connection's own temporary tables and views are included under schema
 // pg_temp (temporary tables with table_type LOCAL TEMPORARY, as in
 // Postgres); other connections' temporary objects are not. key_prefix and
 // index_name are a table's row key prefix and RediSearch index (NULL for
-// views).
+// views). comment is the COMMENT ON text of a table, view or column (NULL
+// without one).
 
 import (
 	"context"
@@ -59,6 +60,7 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "table_type", Type: typeString},
 		{Name: "key_prefix", Type: typeString},
 		{Name: "index_name", Type: typeString},
+		{Name: "comment", Type: typeString},
 	},
 	"columns": {
 		{Name: "table_catalog", Type: typeString},
@@ -73,6 +75,7 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "numeric_scale", Type: typeInt32},
 		{Name: "datetime_precision", Type: typeInt32},
 		{Name: "is_indexed", Type: typeString},
+		{Name: "comment", Type: typeString},
 	},
 	"views": {
 		{Name: "table_catalog", Type: typeString},
@@ -94,6 +97,14 @@ func optInt(n int32, ok bool) Value {
 		return nullValue(typeInt32)
 	}
 	return intValue(typeInt32, int64(n))
+}
+
+// optString is s, or NULL if it is empty.
+func optString(s string) Value {
+	if s == "" {
+		return nullValue(typeString)
+	}
+	return stringValue(s)
 }
 
 // columnRow renders one information_schema.columns row.
@@ -119,14 +130,10 @@ func columnRow(schema, table string, pos int, c columnMeta) []Value {
 	case KindTime, KindTimestamp:
 		dtPrec = optInt(int32(precisionForUnit(t.Unit)), true)
 	}
-	def := nullValue(typeString)
-	if c.Default != "" {
-		def = stringValue(c.Default)
-	}
 	return []Value{
 		stringValue(catalogName), stringValue(schema), stringValue(table),
-		stringValue(c.Name), intValue(typeInt32, int64(pos)), def, stringValue(t.SQLName()),
-		yesNo(c.Nullable), prec, scale, dtPrec, yesNo(c.Indexed),
+		stringValue(c.Name), intValue(typeInt32, int64(pos)), optString(c.Default), stringValue(t.SQLName()),
+		yesNo(c.Nullable), prec, scale, dtPrec, yesNo(c.Indexed), optString(c.Comment),
 	}
 }
 
@@ -183,11 +190,18 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 					continue // dropped meanwhile
 				}
 				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(t), stringValue(tableType),
-					stringValue(metas[i].prefix()), stringValue(metas[i].index())})
+					stringValue(metas[i].prefix()), stringValue(metas[i].index()), optString(metas[i].Comment)})
 			}
-			for _, v := range views {
+			vms, err := e.store.getViews(ctx, stored, views)
+			if err != nil {
+				return nil, err
+			}
+			for i, v := range views {
+				if vms[i] == nil {
+					continue // dropped meanwhile
+				}
 				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(v), stringValue("VIEW"),
-					nullValue(typeString), nullValue(typeString)})
+					nullValue(typeString), nullValue(typeString), optString(vms[i].Comment)})
 			}
 		case "columns":
 			for _, t := range tables {
@@ -225,19 +239,30 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 // information_schema.columns, a table whose metadata can't be read (it was
 // dropped meanwhile) is nil.
 func (s *store) getTables(ctx context.Context, schema string, tables []string) ([]*tableMeta, error) {
+	return getMetas[tableMeta](ctx, s, tables, func(t string) string { return metaKey(schema, t) })
+}
+
+// getViews is getTables for views.
+func (s *store) getViews(ctx context.Context, schema string, views []string) ([]*viewMeta, error) {
+	return getMetas[viewMeta](ctx, s, views, func(v string) string { return viewKey(schema, v) })
+}
+
+// getMetas reads the JSON metadata of several objects (at key(name)) in one
+// round trip; an object whose metadata can't be read is nil.
+func getMetas[T any](ctx context.Context, s *store, names []string, key func(string) string) ([]*T, error) {
 	pipe := s.client.Pipeline()
-	cmds := make([]*goredis.StringCmd, len(tables))
-	for i, t := range tables {
-		cmds[i] = pipe.Get(ctx, metaKey(schema, t))
+	cmds := make([]*goredis.StringCmd, len(names))
+	for i, n := range names {
+		cmds[i] = pipe.Get(ctx, key(n))
 	}
-	if len(tables) > 0 {
+	if len(names) > 0 {
 		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, goredis.Nil) {
-			return nil, wrapRedis(err, "failed to read table metadata")
+			return nil, wrapRedis(err, "failed to read metadata")
 		}
 	}
-	metas := make([]*tableMeta, len(tables))
+	metas := make([]*T, len(names))
 	for i, cmd := range cmds {
-		var meta tableMeta
+		var meta T
 		if raw, err := cmd.Result(); err == nil && json.Unmarshal([]byte(raw), &meta) == nil {
 			metas[i] = &meta
 		}
