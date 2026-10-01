@@ -224,6 +224,8 @@ func unifiedType(f *Func, args []ColType) ColType {
 		}
 		if out.Kind != KindNull {
 			if v.T.Kind == KindString {
+				// The literal has no length, so the result has none.
+				out = out.withoutLength()
 				continue
 			}
 			if v.T.Kind.isNumeric() && out.Kind.isNumeric() {

@@ -305,10 +305,15 @@ func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (i
 		return 0, err
 	}
 	meta := &tableMeta{Schema: schema, Name: name}
-	for _, c := range plan.columns() {
+	for j, c := range plan.columns() {
 		t := c.Type
 		if t.Kind == KindNull {
 			t = typeString // SELECT NULL AS x: no type information
+		}
+		if t.Kind == KindString && t.Length > 0 && !fitsLength(rows, j, t) {
+			// The query's values fit their type's length; should one not,
+			// the column gets none rather than hold it.
+			t = t.withoutLength()
 		}
 		meta.Columns = append(meta.Columns, columnMeta{Name: c.Name, Type: t, Nullable: true})
 	}
@@ -331,6 +336,21 @@ func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (i
 		coerced[i] = out
 	}
 	return e.store.insertRows(ctx, meta, coerced)
+}
+
+// fitsLength reports whether column j of rows holds only values that a
+// column of type t takes unchanged.
+func fitsLength(rows [][]Value, j int, t ColType) bool {
+	for _, row := range rows {
+		cv, err := Coerce(row[j], t)
+		if err != nil {
+			return false
+		}
+		if fv, err := fitLength(t, cv); err != nil || fv.S != cv.S {
+			return false
+		}
+	}
+	return true
 }
 
 // replaceAliases rewrites references to SELECT aliases (that are not also
@@ -482,8 +502,13 @@ func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, checks *tabl
 }
 
 // checkNewRow checks a row to be inserted (ordered like meta.Columns)
-// against NOT NULL and then the table's CHECK constraints, as Postgres does.
+// against the column lengths (cutting trailing spaces beyond them, see
+// lengths.go), NOT NULL and then the table's CHECK constraints, as Postgres
+// does.
 func checkNewRow(meta *tableMeta, checks *tableChecks, row []Value) error {
+	if err := fitLengths(meta, row); err != nil {
+		return err
+	}
 	for i, c := range meta.Columns {
 		if row[i].Null && !c.Nullable {
 			return errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
@@ -1322,7 +1347,8 @@ func setTargets(meta *tableMeta, alias string, sets []SetClause) ([]int, error) 
 }
 
 // setValues evaluates a SET list for the row in env: the new value of each
-// target column, coerced to its type and checked against NOT NULL.
+// target column, coerced to its type and checked against its length and
+// then NOT NULL.
 func setValues(env *evalEnv, meta *tableMeta, cols []int, sets []SetClause) ([]Value, error) {
 	vals := make([]Value, len(sets))
 	for i, s := range sets {
@@ -1335,10 +1361,14 @@ func setValues(env *evalEnv, meta *tableMeta, cols []int, sets []SetClause) ([]V
 		if err != nil {
 			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 		}
-		if cv.Null && !col.Nullable {
+		if vals[i], err = fitLength(col.Type, cv); err != nil {
+			return nil, err
+		}
+	}
+	for i, v := range vals {
+		if col := meta.Columns[cols[i]]; v.Null && !col.Nullable {
 			return nil, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", col.Name)
 		}
-		vals[i] = cv
 	}
 	return vals, nil
 }

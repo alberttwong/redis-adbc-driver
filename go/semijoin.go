@@ -142,6 +142,7 @@ type inSet struct {
 	keys       map[string]struct{} // classTag + eqKey of each hashed value
 	odd        []Value             // values without a key, compared one by one
 	numAsFloat map[string]struct{} // floatKey of the clsNum values, on demand
+	char       bool                // a value is CHAR: compare one by one
 }
 
 // eval applies [NOT] IN's three-valued logic: an empty set gives FALSE (TRUE
@@ -188,6 +189,7 @@ func (s *inSet) build() {
 			s.sawNull = true
 			continue
 		}
+		s.char = s.char || v.T.isChar()
 		c, k := eqKey(v)
 		if c == clsNone {
 			s.odd = append(s.odd, v)
@@ -209,7 +211,8 @@ func (s *inSet) contains(x Value) (found, sawNull bool) {
 		s.build()
 	}
 	cx, kx := eqKey(x)
-	if cx == clsNone {
+	if cx == clsNone || s.char || x.T.isChar() {
+		// CHAR values compare without trailing spaces (lengths.go).
 		return s.linear(x)
 	}
 	slow := false
@@ -287,6 +290,9 @@ type semiJoin struct {
 // sameEqClass reports whether values of types a and b compare by their eqKey
 // (and never fail to compare).
 func sameEqClass(a, b ColType) bool {
+	if a.isChar() || b.isChar() {
+		return false // compared without trailing spaces (lengths.go)
+	}
 	ca, cb := classOf(a), classOf(b)
 	if exactNum(ca) && exactNum(cb) {
 		return true

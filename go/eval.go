@@ -186,7 +186,7 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		c, err := Coerce(v, x.T)
+		c, err := castValue(v, x.T)
 		if err != nil && x.OnError != nil && castable(v.T, x.T) {
 			// TRY_CAST and DEFAULT … ON CONVERSION ERROR: a value that
 			// cannot be converted gives the fallback, but types that never
@@ -195,7 +195,7 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return Coerce(d, x.T)
+			return castValue(d, x.T)
 		}
 		return c, err
 	case *IsNull:
@@ -370,6 +370,14 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 		args[i] = v
 	}
+	if d.impl != implCoalesce && d.impl != implConditional && !seesPadding[f.Name] {
+		// Functions take CHAR values as text, without their padding.
+		for i, a := range args {
+			if a.T.isChar() {
+				args[i] = Value{T: typeString, Null: a.Null, S: a.Text()}
+			}
+		}
+	}
 	switch d.impl {
 	case implCoalesce:
 		// The result has the arguments' common type.
@@ -432,7 +440,7 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 				return Value{}, fmt.Errorf("ESCAPE must be a single character")
 			}
 		}
-		s, pat := args[0].Text(), args[1].Text()
+		s, pat := args[0].padded(), args[1].Text()
 		if f.Name == "ILIKE" {
 			s, pat, esc = strings.ToLower(s), strings.ToLower(pat), strings.ToLower(esc)
 		}
@@ -453,6 +461,23 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		return Value{}, fmt.Errorf("ABS of %s", v.T.Kind)
 	}
 	return Value{}, fmt.Errorf("unsupported function %s", f.Name)
+}
+
+// seesPadding are the functions (operators) that take a CHAR value with its
+// padding, as Postgres's pattern matching does.
+var seesPadding = map[string]bool{"LIKE": true, "ILIKE": true, "~": true, "~*": true, "SIMILAR TO": true}
+
+// keepsLength are the functions whose result keeps the length of a string
+// type their arguments share (Postgres keeps their type modifier).
+var keepsLength = map[string]bool{"COALESCE": true, "IFNULL": true, "NVL": true, "NULLIF": true,
+	"GREATEST": true, "LEAST": true, "IIF": true}
+
+// padded is the text of a value, with a CHAR value's padding.
+func (v Value) padded() string {
+	if v.T.Kind == KindString {
+		return v.S
+	}
+	return v.Text()
 }
 
 func argTypes(args []Value) []ColType {
@@ -643,6 +668,14 @@ func arithmeticType(op string, a, b ColType) (ColType, error) {
 }
 
 func inferFuncType(f *Func, args []ColType) ColType {
+	t := funcType(f, args)
+	if !keepsLength[f.Name] {
+		t = t.withoutLength()
+	}
+	return t
+}
+
+func funcType(f *Func, args []ColType) ColType {
 	if t, ok := dateTimeFuncType(f, args); ok {
 		return t
 	}
@@ -808,6 +841,9 @@ func commonType(a, b ColType) ColType {
 		return b
 	case a.Kind == KindTimestamp && b.Kind == KindDate:
 		return a
+	case a.Kind == KindString && b.Kind == KindString:
+		// Different lengths: no length; CHAR only if both are.
+		return ColType{Kind: KindString, Fixed: a.Fixed && b.Fixed}
 	case a.Kind == b.Kind:
 		return a
 	}

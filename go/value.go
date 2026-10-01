@@ -461,7 +461,12 @@ func (v Value) Text() string {
 		return strconv.FormatFloat(v.F, 'g', -1, 64)
 	case KindDecimal:
 		return formatDecimal(v.D, v.T.Scale)
-	case KindString, KindBinary:
+	case KindString:
+		if v.T.Fixed {
+			return trimPadding(v.S) // CHAR to text drops the padding
+		}
+		return v.S
+	case KindBinary:
 		return v.S
 	case KindDate:
 		return time.Unix(v.I*86400, 0).UTC().Format("2006-01-02")
@@ -583,7 +588,15 @@ func Coerce(v Value, t ColType) (Value, error) {
 		}
 		return decimalValue(r, t.Precision, t.Scale), nil
 	case KindString:
-		if v.T.Kind == KindString {
+		// The length isn't checked here: casts cut (castValue) and writes
+		// check it (fitLength). CHAR values are padded, and lose their
+		// padding as other strings.
+		switch {
+		case t.Fixed && v.T.isChar():
+			return charValue(v.S, t), nil
+		case t.Fixed:
+			return charValue(v.Text(), t), nil
+		case v.T.Kind == KindString && !v.T.Fixed:
 			return v, nil
 		}
 		return stringValue(v.Text()), nil
@@ -750,6 +763,11 @@ func decodeStored(s string, t ColType) (Value, error) {
 		return binaryValue(s), nil
 	case KindInterval:
 		return decodeInterval(s)
+	case KindString:
+		if t.Fixed {
+			return Value{T: t, S: s}, nil
+		}
+		return stringValue(s), nil
 	default:
 		return stringValue(s), nil
 	}
@@ -765,7 +783,17 @@ func compareValues(a, b Value) (int, bool) {
 	case ak == KindInterval && bk == KindInterval:
 		return intervalTotal(a).Cmp(intervalTotal(b)), true
 	case (ak == KindString || ak == KindBinary) && (bk == KindString || bk == KindBinary):
-		return bytes.Compare([]byte(a.S), []byte(b.S)), true
+		as, bs := a.S, b.S
+		if a.T.isChar() || b.T.isChar() {
+			// Trailing spaces don't count next to a CHAR value (lengths.go).
+			if ak == KindString {
+				as = trimPadding(as)
+			}
+			if bk == KindString {
+				bs = trimPadding(bs)
+			}
+		}
+		return bytes.Compare([]byte(as), []byte(bs)), true
 	case ak == KindString && bk != KindString:
 		pb, err := Coerce(a, b.T)
 		if err != nil {

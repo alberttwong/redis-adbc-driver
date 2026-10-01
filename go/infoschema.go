@@ -23,6 +23,7 @@ package redis
 //	          key_prefix, index_name, comment)
 //	columns  (table_catalog, table_schema, table_name, column_name,
 //	          ordinal_position, column_default, data_type, is_nullable,
+//	          character_maximum_length, character_octet_length,
 //	          numeric_precision, numeric_scale, datetime_precision,
 //	          is_indexed, comment)
 //	views    (table_catalog, table_schema, table_name, view_definition)
@@ -34,7 +35,10 @@ package redis
 // Postgres); other connections' temporary objects are not. key_prefix and
 // index_name are a table's row key prefix and RediSearch index (NULL for
 // views). comment is the COMMENT ON text of a table, view or column (NULL
-// without one). routines lists the driver's functions (see routineRows).
+// without one). character_maximum_length is the n of VARCHAR(n) / CHAR(n)
+// (NULL without one) and character_octet_length its bytes at up to 4 per
+// character (1073741824 without one), as in Postgres. routines lists the
+// driver's functions (see routineRows).
 
 import (
 	"context"
@@ -73,6 +77,8 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "column_default", Type: typeString},
 		{Name: "data_type", Type: typeString},
 		{Name: "is_nullable", Type: typeString},
+		{Name: "character_maximum_length", Type: typeInt32},
+		{Name: "character_octet_length", Type: typeInt32},
 		{Name: "numeric_precision", Type: typeInt32},
 		{Name: "numeric_scale", Type: typeInt32},
 		{Name: "datetime_precision", Type: typeInt32},
@@ -123,8 +129,14 @@ func optString(s string) Value {
 func columnRow(schema, table string, pos int, c columnMeta) []Value {
 	t := c.Type
 	null := nullValue(typeInt32)
-	prec, scale, dtPrec := null, null, null
+	prec, scale, dtPrec, chars, octets := null, null, null, null, null
 	switch t.Kind {
+	case KindString:
+		if t.Length > 0 {
+			chars, octets = optInt(t.Length, true), optInt(4*t.Length, true)
+		} else {
+			octets = optInt(1073741824, true)
+		}
 	case KindDecimal:
 		prec, scale = optInt(t.Precision, true), optInt(t.Scale, true)
 	case KindInt16:
@@ -145,7 +157,7 @@ func columnRow(schema, table string, pos int, c columnMeta) []Value {
 	return []Value{
 		stringValue(catalogName), stringValue(schema), stringValue(table),
 		stringValue(c.Name), intValue(typeInt32, int64(pos)), optString(c.Default), stringValue(t.SQLName()),
-		yesNo(c.Nullable), prec, scale, dtPrec, yesNo(c.Indexed), optString(c.Comment),
+		yesNo(c.Nullable), chars, octets, prec, scale, dtPrec, yesNo(c.Indexed), optString(c.Comment),
 	}
 }
 
