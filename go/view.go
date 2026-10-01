@@ -400,7 +400,11 @@ func substitute(e Expr, repl map[string]Expr) (Expr, bool) {
 		return &IsNull{X: v, Not: x.Not}, ok
 	case *Cast:
 		v, ok := substitute(x.X, repl)
-		return &Cast{X: v, T: x.T}, ok
+		c := &Cast{X: v, T: x.T}
+		if ok && x.OnError != nil {
+			c.OnError, ok = substitute(x.OnError, repl)
+		}
+		return c, ok
 	case *Func:
 		f := *x
 		f.Args = make([]Expr, len(x.Args))

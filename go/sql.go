@@ -90,9 +90,14 @@ type IsNull struct {
 	X   Expr
 	Not bool
 }
+
+// Cast is CAST(x AS t) or x::t. OnError, if set, is the result when the
+// value cannot be converted: NULL for TRY_CAST and SAFE_CAST, v for
+// CAST(x AS t DEFAULT v ON CONVERSION ERROR).
 type Cast struct {
-	X Expr
-	T ColType
+	X       Expr
+	T       ColType
+	OnError Expr
 }
 
 // Case is CASE [operand] WHEN … THEN … [ELSE …] END. With an operand, each
@@ -2287,6 +2292,12 @@ func (p *parser) parseMultiplicative() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
+			if op == "%" {
+				// a % b is MOD(a, b), with its result type and its error on
+				// a zero divisor.
+				l = &Func{Name: "MOD", Args: []Expr{l, r}}
+				continue
+			}
 			l = &Binary{Op: op, L: l, R: r}
 		default:
 			return l, nil
@@ -2459,7 +2470,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				return &Subquery{Select: sub, Kind: SubqueryExists}, nil
 			}
-		case "CAST", "TRY_CAST":
+		case "CAST", "TRY_CAST", "SAFE_CAST":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
 				x, err := p.parseExpr()
@@ -2473,6 +2484,18 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
+				var onError Expr
+				if upper != "CAST" {
+					onError = &Literal{V: nullValue(typeNull)}
+				} else if p.acceptKeyword("DEFAULT") {
+					// CAST(x AS t DEFAULT v ON CONVERSION ERROR), as in Oracle.
+					if onError, err = p.parseExpr(); err != nil {
+						return nil, err
+					}
+					if err := p.expectKeyword("ON", "CONVERSION", "ERROR"); err != nil {
+						return nil, err
+					}
+				}
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
 				}
@@ -2480,7 +2503,12 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err != nil {
 					return nil, &sqlError{msg: err.Error()}
 				}
-				return &Cast{X: x, T: ct}, nil
+				return &Cast{X: x, T: ct, OnError: onError}, nil
+			}
+		case "DATEADD", "DATE_ADD", "DATE_SUB", "TIMESTAMPADD", "DATEDIFF", "TIMESTAMPDIFF":
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				return p.parseDateArith(upper)
 			}
 		case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "DATETIME":
 			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...'
@@ -2672,6 +2700,50 @@ func (p *parser) parseTrim() (Expr, error) {
 		f.Args = append(f.Args, chars)
 	}
 	return f, nil
+}
+
+// parseDateArith parses what follows `DATEADD(`, `DATEDIFF(` and their
+// aliases. A bare date part is the part's name, not a column:
+// DATEADD(day, 1, x) is DATEADD('day', 1, x). DATE_ADD(x, INTERVAL n part)
+// and DATE_SUB(x, INTERVAL n part) (MySQL, BigQuery) become
+// DATE_ADD('part', n, x) and DATE_SUB('part', n, x).
+func (p *parser) parseDateArith(name string) (Expr, error) {
+	var first Expr
+	bare := ""
+	if t := p.peek(); t.kind == tokIdent && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "," {
+		if _, ok := datePartOf(t.text); ok {
+			p.pos++
+			bare = t.text
+			first = &Literal{V: stringValue(strings.ToLower(t.text))}
+		}
+	}
+	if first == nil {
+		var err error
+		if first, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	call, err := p.finishCall(name, first)
+	if err != nil {
+		return nil, err
+	}
+	f := call.(*Func)
+	if (name != "DATE_ADD" && name != "DATE_SUB") || (name == "DATE_ADD" && len(f.Args) == 3) {
+		return f, nil
+	}
+	if len(f.Args) == 2 {
+		if iv, ok := f.Args[1].(*Func); ok && iv.Name == "__INTERVAL" {
+			x := f.Args[0]
+			if bare != "" {
+				x = &ColumnRef{Name: bare} // a column named like a date part
+			}
+			return &Func{Name: name, Args: []Expr{iv.Args[1], iv.Args[0], x}}, nil
+		}
+	}
+	if name == "DATE_ADD" {
+		return nil, syntaxErr("DATE_ADD expects (part, n, x) or (x, INTERVAL n part)")
+	}
+	return nil, syntaxErr("DATE_SUB expects (x, INTERVAL n part)")
 }
 
 // parseColumnRef parses the rest of [schema.][table.]column after its first

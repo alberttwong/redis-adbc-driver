@@ -531,7 +531,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   alias (`t.col` qualifies a column, and `t.*` selects one item's columns,
   also as `schema.table.*`),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
-  `CAST(x AS type)` / `x::type`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`/`MERGE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
@@ -574,8 +574,15 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   - As in `ORDER BY`, NULLs sort last by default in either direction
     (PostgreSQL puts them first for `DESC`). Rows that tie on the window's
     `ORDER BY` keep their input order
+- Casts: `CAST(x AS type)` and `x::type` fail on a value that doesn't
+  convert (text that doesn't parse, a value out of the type's range,
+  overflow). `TRY_CAST(x AS type)` and `SAFE_CAST(x AS type)` return NULL
+  for it instead, and `CAST(x AS type DEFAULT v ON CONVERSION ERROR)` returns
+  `v` (converted to the type). The result has the target type. An error
+  while computing `x`, and a cast between types that never convert (`DATE`
+  to `BOOLEAN`), are still errors
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
-  negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD`,
+  negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD` / `%`,
   `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
   `EXP`, `SIGN`, `ABS`, `RANDOM()`
   - `ROUND` rounds half away from zero: exactly on `NUMERIC`, and on
@@ -583,11 +590,14 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     2.68). Postgres rounds doubles half to even
   - Integers and doubles keep their type. `ROUND(NUMERIC(p,s), n)` has scale
     `n` (at most `s`); `ROUND(x)`, `TRUNC(x)`, `FLOOR` and `CEIL` scale 0.
-    `MOD` has its arguments' common type; `SQRT`, `LN`, `LOG`, `EXP`,
+    `MOD` and `%` have their arguments' common type (`NUMERIC` stays
+    exact); `SQRT`, `LN`, `LOG`, `EXP`,
     `POWER` and `RANDOM` return `DOUBLE PRECISION`
   - Errors as in Postgres for the square root of a negative number, the
-    logarithm of zero or of a negative number, `MOD` by zero, zero to a
-    negative power, and overflow
+    logarithm of zero or of a negative number, `MOD` / `%` by zero (of any
+    numeric type), zero to a negative power, and overflow. `EXP` of a double
+    that underflows is an error too ("value out of range: underflow"); `EXP`
+    of a `NUMERIC` then returns 0, as Postgres's `exp(numeric)` does
 - String functions; positions are 1-based and count characters, not bytes:
   - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`,
     `SUBSTR`, `LEFT(s, n)` / `RIGHT(s, n)` (a negative `n` drops characters
@@ -626,6 +636,27 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     `SECOND()`
   - `DATE_TRUNC('unit', x)` (dates stay dates), `DATE_DIFF('unit', a, b)`
     (unit boundaries crossed), `LAST_DAY(d)`
+  - `DATEADD(part, n, x)` and `DATEDIFF(part, a, b)` (Snowflake, Redshift,
+    SQL Server; what dbt's `dateadd` and `datediff` emit), with `part` a bare
+    keyword or a string: `year`, `quarter`, `month`, `week`, `day`, `hour`,
+    `minute`, `second`, `millisecond`, `microsecond`, their plurals, and
+    abbreviations such as `yy` / `yyyy`, `qq`, `mm` / `mon`, `wk` / `ww`,
+    `dd` / `d`, `hh`, `mi` / `n` / `m`, `ss` / `s`, `ms`, `us` / `mcs` (`m`
+    is minute and `w` is week, as in Snowflake). In the part's position a
+    bare part name is the part even if a column has that name (write `"day"`
+    for the column); everywhere else it is the column
+  - `DATEDIFF` counts boundaries crossed, exactly like `DATE_DIFF`.
+    `DATEADD` adds `n` parts (a non-integer `n` is rounded, as by
+    `CAST(n AS BIGINT)`); months clamp to the end of the month. As in
+    Snowflake, a date stays a date for a part of a day or longer and becomes
+    a timestamp for a smaller one; timestamps and times keep their type
+    (times wrap around midnight, and date parts aren't valid for them), and
+    text is read as a timestamp
+  - Aliases: `TIMESTAMPADD` / `TIMESTAMPDIFF` (as in Snowflake; MySQL's
+    `TIMESTAMPDIFF` counts whole units elapsed instead),
+    `DATE_ADD(part, n, x)` (Trino, Databricks), and
+    `DATE_ADD(x, INTERVAL n part)` / `DATE_SUB(x, INTERVAL n part)` (MySQL,
+    BigQuery), which are `DATEADD(part, n, x)` / `DATEADD(part, -n, x)`
   - `MAKE_DATE`, `MAKE_TIME`, `MAKE_TIMESTAMP`, `MAKE_TIMESTAMPTZ`,
     `TO_TIMESTAMP(epoch_seconds)`, `EPOCH(x)`, `EPOCH_MS(x)`
   - `TO_CHAR(x, format)`, `TO_DATE(text, format)`,

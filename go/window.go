@@ -623,7 +623,7 @@ func exprEqual(a, b Expr) bool {
 		return ok && x.Not == y.Not && exprEqual(x.X, y.X)
 	case *Cast:
 		y, ok := b.(*Cast)
-		return ok && x.T == y.T && exprEqual(x.X, y.X)
+		return ok && x.T == y.T && exprEqual(x.X, y.X) && exprEqual(x.OnError, y.OnError)
 	case *Func:
 		y, ok := b.(*Func)
 		if !ok || x.Name != y.Name || x.Star != y.Star || x.Distinct != y.Distinct || len(x.Args) != len(y.Args) {

@@ -162,7 +162,7 @@ func TestScalarMath(t *testing.T) {
 		{"LOG(10, 1000)", "3", "DOUBLE PRECISION"},
 		{"EXP(0)", "1", "DOUBLE PRECISION"},
 		{"EXP(1)", "2.718281828459045", "DOUBLE PRECISION"},
-		{"EXP(-1000)", "0", "DOUBLE PRECISION"},
+		{"EXP(-1000.0)", "0", "DOUBLE PRECISION"}, // NUMERIC: no underflow error
 		{"SQRT(NULL)", "NULL", "DOUBLE PRECISION"},
 
 		{"SIGN(-5)", "-1", "BIGINT"},
@@ -383,6 +383,7 @@ func TestScalarErrors(t *testing.T) {
 		{"POWER(-8, 0.5)", "a negative number raised to a non-integer power yields a complex result"},
 		{"POWER(10, 400)", "POWER: value out of range: overflow"},
 		{"EXP(1000)", "EXP: value out of range: overflow"},
+		{"EXP(-1000)", "EXP: value out of range: underflow"},
 		{"ROUND(9223372036854775807, -1)", "ROUND: integer out of range"},
 		{"ROUND(CAST(32760 AS SMALLINT), -2)", "out of range for SMALLINT"},
 		{"ROUND('abc')", `cannot convert "abc"`},

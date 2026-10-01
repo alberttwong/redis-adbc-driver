@@ -638,6 +638,25 @@ func Coerce(v Value, t ColType) (Value, error) {
 	return fail()
 }
 
+// castable reports whether Coerce converts some values of type from to type
+// to; for the other combinations (such as DATE to BOOLEAN) it always fails.
+func castable(from, to ColType) bool {
+	f := from.Kind
+	switch {
+	case f == KindNull || f == KindString || to.Kind == KindNull || to.Kind == KindString:
+		return true
+	case to.Kind == KindBool:
+		return f == KindBool || f.isInteger()
+	case to.Kind.isNumeric():
+		return f.isNumeric() || f == KindBool
+	case to.Kind == KindDate || to.Kind == KindTime:
+		return f == to.Kind || f == KindTimestamp
+	case to.Kind == KindTimestamp:
+		return f == KindTimestamp || f == KindDate
+	}
+	return f == to.Kind // BINARY, INTERVAL
+}
+
 // parseString converts text into a value of the given type.
 func parseString(s string, t ColType) (Value, error) {
 	trimmed := strings.TrimSpace(s)

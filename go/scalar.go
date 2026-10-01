@@ -764,6 +764,11 @@ func floatFunc(f *Func, args []Value) (Value, error) {
 		}
 	case "EXP":
 		r = math.Exp(x)
+		// As in Postgres, a double that underflows to zero is an error, but
+		// the exp of a NUMERIC is then 0.
+		if r == 0 && !math.IsInf(x, -1) && args[0].T.Kind != KindDecimal {
+			return fail("value out of range: underflow")
+		}
 	case "POWER", "POW":
 		y := xs[1]
 		switch {
