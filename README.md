@@ -340,6 +340,7 @@ DELETE FROM customers WHERE customer_id = 51;
 
 -- DDL
 CREATE TABLE events (id BIGINT NOT NULL, kind VARCHAR, payload VARCHAR NOINDEX, at TIMESTAMP(3));
+COMMENT ON COLUMN events.payload IS 'Raw JSON, as received';
 DROP TABLE events;
 ```
 
@@ -429,9 +430,9 @@ Stop Redis with `docker compose down`.
     not see them at all. Earlier versions of the driver don't raise levels
     when they write.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
-  (column types, defaults, missing values and string levels as JSON), `adbc:{meta}:seq:*` (row ids),
+  (column types, defaults, missing values, string levels and comments as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
-  `adbc:{meta}:view:<schema>:<view>` (the SELECT text and its columns) and
+  `adbc:{meta}:view:<schema>:<view>` (the SELECT text, its columns and comments) and
   `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
   Each table's metadata records its row key prefix and index name, and
   `adbc:{meta}:prefixes` / `adbc:{meta}:indexes` reserve them, so a renamed
@@ -545,7 +546,9 @@ field, even if later rows have it.
 
 ## Supported SQL
 
-- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [DEFAULT expr] [NOINDEX], …)`,
+- `CREATE TABLE [IF NOT EXISTS] t (col TYPE [NOT NULL] [DEFAULT expr] [NOINDEX] [COMMENT 'text'], …)
+  [COMMENT [=] 'text']` (the `COMMENT` clauses, MySQL / Snowflake style, set
+  the same comments as `COMMENT ON`),
   `CREATE TABLE [IF NOT EXISTS] t AS SELECT …` (column names and types come
   from the query; every indexable column is indexed),
   `DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]`,
@@ -602,7 +605,7 @@ field, even if later rows have it.
   names are checked before any table is emptied
 - `ALTER TABLE [IF EXISTS] t` with one of `RENAME TO u`,
   `RENAME [COLUMN] a TO b`,
-  `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOT NULL] [DEFAULT expr] [NOINDEX]`,
+  `ADD [COLUMN] [IF NOT EXISTS] c TYPE [NOT NULL] [DEFAULT expr] [NOINDEX] [COMMENT 'text']`,
   `DROP [COLUMN] [IF EXISTS] c [CASCADE | RESTRICT]`,
   `ALTER [COLUMN] c {SET DEFAULT expr | DROP DEFAULT}`. All of them only change metadata, so they
   take the same time at any table size (except `RENAME TO` with
@@ -667,6 +670,29 @@ field, even if later rows have it.
     a column with the same name is added later.
   - `ALTER COLUMN … SET DEFAULT` / `DROP DEFAULT` only change what rows
     inserted later get; existing rows keep their values.
+- `COMMENT ON {TABLE | VIEW | COLUMN} name IS 'text' | NULL`, as in
+  Postgres (dbt's `persist_docs` runs it). A column is named `t.col`,
+  `schema.t.col` or `redis.schema.t.col`, and names resolve as elsewhere
+  (temporary objects first). `NULL` or `''` removes the comment.
+  - **Storage:** the comment is part of the table's or view's metadata
+    (changed with `WATCH`/`MULTI`), so it stays with the object through
+    `RENAME TO` and `RENAME COLUMN`, and is dropped with the object, or with
+    its column by `DROP COLUMN`. `TRUNCATE` keeps it. With
+    `adbc.redis.rename_rekey` the comments move with the metadata, and
+    `COMMENT ON` isn't refused while the rows move. `CREATE OR REPLACE VIEW`
+    keeps the view's comment and those of the columns that keep their names,
+    as Postgres does. `CREATE TABLE … AS` and `CREATE VIEW` copy no comments
+    from what they read.
+  - **Reading them back:** `information_schema.tables.comment` and
+    `information_schema.columns.comment`; `GetObjects`' `remarks` for
+    columns (the `GetObjects` schema has no field for a table's comment);
+    and `GetTableSchema`, as the field metadata `ARROW:FLIGHT:SQL:REMARKS`
+    (the key Flight SQL uses for column remarks) of each column that has
+    one. Postgres's `obj_description` / `col_description` aren't supported:
+    they take OIDs, which the driver doesn't have.
+  - **Errors** are Postgres's: `"v" is not a table` (`COMMENT ON TABLE` on a
+    view), `"t" is not a view`, `relation "t" does not exist`, `column "c"
+    of relation "t" does not exist`.
 - `INSERT INTO t [(cols)] VALUES (…), (…)` with literals, `?` / `$n`
   parameters or `DEFAULT`, `INSERT INTO t DEFAULT VALUES`, and
   `INSERT INTO t [(cols)] SELECT …` (the query may be parenthesized:
@@ -1092,10 +1118,11 @@ field, even if later rows have it.
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`,
-  and each table's row `key_prefix` and `index_name`, NULL for views),
-  `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
-  `numeric_scale`, `datetime_precision`, and `is_indexed`), and `views`
-  (`view_definition`). Any SQL works on them, including joins
+  each table's row `key_prefix` and `index_name`, NULL for views, and
+  `comment`), `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
+  `numeric_scale`, `datetime_precision`, `is_indexed` and `comment`), and `views`
+  (`view_definition`). `comment` is the `COMMENT ON` text, NULL without
+  one. Any SQL works on them, including joins
 - `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
   `[WITH …] DELETE FROM t [[AS] a] [USING item, …] [WHERE …]` (the Postgres
   forms). The FROM / USING items are written like a SELECT's FROM clause
@@ -1176,7 +1203,9 @@ field, even if later rows have it.
   never compared as a whole); `JSON` and `JSONB` are only cast targets
 
 Tables can be qualified as `schema.table` or `redis.schema.table`, and
-`pg_temp.table` is the connection's temporary table. Schemas are key
+`pg_temp.table` is the connection's temporary table. Strings are written
+`'…'` (`''` for a quote) or dollar-quoted, `$$…$$` or `$tag$…$tag$`, as in
+Postgres. Schemas are key
 namespaces (default `public`). There are no transactions (autocommit
 only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
 every change first (new values and casts, `NOT NULL`, MERGE's

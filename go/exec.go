@@ -211,6 +211,8 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		return execResult{affected: -1}, e.store.dropSchema(ctx, st.Name, st.IfExists, st.Cascade)
 	case *TruncateStmt:
 		return execResult{affected: -1}, e.runTruncate(ctx, st)
+	case *CommentStmt:
+		return execResult{affected: -1}, e.runComment(ctx, st)
 	}
 	return execResult{}, errorf(adbc.StatusNotImplemented, "unsupported statement %T", ps.Stmt)
 }
@@ -253,10 +255,10 @@ func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) erro
 	if err != nil {
 		return err
 	}
-	meta := &tableMeta{Schema: schema, Name: name}
+	meta := &tableMeta{Schema: schema, Name: name, Comment: st.Comment}
 	noIndex := map[string]bool{}
 	for _, c := range st.Columns {
-		col := columnMeta{Name: c.Name, Type: c.Type, Nullable: !c.NotNull}
+		col := columnMeta{Name: c.Name, Type: c.Type, Nullable: !c.NotNull, Comment: c.Comment}
 		if c.Default != nil {
 			if col.Default, _, err = e.checkDefault(ctx, c); err != nil {
 				return err

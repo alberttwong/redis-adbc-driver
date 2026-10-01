@@ -17,7 +17,7 @@ package redis
 // Views.
 //
 // A view is stored as its SELECT text plus the column names and types it
-// produced when it was created:
+// produced when it was created (and its comments, see comment.go):
 //
 //	adbc:{meta}:view:<schema>:<view>   STRING JSON {schema, name, sql, columns}
 //	adbc:{meta}:views:<schema>         SET    view names
@@ -58,6 +58,8 @@ type viewMeta struct {
 	// DefaultSchema is where a temporary view's unqualified names resolve
 	// (after temporary objects). Permanent views use their own schema.
 	DefaultSchema string `json:"default_schema,omitempty"`
+	// Comment is the view's COMMENT ON text (see comment.go).
+	Comment string `json:"comment,omitempty"`
 }
 
 func viewKey(schema, name string) string { return metaPrefix + "view:" + tableKeySuffix(schema, name) }
@@ -90,25 +92,87 @@ func (s *store) viewExists(ctx context.Context, schema, name string) (bool, erro
 	return n > 0, nil
 }
 
+// putView creates a view, or replaces one (CREATE OR REPLACE VIEW), which
+// keeps the comments of the view it replaces (see keepComments).
 func (s *store) putView(ctx context.Context, v *viewMeta) error {
 	if err := s.checkWritableSchema(v.Schema); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return errorf(adbc.StatusInternal, "failed to encode view: %v", err)
-	}
-	pipe := s.client.TxPipeline()
-	pipe.Set(ctx, viewKey(v.Schema, v.Name), raw, 0)
-	pipe.SAdd(ctx, viewsKey(v.Schema), v.Name)
-	if !isTempSchema(v.Schema) {
-		pipe.SAdd(ctx, schemasKey, v.Schema)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
+	key := viewKey(v.Schema, v.Name)
+	for attempt := 0; attempt < 20; attempt++ {
+		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			old, err := tx.Get(ctx, key).Result()
+			if err != nil && !errors.Is(err, goredis.Nil) {
+				return err
+			}
+			put := *v
+			put.Columns = slices.Clone(v.Columns)
+			if err == nil {
+				var replaced viewMeta
+				if json.Unmarshal([]byte(old), &replaced) == nil {
+					keepComments(&replaced, &put)
+				}
+			}
+			raw, err := json.Marshal(&put)
+			if err != nil {
+				return errorf(adbc.StatusInternal, "failed to encode view: %v", err)
+			}
+			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Set(ctx, key, raw, 0)
+				p.SAdd(ctx, viewsKey(v.Schema), v.Name)
+				if !isTempSchema(v.Schema) {
+					p.SAdd(ctx, schemasKey, v.Schema)
+				}
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, goredis.TxFailedErr) {
+			continue // concurrent change: retry
+		}
+		if err == nil {
+			s.trackTemp(v.Schema, v.Name, true)
+		}
 		return wrapRedis(err, "failed to create view")
 	}
-	s.trackTemp(v.Schema, v.Name, true)
-	return nil
+	return errorf(adbc.StatusIO, "view %q.%q is being changed concurrently; try again", displaySchema(v.Schema), v.Name)
+}
+
+// updateView is updateTable for a view's metadata.
+func (s *store) updateView(ctx context.Context, schema, name string, fn func(*viewMeta) error) error {
+	key := viewKey(schema, name)
+	for attempt := 0; attempt < 20; attempt++ {
+		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			raw, err := tx.Get(ctx, key).Result()
+			if errors.Is(err, goredis.Nil) {
+				return viewNotFound(schema, name)
+			}
+			if err != nil {
+				return err
+			}
+			var v viewMeta
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				return errorf(adbc.StatusInternal, "corrupt metadata for view %q.%q: %v", schema, name, err)
+			}
+			if err := fn(&v); err != nil {
+				return err
+			}
+			out, err := json.Marshal(&v)
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Set(ctx, key, out, 0)
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, goredis.TxFailedErr) {
+			continue // concurrent change: retry
+		}
+		return wrapRedis(err, "failed to update view metadata")
+	}
+	return errorf(adbc.StatusIO, "view %q.%q is being changed concurrently; try again", displaySchema(schema), name)
 }
 
 func (s *store) dropView(ctx context.Context, schema, name string, ifExists bool) error {
