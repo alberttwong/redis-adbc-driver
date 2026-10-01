@@ -114,6 +114,8 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 			return execResult{}, err
 		}
 		return execResult{affected: -1}, e.store.dropTable(ctx, schema, name, st.IfExists)
+	case *AlterTableStmt:
+		return execResult{affected: -1}, e.runAlter(ctx, st)
 	case *CreateViewStmt:
 		return execResult{affected: -1}, e.runCreateView(ctx, st, ps.NumParams)
 	case *DropViewStmt:
@@ -769,9 +771,9 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 					if !col.Nullable {
 						return 0, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", col.Name)
 					}
-					del = append(del, col.Name)
+					del = append(del, col.field())
 				} else {
-					set = append(set, col.Name, encodeStored(cv))
+					set = append(set, col.field(), encodeStored(cv))
 				}
 			}
 			if len(set) > 0 {

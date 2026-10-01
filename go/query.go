@@ -644,7 +644,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		col, ok := meta.column(c.Name)
-		if !ok || !col.Indexed || !simpleName(col.Name) {
+		if !ok || !col.Indexed || !simpleName(col.field()) {
 			return nil, false, nil
 		}
 		if !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
@@ -696,7 +696,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		col, ok := meta.column(c.Name)
-		if !ok || !col.Indexed || !simpleName(col.Name) || col.Name == rowIDField {
+		if !ok || !col.Indexed || !simpleName(col.field()) || col.Name == rowIDField {
 			return nil, false, nil
 		}
 		if f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown) {
@@ -706,12 +706,12 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		if _, ok := nonNull[col.Name]; !ok {
 			alias := fmt.Sprintf("__nn%d", len(nonNull))
 			nonNull[col.Name] = alias
-			steps = append(steps, "APPLY", fmt.Sprintf("exists(@%s)", col.Name), "AS", alias)
+			steps = append(steps, "APPLY", fmt.Sprintf("exists(@%s)", col.field()), "AS", alias)
 		}
 	}
 	steps = append(steps, "GROUPBY", len(groupCols))
 	for _, c := range groupCols {
-		steps = append(steps, "@"+c.Name)
+		steps = append(steps, "@"+c.field())
 	}
 	steps = append(steps, "REDUCE", "COUNT", 0, "AS", "__count")
 	for col, alias := range nonNull {
@@ -726,7 +726,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		if op == "AVG" {
 			op = "SUM"
 		}
-		steps = append(steps, "REDUCE", op, 1, "@"+argCol[i].Name, "AS", fmt.Sprintf("__a%d", i))
+		steps = append(steps, "REDUCE", op, 1, "@"+argCol[i].field(), "AS", fmt.Sprintf("__a%d", i))
 	}
 	raw, err := e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: steps})
 	if err != nil {
@@ -740,7 +740,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 	for _, r := range raw {
 		g := aggGroup{rep: map[string]Value{}, results: map[*Func]Value{}}
 		for _, c := range groupCols {
-			s, ok := r[c.Name]
+			s, ok := r[c.field()]
 			if !ok {
 				g.rep[c.Name] = nullValue(c.Type)
 				continue

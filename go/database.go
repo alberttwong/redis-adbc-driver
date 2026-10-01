@@ -70,6 +70,15 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		_ = client.Close()
 		return nil, err
 	}
+	if err := st.ensureRegistry(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	// Finish removing dropped columns' fields left over by earlier connections.
+	if err := st.resumeCleanups(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 	conn := &connectionImpl{
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 		store:              st,

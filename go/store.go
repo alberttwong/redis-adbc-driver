@@ -54,6 +54,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	goredis "github.com/redis/go-redis/v9"
@@ -84,9 +85,10 @@ type columnMeta struct {
 	Nullable bool    `json:"nullable"`
 	// Indexed columns are part of the RediSearch index.
 	Indexed bool `json:"indexed"`
-	// Field is the HASH field / index attribute when it differs from Name
-	// (join views name columns alias.column).
-	Field string `json:"-"`
+	// Field is the HASH field / index attribute when it differs from Name:
+	// after RENAME COLUMN (the data keeps its original field), and in join
+	// views (which name columns alias.column).
+	Field string `json:"field,omitempty"`
 }
 
 // field returns the HASH field and index attribute name of the column.
@@ -135,6 +137,17 @@ type tableMeta struct {
 	Schema  string       `json:"schema"`
 	Name    string       `json:"name"`
 	Columns []columnMeta `json:"columns"`
+
+	// KeyPrefix and IndexName are fixed when the table is created, so that
+	// RENAME TO only rewrites metadata. Empty for tables created before they
+	// were recorded (then derived from the name).
+	KeyPrefix string `json:"key_prefix,omitempty"`
+	IndexName string `json:"index_name,omitempty"`
+	// RetiredFields are HASH fields of dropped columns; they are never
+	// reused, so dropped values cannot reappear. PendingCleanup are the ones
+	// still being removed from existing rows in the background.
+	RetiredFields  []string `json:"retired_fields,omitempty"`
+	PendingCleanup []string `json:"pending_cleanup,omitempty"`
 
 	// In-memory relations (CTEs, derived tables) hold their rows here and
 	// have no index or HASHes.
@@ -206,8 +219,130 @@ func tablesKey(schema string) string        { return metaPrefix + "tables:" + es
 func rowPrefix(schema, table string) string { return tableKeySuffix(schema, table) + ":" }
 func indexName(schema, table string) string { return "idx:" + tableKeySuffix(schema, table) }
 
-func (t *tableMeta) index() string  { return indexName(t.Schema, t.Name) }
-func (t *tableMeta) prefix() string { return rowPrefix(t.Schema, t.Name) }
+func (t *tableMeta) index() string {
+	if t.IndexName != "" {
+		return t.IndexName
+	}
+	return indexName(t.Schema, t.Name)
+}
+
+func (t *tableMeta) prefix() string {
+	if t.KeyPrefix != "" {
+		return t.KeyPrefix
+	}
+	return rowPrefix(t.Schema, t.Name)
+}
+
+// indexAttrArgs returns the FT.CREATE / FT.ALTER attribute definition of an
+// indexed column.
+func indexAttrArgs(c columnMeta) []any {
+	if c.Type.Kind == KindString {
+		return []any{c.field(), "TAG", "SEPARATOR", tagSeparator, "CASESENSITIVE", "INDEXEMPTY", "SORTABLE", "UNF"}
+	}
+	return []any{c.field(), "NUMERIC", "SORTABLE"}
+}
+
+// Registry of key prefixes and index names in use. A renamed table keeps its
+// prefix and index, so a new table with the old name must get different ones.
+const (
+	prefixesKey    = metaPrefix + "prefixes"
+	indexesKey     = metaPrefix + "indexes"
+	registryMarker = metaPrefix + "registry"
+	cleanupKey     = metaPrefix + "cleanup"
+)
+
+// claim atomically reserves the first free name among base, base_2, … in a
+// registry set; suffix formats a candidate from base and a counter.
+func (s *store) claim(ctx context.Context, set, base string, suffix func(string, int) string) (string, error) {
+	for n := 1; n < 10000; n++ {
+		cand := base
+		if n > 1 {
+			cand = suffix(base, n)
+		}
+		added, err := s.client.SAdd(ctx, set, cand).Result()
+		if err != nil {
+			return "", wrapRedis(err, "failed to reserve a key prefix")
+		}
+		if added == 1 {
+			return cand, nil
+		}
+	}
+	return "", errorf(adbc.StatusInternal, "could not reserve a unique name for %q", base)
+}
+
+// ensureRegistry records the prefixes and indexes of tables created before
+// the registry existed (once per database).
+func (s *store) ensureRegistry(ctx context.Context) error {
+	n, err := s.client.Exists(ctx, registryMarker).Result()
+	if err != nil || n > 0 {
+		return wrapRedis(err, "failed to check the table registry")
+	}
+	schemas, err := s.listSchemas(ctx)
+	if err != nil {
+		return err
+	}
+	for _, schema := range schemas {
+		tables, err := s.listTables(ctx, schema)
+		if err != nil {
+			return err
+		}
+		for _, t := range tables {
+			meta, err := s.getTable(ctx, schema, t)
+			if err != nil {
+				continue
+			}
+			if err := s.client.SAdd(ctx, prefixesKey, meta.prefix()).Err(); err != nil {
+				return wrapRedis(err, "failed to build the table registry")
+			}
+			if err := s.client.SAdd(ctx, indexesKey, meta.index()).Err(); err != nil {
+				return wrapRedis(err, "failed to build the table registry")
+			}
+		}
+	}
+	return wrapRedis(s.client.Set(ctx, registryMarker, "1", 0).Err(), "failed to build the table registry")
+}
+
+// updateTable applies fn to a table's metadata with optimistic locking
+// (WATCH/MULTI); extra adds commands to the same transaction.
+func (s *store) updateTable(ctx context.Context, schema, table string, fn func(*tableMeta) error,
+	extra func(goredis.Pipeliner)) error {
+	key := metaKey(schema, table)
+	for attempt := 0; attempt < 20; attempt++ {
+		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			raw, err := tx.Get(ctx, key).Result()
+			if errors.Is(err, goredis.Nil) {
+				return tableNotFound(schema, table)
+			}
+			if err != nil {
+				return err
+			}
+			var meta tableMeta
+			if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+				return errorf(adbc.StatusInternal, "corrupt metadata for table %q.%q: %v", schema, table, err)
+			}
+			if err := fn(&meta); err != nil {
+				return err
+			}
+			out, err := json.Marshal(&meta)
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Set(ctx, key, out, 0)
+				if extra != nil {
+					extra(p)
+				}
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, goredis.TxFailedErr) {
+			continue // concurrent change: retry
+		}
+		return wrapRedis(err, "failed to update table metadata")
+	}
+	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", schema, table)
+}
 
 // ---- errors ----
 
@@ -236,6 +371,10 @@ type store struct {
 	// client is a *goredis.Client, or a *goredis.ClusterClient when the
 	// server exposes the OSS Cluster API.
 	client goredis.UniversalClient
+
+	// Background dropped-column cleanups running on this connection.
+	mu       sync.Mutex
+	cleaning map[string]bool
 }
 
 // search returns the connection used for FT.* commands. On a cluster every
@@ -394,22 +533,50 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 		return false, errorf(adbc.StatusAlreadyExists, "table %q.%q already exists", meta.Schema, meta.Name)
 	}
 
-	// Drop any stale index left behind by an interrupted DROP TABLE.
+	// Reserve a key prefix and index name no other table uses (a renamed
+	// table keeps the ones derived from its old name).
+	release := func() {
+		s.client.Del(ctx, metaKey(meta.Schema, meta.Name))
+		if meta.KeyPrefix != "" {
+			s.client.SRem(ctx, prefixesKey, meta.KeyPrefix)
+		}
+		if meta.IndexName != "" {
+			s.client.SRem(ctx, indexesKey, meta.IndexName)
+		}
+	}
+	if meta.KeyPrefix, err = s.claim(ctx, prefixesKey, rowPrefix(meta.Schema, meta.Name), func(b string, n int) string {
+		return strings.TrimSuffix(b, ":") + "~" + strconv.Itoa(n) + ":"
+	}); err != nil {
+		release()
+		return false, err
+	}
+	if meta.IndexName, err = s.claim(ctx, indexesKey, indexName(meta.Schema, meta.Name), func(b string, n int) string {
+		return b + "~" + strconv.Itoa(n)
+	}); err != nil {
+		release()
+		return false, err
+	}
+	if raw, err = json.Marshal(meta); err == nil {
+		err = s.client.Set(ctx, metaKey(meta.Schema, meta.Name), raw, 0).Err()
+	}
+	if err != nil {
+		release()
+		return false, wrapRedis(err, "failed to create table")
+	}
+
+	// The index name was free in the registry, so an index with that name is
+	// left over from an interrupted CREATE/DROP and can be discarded.
 	_ = s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err()
 
 	args := []any{"FT.CREATE", meta.index(), "ON", "HASH", "PREFIX", 1, meta.prefix(),
 		"SKIPINITIALSCAN", "SCHEMA", rowIDField, "NUMERIC", "SORTABLE"}
 	for _, c := range meta.Columns {
-		switch {
-		case !c.Indexed:
-		case c.Type.Kind == KindString:
-			args = append(args, c.Name, "TAG", "SEPARATOR", tagSeparator, "CASESENSITIVE", "INDEXEMPTY", "SORTABLE", "UNF")
-		default:
-			args = append(args, c.Name, "NUMERIC", "SORTABLE")
+		if c.Indexed {
+			args = append(args, indexAttrArgs(c)...)
 		}
 	}
 	if err := s.searchDo(ctx, meta.index(), args...).Err(); err != nil {
-		s.client.Del(ctx, metaKey(meta.Schema, meta.Name))
+		release()
 		return false, wrapRedis(err, "failed to create search index")
 	}
 	pipe := s.client.TxPipeline()
@@ -424,24 +591,25 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 
 // dropTable removes the index, every row, and the table metadata.
 func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bool) error {
-	exists, err := s.tableExists(ctx, schema, table)
+	meta, err := s.getTable(ctx, schema, table)
 	if err != nil {
-		return err
-	}
-	if !exists {
-		if ifExists {
+		var ae adbc.Error
+		if ifExists && asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
 			return nil
 		}
-		return tableNotFound(schema, table)
+		return err
 	}
 	// DD deletes every document the index knows about.
-	if err := s.searchDo(ctx, indexName(schema, table), "FT.DROPINDEX", indexName(schema, table), "DD").Err(); err != nil &&
+	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
 		!isUnknownIndex(err) {
 		return wrapRedis(err, "failed to drop search index")
 	}
 	pipe := s.client.TxPipeline()
 	pipe.Del(ctx, metaKey(schema, table), seqKey(schema, table))
 	pipe.SRem(ctx, tablesKey(schema), table)
+	pipe.SRem(ctx, prefixesKey, meta.prefix())
+	pipe.SRem(ctx, indexesKey, meta.index())
+	pipe.SRem(ctx, cleanupKey, cleanupMember(schema, table))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return wrapRedis(err, "failed to drop table")
 	}
@@ -552,7 +720,7 @@ func (s *store) insertRows(ctx context.Context, meta *tableMeta, rows [][]Value)
 			fields = append(fields, rowIDField, id)
 			for i, c := range meta.Columns {
 				if v := rows[r][i]; !v.Null {
-					fields = append(fields, c.Name, encodeStored(v))
+					fields = append(fields, c.field(), encodeStored(v))
 				}
 			}
 			pipe.HSet(ctx, prefix+id, fields...)

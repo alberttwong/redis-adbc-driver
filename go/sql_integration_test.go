@@ -21,14 +21,17 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 type sqlHarness struct {
@@ -548,4 +551,172 @@ func TestSQLViews(t *testing.T) {
 	h.exec(`DROP VIEW v_tmp`)
 	h.expectError(`SELECT * FROM v_tmp`, "does not exist")
 	h.exec(`DROP VIEW IF EXISTS v_tmp`)
+}
+
+// rawClient connects to REDIS_URI directly (cluster-aware) so tests can
+// inspect row HASHes.
+func (h *sqlHarness) rawClient() goredis.UniversalClient {
+	h.t.Helper()
+	opts, err := goredis.ParseURL(os.Getenv("REDIS_URI"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	opts.Protocol = 2 // the driver's reply parsing expects RESP2
+	var c goredis.UniversalClient = goredis.NewClient(opts)
+	if info, err := c.Info(h.ctx, "cluster").Result(); err == nil && strings.Contains(info, "cluster_enabled:1") {
+		_ = c.Close()
+		c = goredis.NewClusterClient(&goredis.ClusterOptions{Addrs: []string{opts.Addr}, Password: opts.Password,
+			Username: opts.Username, TLSConfig: opts.TLSConfig, Protocol: 2})
+	}
+	h.t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// rowFields returns the field names of every row HASH under a table prefix.
+func (h *sqlHarness) rowFields(c goredis.UniversalClient, schema, table string) map[string]int {
+	h.t.Helper()
+	st := &store{client: c}
+	meta, err := st.getTable(h.ctx, schema, table)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	rows, err := st.aggregate(h.ctx, &aggRequest{index: meta.index(), query: "*", load: []string{"__key"}})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, r := range rows {
+		fields, err := c.HKeys(h.ctx, r["__key"]).Result()
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		for _, f := range fields {
+			counts[f]++
+		}
+	}
+	return counts
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestSQLAlterTable(t *testing.T) {
+	h := newSQLHarness(t)
+	for _, n := range []string{"it_alter", "it_alter2", "it_alter3"} {
+		h.exec("DROP TABLE IF EXISTS " + n)
+	}
+	t.Cleanup(func() {
+		for _, n := range []string{"it_alter", "it_alter2", "it_alter3"} {
+			h.exec("DROP TABLE IF EXISTS " + n)
+		}
+	})
+	raw := h.rawClient()
+	h.exec(`CREATE TABLE it_alter (id INTEGER NOT NULL, name VARCHAR, qty INTEGER)`)
+	h.exec(`INSERT INTO it_alter VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL)`)
+
+	// RENAME COLUMN: SQL name changes, data and index attribute stay.
+	h.exec(`ALTER TABLE it_alter RENAME COLUMN name TO label`)
+	h.expectRows(`SELECT id, label FROM it_alter WHERE label = 'b'`, "2|b")
+	h.expectError(`SELECT name FROM it_alter`, "does not exist")
+	if f := h.rowFields(raw, "public", "it_alter"); f["name"] != 3 || f["label"] != 0 {
+		t.Errorf("row fields after RENAME COLUMN = %v, want the original 'name' field", f)
+	}
+	h.expectError(`ALTER TABLE it_alter RENAME COLUMN label TO qty`, "already exists")
+	h.expectError(`ALTER TABLE it_alter RENAME COLUMN nope TO x`, "does not exist")
+
+	// ADD COLUMN: NULL for existing rows, indexed for new data.
+	h.exec(`ALTER TABLE it_alter ADD COLUMN note VARCHAR`)
+	h.exec(`INSERT INTO it_alter (id, label, qty, note) VALUES (4, 'd', 40, 'x')`)
+	h.expectRows(`SELECT id, note FROM it_alter ORDER BY id`, "1|NULL", "2|NULL", "3|NULL", "4|x")
+	h.expectRows(`SELECT id FROM it_alter WHERE note = 'x'`, "4")
+	h.exec(`ALTER TABLE it_alter ADD COLUMN IF NOT EXISTS note VARCHAR`)
+	h.expectError(`ALTER TABLE it_alter ADD COLUMN note VARCHAR`, "already exists")
+	h.expectError(`ALTER TABLE it_alter ADD COLUMN must INTEGER NOT NULL`, "NOT NULL")
+	h.expectError(`ALTER TABLE it_alter ADD COLUMN d INTEGER DEFAULT 5`, "defaults")
+
+	// DROP COLUMN: gone at once; its field is removed from rows in the
+	// background; re-adding the name never shows the old values.
+	h.exec(`ALTER TABLE it_alter DROP COLUMN qty`)
+	h.expectRows(`SELECT * FROM it_alter WHERE id = 1`, "1|a|NULL")
+	h.expectError(`SELECT qty FROM it_alter`, "does not exist")
+	h.exec(`ALTER TABLE it_alter ADD COLUMN qty INTEGER`)
+	h.expectRows(`SELECT id, qty FROM it_alter ORDER BY id`, "1|NULL", "2|NULL", "3|NULL", "4|NULL")
+	waitFor(t, "dropped column cleanup", func() bool { return h.rowFields(raw, "public", "it_alter")["qty"] == 0 })
+	h.exec(`UPDATE it_alter SET qty = 7 WHERE id = 1`)
+	h.expectRows(`SELECT id FROM it_alter WHERE qty = 7`, "1")
+	h.exec(`ALTER TABLE it_alter DROP COLUMN IF EXISTS nope`)
+	h.expectError(`ALTER TABLE it_alter DROP COLUMN nope`, "does not exist")
+
+	// RENAME TO: rows and index follow without being rewritten. A new table
+	// with the old name must not see (or, when dropped, delete) them.
+	h.exec(`ALTER TABLE it_alter RENAME TO it_alter2`)
+	h.expectRows(`SELECT COUNT(*) FROM it_alter2`, "4")
+	h.expectRows(`SELECT id FROM it_alter2 WHERE label = 'c'`, "3")
+	h.expectError(`SELECT * FROM it_alter`, "does not exist")
+	h.exec(`CREATE TABLE it_alter (x INTEGER)`)
+	h.exec(`INSERT INTO it_alter VALUES (100)`)
+	h.expectRows(`SELECT COUNT(*) FROM it_alter`, "1")
+	h.exec(`INSERT INTO it_alter2 (id, label) VALUES (5, 'e')`)
+	h.expectRows(`SELECT COUNT(*) FROM it_alter2`, "5")
+	h.exec(`DROP TABLE it_alter`)
+	h.expectRows(`SELECT COUNT(*) FROM it_alter2`, "5")
+	h.exec(`CREATE TABLE it_alter3 (a INTEGER)`)
+	h.expectError(`ALTER TABLE it_alter2 RENAME TO it_alter3`, "already exists")
+	h.expectError(`ALTER TABLE it_alter2 RENAME TO secondary.x`, "another schema")
+	h.exec(`ALTER TABLE it_alter3 ADD COLUMN b INTEGER`)
+	h.exec(`ALTER TABLE it_alter3 DROP COLUMN a`)
+	h.expectError(`ALTER TABLE it_alter3 DROP COLUMN b`, "only column")
+	h.exec(`ALTER TABLE IF EXISTS it_missing RENAME TO it_missing2`)
+	h.expectError(`ALTER TABLE it_missing RENAME TO it_missing2`, "does not exist")
+}
+
+func TestSQLAlterCleanupResumes(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP TABLE IF EXISTS it_resume")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_resume") })
+	h.exec(`CREATE TABLE it_resume (id INTEGER, v INTEGER)`)
+	h.exec(`INSERT INTO it_resume VALUES (1, 1), (2, 2), (3, 3)`)
+	raw := h.rawClient()
+
+	// Leave a cleanup pending, as if the process had exited mid-way: the
+	// rows still hold a dropped column's field.
+	st := &store{client: raw}
+	meta, err := st.getTable(h.ctx, "public", "it_resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe := raw.Pipeline()
+	for id := 1; id <= 3; id++ {
+		pipe.HSet(h.ctx, fmt.Sprintf("%s%d", meta.prefix(), id), "ghost", "boo")
+	}
+	if _, err := pipe.Exec(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.updateTable(h.ctx, "public", "it_resume", func(m *tableMeta) error {
+		m.RetiredFields = append(m.RetiredFields, "ghost")
+		m.PendingCleanup = append(m.PendingCleanup, "ghost")
+		return nil
+	}, func(p goredis.Pipeliner) { p.SAdd(h.ctx, cleanupKey, cleanupMember("public", "it_resume")) }); err != nil {
+		t.Fatal(err)
+	}
+	if h.rowFields(raw, "public", "it_resume")["ghost"] != 3 {
+		t.Fatal("setup: ghost field missing")
+	}
+
+	// A new connection resumes and finishes it.
+	h2 := newSQLHarness(t)
+	waitFor(t, "resumed cleanup", func() bool { return h2.rowFields(raw, "public", "it_resume")["ghost"] == 0 })
+	waitFor(t, "cleanup marker removal", func() bool {
+		m, _ := raw.SIsMember(h.ctx, cleanupKey, cleanupMember("public", "it_resume")).Result()
+		return !m
+	})
+	h2.expectRows(`SELECT id, v FROM it_resume ORDER BY id`, "1|1", "2|2", "3|3")
 }
