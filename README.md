@@ -44,6 +44,10 @@ The remaining 10 skipped tests and 1 expected failure are features the
 driver doesn't offer: constraints, statistics, a second catalog,
 transactions, and parameter-type introspection.
 
+Redis Flex (RAM + SSD) databases are not supported yet, and the driver
+refuses them when it connects; see
+[Server requirements](#server-requirements).
+
 ## Server requirements
 
 You don't create any indexes or enable any settings yourself. The one hard
@@ -93,6 +97,28 @@ A table exists for the driver only if its metadata key
 HASHes and indexes created some other way (for example your own
 `row:*` / `idx:rows` layout) won't appear as tables. To query existing data,
 load it through the driver; bulk ingest from Arrow is the quickest route.
+
+**Limitation: Redis Flex databases are not supported yet**
+
+[Redis Flex](https://redis.io/docs/latest/operate/rs/flex/) (formerly Auto
+Tiering) keeps most of a database on SSD, for datasets of a terabyte and
+more. Search on Flex can't index tables the way the driver needs. Every
+table's index has a `NUMERIC SORTABLE` row-ID field, and every query reads
+rows through `FT.AGGREGATE` cursors. So when the driver connects to a Flex
+database it fails with `Redis Flex databases are not supported`, before
+writing anything.
+
+| Flex database | Search on Flex | Missing for the driver |
+|-|-|-|
+| Redis Cloud Essentials | Not available | Search itself (the driver reports that search is missing) |
+| Redis Cloud Pro | Opt-in Preview | `FT.AGGREGATE`; `NUMERIC` fields (per Redis's docs; not tested here) |
+| Redis Software 8.2.0-78, Redis 8.6.2, Search 8.6.11 | Included (`search_on_bigstore`) | `FT.AGGREGATE`, `FT.ALTER`, `FT.DROPINDEX … DD`; `NUMERIC`, `GEO` and `SORTABLE` fields. `FT.SEARCH` returns only keys, and indexes need `SKIPINITIALSCAN` (tested, see [Building and testing](#building-and-testing)) |
+
+Redis's announcement of Search on Flex says Redis Software already offers
+`NUMERIC` fields and `FT.AGGREGATE` on Flex, and that Redis Cloud will follow.
+But the latest Docker image (8.2.0-78, built 2026-09-01) rejects both. The
+connect check tests whether `FT.AGGREGATE` works, not whether the database
+is Flex. So a Flex release that supports it is no longer refused.
 
 ## Quick start
 
@@ -1499,6 +1525,29 @@ docker compose --profile cluster up --detach --wait redis-cluster
 ```bash
 cd validation && REDIS_URI=redis://localhost:7001/0 uv run pytest -v tests/
 ```
+
+To test against Redis Flex, `flex-setup.sh` (from `go`) starts a
+single-node Redis Software cluster with flash storage in Docker. It then
+creates a Flex database with Search on it, and prints the database's URI.
+The cluster uses about 1.5 GB of memory and the image's trial license. Its
+"flash" is a directory inside the container, and its admin API (port 9443)
+listens on localhost only, with fixed test credentials.
+
+```bash
+./flex-setup.sh
+```
+
+The driver refuses Flex databases (see
+[Server requirements](#server-requirements)), and `TestFlexRefused` checks
+that it does so without writing to the database. The test is skipped unless
+`REDIS_FLEX_URI` is set:
+
+```bash
+REDIS_FLEX_URI=redis://localhost:12000/0 go test -run TestFlex ./...
+```
+
+Remove the cluster with `docker compose --profile flex down redis-flex`.
+Name the service: without it, `down` also removes the `redis` container.
 
 To build the Linux library (on Linux or a Mac, with Docker), run
 `build-linux.sh` from `go` with `amd64` or `arm64`. It writes

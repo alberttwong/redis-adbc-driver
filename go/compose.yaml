@@ -55,3 +55,23 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # A single-node Redis Software cluster with flash storage, for testing on
+  # Redis Flex (RAM + SSD). flex-setup.sh starts it, creates the cluster and a
+  # Flex database with Search, and prints its URI. Uses the built-in trial
+  # license.
+  redis-flex:
+    image: redislabs/redis:latest
+    container_name: redis-adbc-flex
+    profiles: ["flex"]
+    cap_add: [SYS_RESOURCE]
+    ports:
+      # Bound to localhost only: the admin API uses fixed test credentials.
+      - "127.0.0.1:${FLEX_API_PORT:-9443}:9443"
+      - "127.0.0.1:${FLEX_DB_PORT:-12000}:12000"
+    healthcheck:
+      # Any HTTP reply: the REST API is up (it answers 401 once bootstrapped).
+      test: ["CMD-SHELL", "curl -sk -o /dev/null https://localhost:9443/v1/bootstrap"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
