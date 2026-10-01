@@ -38,6 +38,7 @@ package redis
 
 import (
 	"context"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -62,21 +63,37 @@ type joinItem struct {
 	// UPDATE … FROM and DELETE … USING use it to find the target row of a
 	// joined row, and to tell which side of an outer join a row came from.
 	tag string
+
+	// lateral is set for a LATERAL subquery or a table function, whose rows
+	// are computed when the join runs (see lateral.go).
+	lateral *lateralItem
+	// natural is NATURAL JOIN; usingOn is then its condition over the
+	// common columns (see planNatural).
+	natural bool
+	usingOn Expr
 }
 
 type joinPlan struct {
 	items []*joinItem
+	// star is the column order of SELECT * when there is a NATURAL JOIN,
+	// and merged are the columns it merges with COALESCE (FULL joins).
+	star   []columnMeta
+	merged []mergedColumn
+	// err is an error found by finish, reported by bindJoin.
+	err error
 }
 
 // planJoin resolves the FROM items of a query with joins. It returns the
 // joined relation (column names "alias.column") and the scope relations.
 func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, []relation, *joinPlan, error) {
 	jp := &joinPlan{}
-	if err := e.addJoinItem(ctx, jp, "", sel.From, sel.FromSelect, sel.FromAlias); err != nil {
+	first := JoinClause{Table: sel.From, Select: sel.FromSelect, Func: sel.FromFunc, Lateral: sel.FromLateral,
+		Alias: sel.FromAlias, Columns: sel.FromColumns}
+	if err := e.addFromItem(ctx, jp, first); err != nil {
 		return nil, nil, nil, err
 	}
 	for _, jc := range sel.Joins {
-		if err := e.addJoinItem(ctx, jp, jc.Kind, jc.Table, jc.Select, jc.Alias); err != nil {
+		if err := e.addFromItem(ctx, jp, jc); err != nil {
 			return nil, nil, nil, err
 		}
 	}
@@ -150,15 +167,27 @@ func (jp *joinPlan) finish() (*tableMeta, []relation) {
 		}
 		rels[i] = relation{name: it.alias, meta: it.base, prefix: it.prefix}
 	}
+	rels = jp.planNatural(joined, rels)
 	return joined, rels
 }
 
 // bindJoin binds the ON / USING conditions in the query's scope (called with
 // the join scope pushed).
 func (e *executor) bindJoin(ctx context.Context, sel *SelectStmt, jp *joinPlan) error {
+	if jp.err != nil {
+		return jp.err
+	}
+	for _, m := range jp.merged {
+		if err := e.bind(ctx, m.expr); err != nil {
+			return err
+		}
+	}
 	for i, jc := range sel.Joins {
 		it := jp.items[i+1]
 		cond := jc.On
+		if jc.Natural {
+			cond = it.usingOn
+		}
 		if len(jc.Using) > 0 {
 			var parts []Expr
 			for _, col := range jc.Using {
@@ -221,6 +250,12 @@ func (jp *joinPlan) itemsOf(expr Expr) ([]int, bool) {
 			}
 		}
 	})
+	// A column merged by a NATURAL FULL JOIN reads the columns it merges.
+	for _, m := range jp.merged {
+		if refs[m.key] {
+			columnRefs(m.expr, refs)
+		}
+	}
 	var out []int
 	for i, it := range jp.items {
 		for name := range refs {
@@ -359,7 +394,8 @@ type joinStep struct {
 func (e *executor) joinOrder(ctx context.Context, jp *joinPlan, wps []wherePlan) ([]joinStep, error) {
 	inner := true
 	for _, it := range jp.items {
-		if it.kind != "" && it.kind != "INNER" && it.kind != "CROSS" {
+		// LATERAL items and table functions keep the written order too.
+		if (it.kind != "" && it.kind != "INNER" && it.kind != "CROSS") || it.lateral != nil {
 			inner = false
 		}
 	}
@@ -475,12 +511,19 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 		for _, x := range it.extra {
 			columnRefs(x, allNeed)
 		}
+		if it.lateral != nil {
+			maps.Copy(allNeed, it.lateral.need)
+		}
 	}
 	types := map[string]ColType{}
 	for _, it := range jp.items {
 		for _, c := range it.base.Columns {
 			types[it.prefix+c.Name] = c.Type
 		}
+	}
+	for _, m := range jp.merged {
+		columnRefs(m.expr, allNeed)
+		types[m.key] = m.typ
 	}
 	env := e.newEnv(ctx, types, params)
 
@@ -555,6 +598,15 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 				continue
 			}
 		}
+		if it.lateral != nil {
+			if left, err = e.lateralJoin(env, k, st, it, wp, left, pairs, filters); err != nil {
+				return nil, err
+			}
+			if err := jp.fillMerged(env, i, left); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if k > 0 && innerLike && wp.keys == nil && !view.isMem {
 			// Index lookup join: fetch only rows whose key matches the left.
 			for _, p := range pairs {
@@ -613,6 +665,9 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 		}
 		left, err = e.joinRows(env, st.kind, left, right, pairs, filters)
 		if err != nil {
+			return nil, err
+		}
+		if err := jp.fillMerged(env, i, left); err != nil {
 			return nil, err
 		}
 	}

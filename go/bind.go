@@ -41,6 +41,9 @@ type relation struct {
 	meta *tableMeta
 	// prefix is prepended to resolved column names ("alias." in joins).
 	prefix string
+	// hidden are columns merged by a NATURAL JOIN: only a qualified
+	// reference reads them, an unqualified one means the merged column.
+	hidden map[string]bool
 }
 
 type scope struct {
@@ -65,6 +68,10 @@ type execCache struct {
 	ctes          map[*CTE]*tableMeta
 	derived       map[*SelectStmt]*tableMeta
 	materializing map[any]bool
+	// working is the working table of each recursive CTE being evaluated.
+	working map[*CTE]*tableMeta
+	// extremes are the bounds of uncorrelated ANY / ALL subqueries.
+	extremes map[*Subquery]*quantExtremes
 	// usedTemp is set when a name resolves to a temporary object.
 	usedTemp bool
 }
@@ -79,6 +86,8 @@ func newExecCache() *execCache {
 		ctes:          map[*CTE]*tableMeta{},
 		derived:       map[*SelectStmt]*tableMeta{},
 		materializing: map[any]bool{},
+		working:       map[*CTE]*tableMeta{},
+		extremes:      map[*Subquery]*quantExtremes{},
 	}
 }
 
@@ -144,6 +153,9 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 			if v.Name == "MERGE_ACTION" {
 				err = e.checkMergeAction(v)
 			}
+			if v.Name == "GENERATE_SERIES" {
+				err = errorf(adbc.StatusNotImplemented, "generate_series is only supported in FROM (SELECT … FROM generate_series(…) AS g)")
+			}
 			if err == nil {
 				err = checkCall(v)
 			}
@@ -169,7 +181,7 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 				continue
 			}
 			col, ok := rel.meta.column(c.Name)
-			if !ok || (rel.prefix != "" && col.Name == rowIDField) {
+			if !ok || (rel.prefix != "" && col.Name == rowIDField) || (c.Qualifier == "" && rel.hidden[col.Name]) {
 				continue
 			}
 			found++
@@ -289,7 +301,10 @@ func memTable(name string, cols []resultColumn, rows [][]Value, rename []string)
 // materialize runs a query that has no access to enclosing scopes.
 func (e *executor) materialize(ctx context.Context, key any, name string, sel *SelectStmt, rename []string) (*tableMeta, error) {
 	if e.cache.materializing[key] {
-		return nil, errorf(adbc.StatusNotImplemented, "%q refers to itself; recursive queries are not supported", name)
+		if def, ok := key.(*CTE); ok && def.Recursive {
+			return nil, errorf(adbc.StatusNotImplemented, "mutual recursion between WITH items is not implemented")
+		}
+		return nil, errorf(adbc.StatusInvalidArgument, "%q refers to itself; recursive references need WITH RECURSIVE", name)
 	}
 	e.cache.materializing[key] = true
 	defer delete(e.cache.materializing, key)
@@ -364,10 +379,14 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 		}
 		if table.Schema == "" && table.Catalog == "" {
 			if def := e.lookupCTE(table.Name); def != nil {
+				if m, ok := e.cache.working[def]; ok {
+					// The recursive reference of a recursive CTE.
+					return m, alias, nil
+				}
 				if m, ok := e.cache.ctes[def]; ok {
 					return m, alias, nil
 				}
-				m, err := e.materialize(ctx, def, def.Name, def.Select, def.Columns)
+				m, err := e.materializeCTE(ctx, def)
 				if err != nil {
 					return nil, "", err
 				}
@@ -486,6 +505,8 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 			return rows[0][0], nil
 		}
 		return Value{}, fmt.Errorf("scalar subquery returned %d rows", len(rows))
+	case SubqueryAny, SubqueryAll:
+		return env.evalQuantified(sq, rows)
 	}
 	// IN
 	x, err := env.eval(sq.X)

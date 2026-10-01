@@ -374,7 +374,7 @@ func TestSQLDerivedTablesAndCTEs(t *testing.T) {
 	h.expectRows(`WITH c AS (SELECT id, name FROM it_customers)
 		SELECT c.name, (SELECT COUNT(*) FROM it_orders o WHERE o.customer_id = c.id) FROM c ORDER BY c.id`,
 		"Ada|2", "Bo|2", "Cy|1", "Di|0")
-	h.expectError(`WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r`, "not supported")
+	h.expectRows(`WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r`, "1")
 	h.expectError(`WITH r AS (SELECT * FROM r) SELECT * FROM r`, "recursive")
 	h.expectError(`WITH x(a) AS (SELECT id, qty FROM it_orders) SELECT * FROM x`, "column names")
 

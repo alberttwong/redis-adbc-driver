@@ -318,7 +318,7 @@ func semiKey(v Value, t ColType) (string, bool) {
 // semiJoinState can tell, and call no volatile function.
 func (e *executor) planSemiJoin(ctx context.Context, sq *Subquery) {
 	sel, plan := sq.Select, sq.plan
-	if !sq.correlated || sq.Kind == SubqueryScalar || sel.SetOp != nil || plan.meta == nil ||
+	if !sq.correlated || (sq.Kind != SubqueryExists && sq.Kind != SubqueryIn) || sel.SetOp != nil || plan.meta == nil ||
 		plan.aggregate || len(sel.GroupBy) > 0 || sel.Having != nil || sel.Offset != nil || sel.Where == nil ||
 		plan.windowed() || len(sel.Windows) > 0 {
 		return

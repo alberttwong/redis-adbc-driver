@@ -441,15 +441,18 @@ How SQL is executed:
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that (or on an unindexed column) the driver checks each row against a hash set of the values, built once per statement: always for `IN (SELECT …)`, and for a literal list of 16 or more constants when the column's type can't fail to compare with them (otherwise value by value, as `=` would) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
+| `x op ANY / ALL (SELECT …)` | `= ANY` is `IN` and `<> ALL` is `NOT IN`, with the same index unions, hash sets and semi-joins. Other operators: an uncorrelated subquery runs once, and `<`, `<=`, `>`, `>=` compare with its smallest or largest value (when all the values are of one type class); otherwise each row is compared with every value |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| `WITH RECURSIVE` | Working-table iteration in memory: the non-recursive term runs once, then the recursive term runs against the rows the last iteration added (its joins with tables still use their indexes, such as an index lookup join on the new rows' keys) until it adds none. `UNION` drops rows produced before. At most 10,000 iterations and 1,000,000 rows. With `SEARCH` / `CYCLE`, the recursive term runs once per row of the working table, to know each row's parent |
+| `LATERAL`, `GENERATE_SERIES` | Join items computed while the join runs. One that reads earlier FROM items runs for each row joined so far (a `LATERAL` subquery memoised on the values it reads, like a correlated subquery); otherwise it runs once and is joined like a derived table. A join with such an item keeps its written order. `GENERATE_SERIES` makes its rows in memory, at most 1,000,000 per call |
 | `SELECT DISTINCT` | Over plain expressions it is the same as `GROUP BY` them, so it runs in the index (`FT.AGGREGATE … GROUPBY`) when they're indexed columns. Otherwise (stars, aggregates, window functions, `DISTINCT ON`) the driver removes duplicate rows after the rest of the query, NULLs counting as equal. `LIMIT` / `OFFSET` apply afterwards and never run in the index. As in Postgres, `ORDER BY` must use the select list, and `DISTINCT ON` keys must match the leading `ORDER BY` expressions |
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows |
 | Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
-| Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
+| Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING` |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
@@ -590,17 +593,19 @@ field, even if later rows have it.
   - `information_schema.columns.column_default` and `GetObjects`'
     `xdbc_column_def` show the default as written. `CREATE TABLE … AS`
     copies values, not defaults
-- `[WITH name [(cols)] AS (SELECT …), …] SELECT [ALL | DISTINCT | DISTINCT ON (…)] … FROM item {, item |
-  [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item}
+- `[WITH [RECURSIVE] name [(cols)] AS (SELECT …), …] SELECT [ALL | DISTINCT | DISTINCT ON (…)] … FROM item {, item |
+  [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item |
+  NATURAL [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item}
   [WHERE …] [GROUP BY …] [HAVING …] [WINDOW w AS (…), …] [QUALIFY …]
   [ORDER BY …] [LIMIT n] [OFFSET m]`,
-  where an item is a table, a CTE, or `(SELECT …)`, each with an optional
-  alias (`t.col` qualifies a column, and `t.*` selects one item's columns,
-  also as `schema.table.*`),
+  where an item is a table, a CTE, `[LATERAL] (SELECT …)` or
+  `[LATERAL] GENERATE_SERIES(…)`, each with an optional alias and column
+  aliases (`AS a(x, y)`; `t.col` qualifies a column, and `t.*` selects one
+  item's columns, also as `schema.table.*`),
   with aggregates (below), `CASE` (simple and searched), arithmetic,
   `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
-  `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
-  `UPDATE`/`DELETE`/`MERGE`),
+  `[NOT] IN (SELECT …)`, `x op ANY | SOME | ALL (SELECT …)`, correlated or
+  not, in SELECT/WHERE/HAVING and in `UPDATE`/`DELETE`/`MERGE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
   `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
   returns NULL if either side is NULL), `from_hex`
@@ -629,6 +634,60 @@ field, even if later rows have it.
   as equal when removing duplicates. `ORDER BY` on the combined result uses
   output column names or positions. Set operations work anywhere a query
   does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
+- `WITH RECURSIVE name [(cols)] AS (non-recursive term UNION [ALL]
+  recursive term)`, evaluated as in Postgres: the recursive term reads the
+  rows the previous iteration added until it adds none, and `UNION` also
+  drops rows equal to any earlier row (NULLs count as equal). The columns
+  are named by the CTE's column list or the non-recursive term, and have the
+  non-recursive term's types, widened to hold the recursive term's values of
+  the same category (otherwise it's Postgres's "has type … in non-recursive
+  term but type … overall" error; cast the non-recursive term). Postgres's
+  rules apply, with its errors: the recursive term refers to the CTE once,
+  not in a subquery, on the NULL-supplying side of an outer join, under
+  `EXCEPT` or `INTERSECT ALL`, or at a level with aggregates; no `ORDER BY`
+  / `LIMIT` / `OFFSET` on the `UNION`; no mutual recursion between CTEs. The
+  CTE is computed in full before the query reads it (Postgres stops early,
+  for instance under a `LIMIT`), so the recursive term needs a stop
+  condition: more than 10,000 iterations that add rows, or more than
+  1,000,000 rows, is an error. A CTE of a `WITH RECURSIVE` list that doesn't
+  refer to itself is an ordinary CTE
+  - `SEARCH {BREADTH | DEPTH} FIRST BY col, … SET seq` adds a `BIGINT` column
+    that orders the rows breadth or depth first (Postgres has a record or an
+    array that sorts the same way); `CYCLE col, … SET mark [TO v DEFAULT d]
+    USING path` marks (and doesn't recurse into) a row whose columns repeat a
+    row on its path, and adds the path as text in Postgres's format
+    (`{(1),(2)}`). As in Postgres, the recursive term must then be a SELECT
+    that reads the CTE at its top level; here it also can't use `GROUP BY`,
+    `HAVING`, window functions, `LIMIT` or `OFFSET`
+- `LATERAL (SELECT …)` in FROM (`, LATERAL`, `CROSS JOIN LATERAL`,
+  `[LEFT] JOIN LATERAL … ON …`) reads the columns of the items before it; a
+  table function reads them with or without `LATERAL`, as in Postgres. It
+  runs once per distinct value of the columns it reads. `RIGHT` and `FULL`
+  joins can't have such a reference (Postgres's error), but are fine for a
+  `LATERAL` item that reads none
+- `NATURAL [INNER | LEFT | RIGHT | FULL] JOIN` joins on the columns both
+  sides have (a cross join if none). As in Postgres, `SELECT *` lists each
+  common column once, first, then the left side's other columns and the
+  right side's; the merged column is the left one for inner and left joins,
+  the right one for right joins and `COALESCE` of both for full joins, and
+  an unqualified reference means the merged column (`a.id` still reads
+  `a`'s). `USING (…)` keeps its existing behavior (both columns, so an
+  unqualified reference is ambiguous)
+- `GENERATE_SERIES(start, stop [, step])` in FROM, with Postgres's overloads:
+  integers (step 1 by default) and numerics, and timestamps with an interval
+  step (`DATE` arguments give `TIMESTAMP WITH TIME ZONE`, as in Postgres;
+  cast with `::date`). The column is named `generate_series`, or after the
+  alias (`AS g` → `g`, `AS g(n)` → `n`). A zero step is an error, a step in
+  the wrong direction or a NULL argument gives no rows, and month steps
+  clamp (`Jan 31, Feb 29, Mar 29, …`). Parameters work, and so do joins
+  (`generate_series(…) d LEFT JOIN t ON t.day = d::date` for a date spine)
+  and arguments read from earlier FROM items. At most 1,000,000 rows per
+  call
+- `x op ANY | SOME | ALL (SELECT …)` for `= <> < <= > >=`, with SQL's
+  three-valued logic: `ANY` is true if a comparison is, else NULL if one is
+  NULL; `ALL` is false if a comparison is, else NULL if one is NULL. Over no
+  rows `ANY` is false and `ALL` true. `= ANY` is `IN` and `<> ALL` is
+  `NOT IN`
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
 - Aggregates, with `GROUP BY` or over the whole input. They skip NULL
@@ -1003,13 +1062,16 @@ field, even if later rows have it.
   read in the `RETURNING` list of `UPDATE … FROM`, `DELETE … USING` or
   `MERGE` (as in any join), and `merge_action()` can't be called inside a
   subquery
-- Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
-  comparisons, data-modifying statements in `WITH` (`WITH d AS (DELETE …
-  RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres 18),
-  `GROUP BY DISTINCT` (which drops repeated grouping sets), `GROUPING()`
-  of an enclosing query's columns inside a subquery, `PERCENTILE_CONT` /
-  `PERCENTILE_DISC` of an array of fractions (there is no array type), and
-  the ordered-set aggregates and `MEDIAN` as window functions
+- Not supported: mutually recursive CTEs, `ANY` / `ALL` over arrays or
+  value lists, set-returning functions in the SELECT list
+  (`SELECT generate_series(1, 3)`), table functions other than
+  `GENERATE_SERIES`, data-modifying statements in `WITH` (`WITH d AS
+  (DELETE … RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres
+  18), `GROUP BY DISTINCT` (which drops repeated grouping sets),
+  `GROUPING()` of an enclosing query's columns inside a subquery,
+  `PERCENTILE_CONT` / `PERCENTILE_DISC` of an array of fractions (there is
+  no array type), and the ordered-set aggregates and `MEDIAN` as window
+  functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed).

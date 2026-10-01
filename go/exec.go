@@ -566,7 +566,9 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	var types map[string]ColType
 	var rels []relation
 	var jp *joinPlan
-	if len(sel.Joins) > 0 {
+	if len(sel.Joins) > 0 || sel.FromFunc != nil || sel.FromLateral || sel.FromColumns != nil {
+		// Table functions, LATERAL items and column aliases are handled by
+		// the join executor, even for a single FROM item.
 		joined, jrels, plan2, err := e.planJoin(ctx, sel)
 		if err != nil {
 			return nil, err
@@ -770,6 +772,10 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 // relation); otherwise the qualifier must name the one FROM item.
 func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) ([]columnMeta, error) {
 	if len(qual) == 0 {
+		if meta.join != nil && meta.join.star != nil {
+			// NATURAL JOIN: merged columns first (see planNatural).
+			return meta.join.star, nil
+		}
 		return meta.Columns, nil
 	}
 	name := qual[len(qual)-1]
