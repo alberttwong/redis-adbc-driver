@@ -513,6 +513,9 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	if plan.setop != nil {
 		return e.runSetOp(ctx, plan, params)
 	}
+	if plan.grouping != nil {
+		return e.runGroupingSets(ctx, plan, params)
+	}
 	if plan.meta == nil {
 		return e.selectWithoutTable(ctx, plan, params)
 	}

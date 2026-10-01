@@ -426,6 +426,7 @@ How SQL is executed:
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
+| `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that (or on an unindexed column) the driver checks each row against a hash set of the values, built once per statement: always for `IN (SELECT …)`, and for a literal list of 16 or more constants when the column's type can't fail to compare with them (otherwise value by value, as `=` would) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
@@ -582,6 +583,25 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
   `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
   returns NULL if either side is NULL), `from_hex`
+- `GROUP BY` items are expressions, output positions or aliases, and also
+  (as in Postgres) `ROLLUP (…)`, `CUBE (…)`, `GROUPING SETS (…)` and `()`:
+  - `ROLLUP (a, b)` is the grouping sets `(a, b), (a), ()`, and `CUBE (a, b)`
+    is every subset of its items (at most 12). `GROUPING SETS (…)` lists
+    sets, and may contain `ROLLUP`, `CUBE` and `GROUPING SETS`. A
+    parenthesized list is one item of several expressions (`ROLLUP (a, (b,
+    c))`), and `()` is the empty set: one group of all the rows, even when
+    there are none
+  - Several items combine as a cross product: `GROUP BY a, ROLLUP (b, c)` is
+    `(a, b, c), (a, b), (a)`. At most 4,096 sets; repeated sets are kept
+  - A set's rows have NULL for the grouping columns it doesn't group.
+    `GROUPING(a, …)` tells those from NULL values: an `INTEGER` with a bit
+    per argument, the last one lowest, set when the argument is not grouped.
+    It works in the SELECT list, HAVING, ORDER BY, QUALIFY and window
+    definitions (and is 0 in a plain `GROUP BY`)
+  - As in Postgres, outside aggregate calls such a query may use only
+    grouping expressions, matched as a whole (`GROUP BY ROLLUP (UPPER(s))`
+    can select `UPPER(s)` but not `s`); this also applies to a plain `GROUP
+    BY` that calls `GROUPING()`
 - `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` (`INTERSECT` binds
   tighter; parenthesized branches may have their own `ORDER BY`/`LIMIT`).
   Columns are matched by position and widened to a common type; NULLs count
@@ -795,7 +815,9 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   subquery
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
   comparisons, data-modifying statements in `WITH` (`WITH d AS (DELETE …
-  RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres 18)
+  RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres 18),
+  `GROUP BY DISTINCT` (which drops repeated grouping sets), and `GROUPING()`
+  of an enclosing query's columns inside a subquery
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)

@@ -290,6 +290,10 @@ type SelectStmt struct {
 	Having     Expr
 	Windows    []NamedWindow // WINDOW clause
 	Qualify    Expr          // filters rows after window functions
+	// GroupingSets is set when GROUP BY uses ROLLUP, CUBE, GROUPING SETS or
+	// (): each grouping set lists the positions in GroupBy of its
+	// expressions, and GroupBy holds the expressions of every set.
+	GroupingSets [][]int
 	// Distinct is SELECT DISTINCT; DistinctOn holds the expressions of
 	// Postgres's SELECT DISTINCT ON (…).
 	Distinct   bool
@@ -1250,15 +1254,8 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 		sel.Where = e
 	}
 	if p.acceptKeyword("GROUP", "BY") {
-		for {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			sel.GroupBy = append(sel.GroupBy, e)
-			if !p.acceptOp(",") {
-				break
-			}
+		if err := p.parseGroupBy(sel); err != nil {
+			return nil, err
 		}
 	}
 	if p.acceptKeyword("HAVING") {
