@@ -123,7 +123,11 @@ func valueAt(arr arrow.Array, i int) (Value, error) {
 		return intervalValue(0, int64(v.Days), int64(v.Milliseconds)*1_000_000)
 	case *array.Duration:
 		unit := a.DataType().(*arrow.DurationType).Unit
-		return intervalValue(0, 0, int64(a.Value(i))*(nsPerSecond/unitsPerSecond[unit]))
+		ns, err := convertUnit(int64(a.Value(i)), unit, arrow.Nanosecond)
+		if err != nil {
+			return Value{}, fmt.Errorf("interval out of range")
+		}
+		return intervalValue(0, 0, ns)
 	}
 	return Value{}, fmt.Errorf("unsupported Arrow type %s", arr.DataType())
 }
