@@ -517,6 +517,7 @@ How SQL is executed:
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` on the prefix's tag, re-checked by the driver (other patterns are checked by the driver alone). RediSearch expands a prefix into at most `search-max-prefix-expansions` tags (200 by default, per shard) and silently ignores the rest, so the driver first runs the prefix query under `FT.PROFILE … LIMIT 0 1` (one more round trip, about 0.3 ms) and, unless every shard's profile reports no warning, checks the prefix on every row the rest of the WHERE clause selects instead. The server's configuration is never changed |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that (or on an unindexed column) the driver checks each row against a hash set of the values, built once per statement: always for `IN (SELECT …)`, and for a literal list of 16 or more constants when the column's type can't fail to compare with them (otherwise value by value, as `=` would) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
+| `(a, b) [NOT] IN (SELECT …)` (and `= ANY`, `<> ALL`) | The subquery runs once, and each row is checked against a hash set of its rows, built once per statement. Telling NULL from false (for `NOT IN`) costs one lookup per pattern of NULLs among the subquery's rows. If the subquery has no row without a NULL, `IN` reads no row. For each indexed column among the items with ≤ 1,000 distinct values in the subquery's rows, an index union fetches only the rows with those values. Correlated, with only `inner = outer` conditions: the hash semi-join below, with a set of rows per key. A literal list, `(a, b) IN ((1, 'x'), (2, 'y'))`, is an `OR` of `AND`s; each indexed column that every row of the list sets gets an index union |
 | `x op ANY / ALL (SELECT …)` | `= ANY` is `IN` and `<> ALL` is `NOT IN`, with the same index unions, hash sets and semi-joins. Other operators: an uncorrelated subquery runs once, and `<`, `<=`, `>`, `>=` compare with its smallest or largest value (when all the values are of one type class); otherwise each row is compared with every value |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once, unless the query that reads them can't return rows (see above); the outer query filters, sorts and groups them in memory |
@@ -902,9 +903,12 @@ field, even if later rows have it.
   aliases (`AS a(x, y)`; `t.col` qualifies a column, and `t.*` selects one
   item's columns, also as `schema.table.*`),
   with aggregates (below), `CASE` (simple and searched), arithmetic,
-  `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
-  `[NOT] IN (SELECT …)`, `x op ANY | SOME | ALL (SELECT …)`, correlated or
-  not, in SELECT/WHERE/HAVING and in `UPDATE`/`DELETE`/`MERGE`),
+  `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`,
+  `IS [NOT] DISTINCT FROM` (NULLs count as equal), row constructors
+  (`(a, b) = (1, 'x')`, `(a, b) IN (SELECT …)`; see below), `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `[NOT] IN (SELECT …)`, `x op ANY | SOME | ALL (SELECT …)`, also with a row
+  on the left, correlated or not, in SELECT/WHERE/HAVING and in
+  `UPDATE`/`DELETE`/`MERGE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
   `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
   returns NULL if either side is NULL), `from_hex`
@@ -996,6 +1000,50 @@ field, even if later rows have it.
   NULL; `ALL` is false if a comparison is, else NULL if one is NULL. Over no
   rows `ANY` is false and `ALL` true. `= ANY` is `IN` and `<> ALL` is
   `NOT IN`
+- Row constructors, as in Postgres: `(a, b, …)` with two or more items, and
+  `ROW(…)` with any number (`ROW(a)`, `ROW()`). They can be compared
+  wherever a condition can be: `WHERE`, `ON`, `HAVING`, `CASE`, the SELECT
+  list, `CHECK`, and the conditions of `UPDATE`, `DELETE` and `MERGE`:
+  - **`=` and `<>`:** item by item. `=` is true if every pair is equal,
+    false if a pair is unequal, and otherwise NULL: `(1, NULL) = (1, 2)` is
+    NULL, `(1, NULL) = (2, 2)` false. `<>` is its negation
+  - **`<`, `<=`, `>`, `>=`:** left to right; the first pair that is unequal
+    or has a NULL decides, NULL for a NULL. `(1, 2) < (1, 3)` and
+    `(2, NULL) > (1, 5)` are true, `(1, NULL) < (1, 5)` is NULL. Keyset
+    pagination writes `WHERE (ts, id) > (?, ?)`
+  - **`IS [NOT] DISTINCT FROM`:** item by item, with NULLs equal
+  - **`IS [NOT] NULL`:** `(a, b) IS NULL` is true when every item is NULL,
+    `IS NOT NULL` when none is (so a row can be neither)
+  - **`[NOT] IN`:** over a list of rows, or a subquery with as many columns
+    as the row has items, with three-valued logic: if no row is equal but a
+    comparison is NULL (`(1, NULL)` with `(1, 2)`), `IN` is NULL rather than
+    false and `NOT IN` NULL rather than true. So dbt's
+    `delete+insert` strategy with a list `unique_key`, `delete from t where
+    (k1, k2) in (select distinct k1, k2 from …)`, keeps the rows of `t`
+    with a NULL key column, as on Postgres
+  - **`ANY` / `SOME` / `ALL`** over a subquery: `= ANY` and `= SOME` are
+    `IN`, `<> ALL` is `NOT IN`, and the other operators compare with each
+    row
+  - **`(a, b) op (SELECT x, y …)`** compares with the subquery's row: NULL
+    if it returns none, an error if it returns more than one
+  - **`BETWEEN` and simple `CASE`** work with rows too (`(a, b) BETWEEN (1,
+    2) AND (3, 4)`, `CASE (a, b) WHEN (1, 2) THEN …`). `EXISTS` is
+    unchanged
+  - **Errors**, raised when the statement is planned, are Postgres's:
+    `unequal number of entries in row expressions`, `subquery has too many
+    columns` / `subquery has too few columns` (also `x IN (SELECT a, b …)`
+    for a single value), `cannot compare rows of zero length`, and
+    `operator does not exist: record = integer` for a row compared with a
+    single value. A row anywhere else (as a select list item, a function
+    argument, in arithmetic) is `a row constructor can only be compared (…)
+    or tested with IS [NOT] NULL`, and a row nested in another is `nested
+    row constructors are not supported` (Postgres compares those as
+    composite values, with other NULL rules). Rows as values (`SELECT (a,
+    b)` returning a composite) and `ORDER BY` / `GROUP BY` on a row
+    expression aren't supported
+  - A comparison of two rows is rewritten into comparisons of their items,
+    so `(k1, k2) = (1, 'x')` runs in the index like `k1 = 1 AND k2 = 'x'`.
+    For `IN`, see "How SQL is executed"
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
 - Function calls (the functions are listed below) are checked when the
@@ -1632,6 +1680,17 @@ What drives the numbers:
   the index then rules out every row. Without the hash set, each row was
   compared with every value (23 s), and without the semi-join the subquery
   ran once per outer row (100,000 `FT.AGGREGATE` commands, 22–23 s).
+- **dbt's `delete+insert` with a composite key** (`where (k1, k2) in
+  (select distinct k1, k2 from …)`) deleted 10,000 keys from a table of
+  200,000 rows in about 1 s, standalone and on a 3-shard cluster, and
+  inserted them in 0.4 and 0.15 s (measured separately with
+  `TestSQLRowValueScale`: Redis 8.6.2 on a machine shared with other work,
+  median of 4 runs, which ranged from 0.8 to 2.2 s). Every row is read and
+  checked against a hash
+  set of the keys. The per-key forms, `DELETE … USING` and `EXISTS`, also
+  read every row and took 1.2–1.6 s. When a key column of the keys has at
+  most 1,000 distinct values, the index fetches only the rows with those
+  values, and the delete took 0.2–0.3 s.
 - **Queries that can't return rows read nothing**, only the tables'
   metadata. On a table of 152,686 rows (measured separately, best of 3,
   standalone), dbt's `select * from (<model>) as __dbt_sbq where false
@@ -1646,6 +1705,12 @@ Known ways to make the slow cases faster (not done yet):
 - `COUNT(*)` with a `LIKE` prefix, and `COUNT(*)` on a lazy view, still read
   the matched rows to re-check them, although the index has already matched
   them exactly; the index could answer them alone.
+- A row ordering comparison, as in keyset pagination (`WHERE (ts, id) > (?,
+  ?)`), is checked on every row; the index could take the bound its first
+  item implies (`ts >= ?`).
+- A literal list of rows, `(a, b) IN ((1, 'x'), …)`, is checked row by row
+  of the list (after the index unions); a long one could use a hash set, as
+  `IN (SELECT …)` does.
 
 To reproduce (from `go`, with a Redis running):
 
@@ -1682,6 +1747,10 @@ are skipped when `REDIS_URI` is unset (from `go`):
 ```bash
 REDIS_URI=redis://localhost:6379/0 go test -run TestSQL ./...
 ```
+
+`TestSQLRowValueScale` times dbt's `delete+insert` with a composite key
+(with `-v`) on 20,000 rows; `REDIS_ROW_VALUES_ROWS=200000` runs it on
+200,000 (a multiple of 200), as measured under Performance.
 
 To test against a local 3-shard Redis Cluster (from `go`):
 

@@ -47,15 +47,17 @@ type ColumnRef struct {
 // Subquery is a SELECT used as an expression: a scalar subquery
 // `(SELECT …)`, `EXISTS (SELECT …)`, `X [NOT] IN (SELECT …)`, or
 // `X op ANY | SOME | ALL (SELECT …)`. `= ANY` is parsed as IN and `<> ALL`
-// as NOT IN.
+// as NOT IN. X is a *RowExpr for a row operand: `(a, b) IN (SELECT x, y …)`.
 type Subquery struct {
 	Select *SelectStmt
 	Kind   SubqueryKind
 	X      Expr // IN operand
 	Not    bool // NOT IN
 	// Width is set for a scalar subquery assigned to a column list (UPDATE
-	// … SET (a, b) = (SELECT …)): the number of columns it must return.
-	Width int
+	// … SET (a, b) = (SELECT …)) or compared with a row ((a, b) = (SELECT
+	// …), rowCompare set): the number of columns it must return.
+	Width      int
+	rowCompare bool
 	// Op is the comparison operator of ANY / ALL (X is their operand).
 	Op string
 
@@ -96,6 +98,14 @@ type outerRef struct {
 type RowColumn struct {
 	Sub   *Subquery
 	Index int
+}
+
+// RowExpr is a row constructor, (a, b, …) or ROW(…). The parser rewrites
+// its comparisons into comparisons of its items (rowvalue.go), so it stays
+// in a statement only as the operand of a row IN / ANY / ALL subquery, or
+// where it is an error, which binding reports.
+type RowExpr struct {
+	Items []Expr
 }
 
 type Param struct{ Index int }
@@ -250,6 +260,7 @@ func (*Func) exprNode()      {}
 func (*Case) exprNode()      {}
 func (*Subquery) exprNode()  {}
 func (*RowColumn) exprNode() {}
+func (*RowExpr) exprNode()   {}
 
 type TableName struct {
 	Catalog string
@@ -2912,6 +2923,7 @@ func (p *parser) parseCase() (Expr, error) {
 	if len(c.Whens) == 0 {
 		return nil, syntaxErr("CASE requires at least one WHEN")
 	}
+	rowCaseToSearched(c)
 	if p.acceptKeyword("ELSE") {
 		e, err := p.parseExpr()
 		if err != nil {
@@ -2996,7 +3008,7 @@ func (p *parser) parseComparison() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				l = &Binary{Op: op, L: l, R: r}
+				l = compareExpr(op, l, r)
 				continue
 			}
 		}
@@ -3009,10 +3021,25 @@ func (p *parser) parseComparison() (Expr, error) {
 				}
 				continue
 			}
-			if !p.acceptKeyword("NULL") {
-				return nil, syntaxErr("expected NULL after IS")
+			if p.acceptKeyword("DISTINCT") {
+				if err := p.expectKeyword("FROM"); err != nil {
+					return nil, err
+				}
+				r, err := p.parseOtherOp()
+				if err != nil {
+					return nil, err
+				}
+				op := "IS DISTINCT FROM"
+				if not {
+					op = "IS NOT DISTINCT FROM"
+				}
+				l = compareExpr(op, l, r)
+				continue
 			}
-			l = &IsNull{X: l, Not: not}
+			if !p.acceptKeyword("NULL") {
+				return nil, syntaxErr("expected NULL, DISTINCT FROM or JSON after IS")
+			}
+			l = isNullExpr(l, not)
 			continue
 		}
 		if p.isKeyword("LIKE") || p.isKeyword("ILIKE") ||
@@ -3079,7 +3106,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			var e Expr = &Binary{Op: "AND", L: &Binary{Op: ">=", L: l, R: lo}, R: &Binary{Op: "<=", L: l, R: hi}}
+			var e Expr = &Binary{Op: "AND", L: compareExpr(">=", l, lo), R: compareExpr("<=", l, hi)}
 			if not {
 				e = &Unary{Op: "NOT", X: e}
 			}
@@ -3097,7 +3124,7 @@ func (p *parser) parseComparison() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				l = &Subquery{Select: sub, Kind: SubqueryIn, X: l, Not: not}
+				l = &Subquery{Select: sub, Kind: SubqueryIn, X: rowOperand(l), Not: not}
 				continue
 			}
 			var e Expr
@@ -3106,7 +3133,7 @@ func (p *parser) parseComparison() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				eq := &Binary{Op: "=", L: l, R: item}
+				eq := compareExpr("=", l, item)
 				if e == nil {
 					e = eq
 				} else {
@@ -3188,6 +3215,7 @@ func (p *parser) parseQuantified(x Expr, op string) (Expr, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	x = rowOperand(x)
 	switch {
 	case op == "=" && !all:
 		return &Subquery{Select: sub, Kind: SubqueryIn, X: x}, true, nil
@@ -3374,6 +3402,21 @@ func (p *parser) parsePrimary() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
+			if p.isOp(",") {
+				// (a, b, …) is a row constructor.
+				row := &RowExpr{Items: []Expr{e}}
+				for p.acceptOp(",") {
+					item, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					row.Items = append(row.Items, item)
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				return row, nil
+			}
 			if err := p.expectOp(")"); err != nil {
 				return nil, err
 			}
@@ -3527,6 +3570,23 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "INTERVAL":
 			p.pos++
 			return p.parseInterval()
+		case "ROW":
+			// ROW(a, …) is a row constructor, also with one item or none.
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				row := &RowExpr{}
+				for more := !p.isOp(")"); more; more = p.acceptOp(",") {
+					item, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					row.Items = append(row.Items, item)
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				return row, nil
+			}
 		}
 		p.pos++
 		if p.acceptOp("(") {

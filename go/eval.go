@@ -87,10 +87,18 @@ func walkExpr(e Expr, fn func(Expr)) {
 		}
 		walkExpr(x.Else, fn)
 	case *Subquery:
-		// The body is a separate scope; only the IN operand belongs here.
-		walkExpr(x.X, fn)
+		// The body is a separate scope; only the IN operand belongs here. A
+		// row operand's items are visited, not the row: a *RowExpr is
+		// visited only where it is an error.
+		for _, it := range subqueryOperands(x) {
+			walkExpr(it, fn)
+		}
 	case *RowColumn:
 		walkExpr(x.Sub, fn)
+	case *RowExpr:
+		for _, it := range x.Items {
+			walkExpr(it, fn)
+		}
 	case *WindowFunc:
 		// The call itself is not visited as a *Func: SUM(x) OVER (…) is not
 		// an aggregate, but aggregates in its arguments (SUM(COUNT(*))) are.
@@ -133,7 +141,13 @@ func walkOutsideAggregates(e Expr, fn func(Expr)) {
 		}
 		walkOutsideAggregates(x.Else, fn)
 	case *Subquery:
-		walkOutsideAggregates(x.X, fn)
+		for _, it := range subqueryOperands(x) {
+			walkOutsideAggregates(it, fn)
+		}
+	case *RowExpr:
+		for _, it := range x.Items {
+			walkOutsideAggregates(it, fn)
+		}
 	case *WindowFunc:
 		for _, c := range x.children() {
 			walkOutsideAggregates(c, fn)
@@ -267,6 +281,8 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 			return Value{}, err
 		}
 		return binaryOp(x.Op, l, r)
+	case *RowExpr:
+		return Value{}, errRowValue()
 	case *Func:
 		return env.evalFunc(x)
 	case *Case:
@@ -517,6 +533,9 @@ func isComparison(op string) bool {
 }
 
 func binaryOp(op string, l, r Value) (Value, error) {
+	if isDistinctOp(op) {
+		return distinctFrom(op, l, r)
+	}
 	if isComparison(op) {
 		if l.Null || r.Null {
 			return nullValue(typeBool), nil
@@ -747,7 +766,7 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 		return inferType(x.X, cols, params)
 	case *Binary:
 		switch {
-		case x.Op == "AND" || x.Op == "OR" || isComparison(x.Op):
+		case x.Op == "AND" || x.Op == "OR" || isComparison(x.Op) || isDistinctOp(x.Op):
 			return typeBool, nil
 		case x.Op == "||":
 			return typeString, nil
@@ -787,6 +806,8 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 		return typeBool, nil
 	case *WindowFunc:
 		return windowType(x, cols, params)
+	case *RowExpr:
+		return ColType{}, errRowValue()
 	case *Case:
 		results := make([]Expr, 0, len(x.Whens)+1)
 		for _, w := range x.Whens {

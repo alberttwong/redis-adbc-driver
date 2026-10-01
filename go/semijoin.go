@@ -278,7 +278,7 @@ func (e *executor) cachedInSet(sq *Subquery, rows [][]Value) *inSet {
 type semiJoin struct {
 	// plan is the subquery without its correlation conjuncts. Its first
 	// len(outer) items are their inner sides; for IN, the subquery's value
-	// follows.
+	// (or values, for a row IN) follows.
 	plan *selectPlan
 	// outer are the outer columns the keys are compared with, and types their
 	// types. Keys and outer values must be of the same class (and time unit),
@@ -338,8 +338,15 @@ func (e *executor) planSemiJoin(ctx context.Context, sq *Subquery) {
 		return
 	}
 	// RANDOM() would be drawn once per inner row for all outer rows.
-	if hasVolatile(sel.Where) || (sq.Kind == SubqueryIn && hasVolatile(sel.Items[0].Expr)) {
+	if hasVolatile(sel.Where) {
 		return
+	}
+	if sq.Kind == SubqueryIn {
+		for _, it := range sel.Items {
+			if hasVolatile(it.Expr) {
+				return
+			}
+		}
 	}
 	if sel.Limit != nil && (sq.Kind == SubqueryIn || *sel.Limit < 1) {
 		return
@@ -434,8 +441,10 @@ type semiResult struct {
 	failed bool
 	rows   int // rows with no NULL key
 	// groups maps the key tuple of each row to the rows with that key (for
-	// IN, as the set of values; for EXISTS, nil).
+	// IN, as the set of values; for EXISTS and a row IN, nil).
 	groups map[string]*inSet
+	// rowGroups are a row IN's groups, as sets of rows.
+	rowGroups map[string]*rowSet
 	// distinct holds the distinct values of each key, up to maxUnionTerms+1.
 	distinct [][]Value
 }
@@ -501,6 +510,10 @@ func (e *executor) buildSemiJoin(ctx context.Context, sq *Subquery, r *semiResul
 	}
 	n := len(sj.outer)
 	r.groups = map[string]*inSet{}
+	rowX, isRow := sq.X.(*RowExpr)
+	if isRow {
+		r.rowGroups = map[string]*rowSet{}
+	}
 	r.distinct = make([][]Value, n)
 	seen := make([]map[string]bool, n)
 	for i := range seen {
@@ -533,7 +546,15 @@ next:
 			}
 		}
 		g, ok := r.groups[string(buf)]
-		if sq.Kind == SubqueryIn {
+		if isRow {
+			rg := r.rowGroups[string(buf)]
+			if rg == nil {
+				rg = &rowSet{col: n, n: len(rowX.Items)}
+				r.rowGroups[string(buf)] = rg
+				r.groups[string(buf)] = nil
+			}
+			rg.rows = append(rg.rows, row)
+		} else if sq.Kind == SubqueryIn {
 			if !ok {
 				g = &inSet{col: n}
 				r.groups[string(buf)] = g
@@ -582,6 +603,16 @@ func (e *executor) evalSemiJoin(env *evalEnv, sq *Subquery) (Value, bool, error)
 	}
 	if sq.Kind == SubqueryExists {
 		return boolValue(found), true, nil
+	}
+	if rowX, ok := sq.X.(*RowExpr); ok {
+		x, err := env.evalItems(rowX.Items)
+		if err != nil {
+			return Value{}, true, err
+		}
+		if !found {
+			return boolValue(sq.Not), true, nil // no rows
+		}
+		return r.rowGroups[string(buf)].eval(x, sq.Not), true, nil
 	}
 	x, err := env.eval(sq.X)
 	if err != nil {

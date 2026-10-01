@@ -1140,7 +1140,10 @@ const maxUnionTerms = 1000
 
 // unionTerm turns a membership predicate on an indexed column into a
 // RediSearch union query: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`.
-// A semi-join (correlated EXISTS / IN) becomes one on its outer column.
+// A semi-join (correlated EXISTS / IN) becomes one on its outer column, and
+// a row IN one per indexed column (rowInTerm). An OR whose every operand
+// requires `c = constant` (an IN list, also of rows: `(a = 1 AND b = 2) OR
+// (a = 3 AND b = 4)`) becomes a union for each such indexed column c.
 func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *evalEnv) (string, bool, error) {
 	var col *ColumnRef
 	var values []Value
@@ -1152,6 +1155,9 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 		}
 		if x.Kind != SubqueryIn || x.Not || x.correlated {
 			return "", false, nil
+		}
+		if r, ok := x.X.(*RowExpr); ok {
+			return e.rowInTerm(ctx, x, r, meta, env)
 		}
 		ref, ok := x.X.(*ColumnRef)
 		if !ok || ref.Outer != 0 {
@@ -1186,18 +1192,7 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 		if len(leaves) > maxUnionTerms {
 			return "", false, nil
 		}
-		for _, leaf := range leaves {
-			ref, op, other, ok := comparison(leaf)
-			if !ok || op != "=" || ref.Outer != 0 || (col != nil && ref.Name != col.Name) {
-				return "", false, nil
-			}
-			v, err := env.eval(other)
-			if err != nil {
-				return "", false, invalidArg(err)
-			}
-			col = ref
-			values = append(values, v)
-		}
+		return e.orUnionTerms(leaves, meta, env)
 	default:
 		return "", false, nil
 	}
@@ -1207,6 +1202,56 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 	}
 	q, ok := unionQuery(cm, values)
 	return q, ok, nil
+}
+
+// orUnionTerms is unionTerm for the operands of an OR: the columns c with a
+// conjunct `c = constant` in every operand, in the first operand's order,
+// each give a union of their constants if c is indexed.
+func (e *executor) orUnionTerms(leaves []Expr, meta *tableMeta, env *evalEnv) (string, bool, error) {
+	var cols []string
+	eqs := make([]map[string]Expr, len(leaves))
+	for j, leaf := range leaves {
+		eqs[j] = map[string]Expr{}
+		for _, c := range conjuncts(leaf, nil) {
+			ref, op, other, ok := comparison(c)
+			if !ok || op != "=" || ref.Outer != 0 {
+				continue
+			}
+			if _, dup := eqs[j][ref.Name]; dup {
+				continue
+			}
+			eqs[j][ref.Name] = other
+			if j == 0 {
+				cols = append(cols, ref.Name)
+			}
+		}
+		cols = slices.DeleteFunc(cols, func(name string) bool { _, ok := eqs[j][name]; return !ok })
+		if len(cols) == 0 {
+			return "", false, nil
+		}
+	}
+	var terms []string
+	for _, name := range cols {
+		cm, ok := meta.column(name)
+		if !ok || !cm.Indexed || !simpleName(cm.field()) {
+			continue
+		}
+		values := make([]Value, len(leaves))
+		for j := range leaves {
+			v, err := env.eval(eqs[j][name])
+			if err != nil {
+				return "", false, invalidArg(err)
+			}
+			values[j] = v
+		}
+		if q, ok := unionQuery(cm, values); ok {
+			terms = append(terms, q)
+		}
+	}
+	if len(terms) == 0 {
+		return "", false, nil
+	}
+	return strings.Join(terms, " "), true, nil
 }
 
 // unionQuery builds an index query matching rows whose column equals any of

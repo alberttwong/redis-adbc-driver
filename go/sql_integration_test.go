@@ -299,7 +299,7 @@ func TestSQLSubqueries(t *testing.T) {
 	h.expectRows(`SELECT (SELECT MAX(qty) FROM it_orders) AS m`, "10")
 	h.expectRows(`SELECT (SELECT id FROM it_orders WHERE id = 99)`, "NULL")
 	h.expectError(`SELECT (SELECT id FROM it_orders)`, "returned 6 rows")
-	h.expectError(`SELECT id FROM it_orders WHERE id IN (SELECT id, qty FROM it_orders)`, "exactly one column")
+	h.expectError(`SELECT id FROM it_orders WHERE id IN (SELECT id, qty FROM it_orders)`, "subquery has too many columns")
 
 	// IN / NOT IN with subqueries, including SQL NULL semantics.
 	h.expectRows(`SELECT name FROM it_customers WHERE id IN (SELECT customer_id FROM it_orders WHERE status = 'shipped') ORDER BY name`,
