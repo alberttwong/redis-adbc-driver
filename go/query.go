@@ -437,6 +437,9 @@ func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value)
 // ---- SELECT ----
 
 func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	if plan.setop != nil {
+		return e.runSetOp(ctx, plan, params)
+	}
 	if plan.meta == nil {
 		return e.selectWithoutTable(ctx, plan, params)
 	}
@@ -461,7 +464,8 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	indexSort := wp.keys == nil && !meta.isMem
 	for _, o := range plan.order {
 		c, ok := o.expr.(*ColumnRef)
-		if !ok {
+		if !ok || o.nullsFirst {
+			// RediSearch always sorts missing values last.
 			indexSort = false
 			break
 		}

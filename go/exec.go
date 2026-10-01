@@ -351,8 +351,9 @@ type planItem struct {
 }
 
 type planOrder struct {
-	expr Expr
-	desc bool
+	expr       Expr
+	desc       bool
+	nullsFirst bool // NULLS FIRST (the default is NULLs last either way)
 }
 
 type selectPlan struct {
@@ -365,6 +366,8 @@ type selectPlan struct {
 	having Expr
 	// extraNeed are columns read only by correlated subqueries.
 	extraNeed map[string]bool
+	// setop is set for UNION / INTERSECT / EXCEPT.
+	setop *setOpPlan
 }
 
 func (p *selectPlan) columns() []resultColumn {
@@ -392,6 +395,9 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		}
 		e.ctes = append(e.ctes, defs)
 		defer func() { e.ctes = e.ctes[:len(e.ctes)-1] }()
+	}
+	if sel.SetOp != nil {
+		return e.planSetOp(ctx, sel, plan)
 	}
 	var types map[string]ColType
 	var rels []relation
@@ -528,7 +534,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			if n < 1 || n > len(plan.items) {
 				return nil, errorf(adbc.StatusInvalidArgument, "ORDER BY position %d is out of range", n)
 			}
-			plan.order = append(plan.order, planOrder{expr: plan.items[n-1].expr, desc: o.Desc})
+			plan.order = append(plan.order, planOrder{expr: plan.items[n-1].expr, desc: o.Desc, nullsFirst: o.Nulls == NullsFirst})
 			continue
 		}
 		// ORDER BY <output alias>
@@ -536,7 +542,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			matched := false
 			for i, it := range sel.Items {
 				if !it.Star && it.Alias != "" && strings.EqualFold(it.Alias, c.Name) {
-					plan.order = append(plan.order, planOrder{expr: plan.items[itemStart[i]].expr, desc: o.Desc})
+					plan.order = append(plan.order, planOrder{expr: plan.items[itemStart[i]].expr, desc: o.Desc, nullsFirst: o.Nulls == NullsFirst})
 					matched = true
 					break
 				}
@@ -548,7 +554,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if err := e.bind(ctx, expr); err != nil {
 			return nil, err
 		}
-		plan.order = append(plan.order, planOrder{expr: expr, desc: o.Desc})
+		plan.order = append(plan.order, planOrder{expr: expr, desc: o.Desc, nullsFirst: o.Nulls == NullsFirst})
 	}
 	return plan, nil
 }
@@ -575,9 +581,9 @@ func lessKeys(a, b []Value, order []planOrder) bool {
 		case x.Null && y.Null:
 			continue
 		case x.Null:
-			return false
+			return o.nullsFirst
 		case y.Null:
-			return true
+			return !o.nullsFirst
 		}
 		c, _ := compareValues(x, y)
 		if c == 0 {

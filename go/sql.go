@@ -146,9 +146,26 @@ type SelectItem struct {
 	Text  string
 }
 
+// NullsOrder is an explicit NULLS FIRST / NULLS LAST.
+type NullsOrder int
+
+const (
+	NullsDefault NullsOrder = iota // last, in either direction
+	NullsFirst
+	NullsLast
+)
+
 type OrderItem struct {
-	Expr Expr
-	Desc bool
+	Expr  Expr
+	Desc  bool
+	Nulls NullsOrder
+}
+
+// SetOperation is `Left op [ALL] Right` for op UNION, INTERSECT or EXCEPT.
+type SetOperation struct {
+	Op          string
+	All         bool
+	Left, Right *SelectStmt
 }
 
 // CTE is one `name [(columns)] AS (SELECT …)` of a WITH clause.
@@ -170,6 +187,9 @@ type JoinClause struct {
 }
 
 type SelectStmt struct {
+	// SetOp is set for a set operation (UNION / INTERSECT / EXCEPT); only
+	// With, OrderBy, Limit and Offset (of the combined result) are used then.
+	SetOp *SetOperation
 	With  []CTE
 	Items []SelectItem
 	// Joins are the FROM items after the first.
@@ -611,7 +631,7 @@ func (p *parser) parseTableName() (TableName, error) {
 
 func (p *parser) parseStatement() (Stmt, error) {
 	switch {
-	case p.isKeyword("SELECT"), p.isKeyword("WITH"):
+	case p.isKeyword("SELECT"), p.isKeyword("WITH"), p.isOp("("):
 		return p.parseSelect()
 	case p.isKeyword("INSERT"):
 		return p.parseInsert()
@@ -635,6 +655,7 @@ var reservedAfterExpr = map[string]bool{
 	"ASC": true, "DESC": true, "HAVING": true, "UNION": true, "NULLS": true,
 	"LIKE": true, "IN": true, "BETWEEN": true, "SET": true, "VALUES": true,
 	"WHEN": true, "THEN": true, "ELSE": true, "END": true, "ILIKE": true, "ESCAPE": true,
+	"INTERSECT": true, "EXCEPT": true, "MINUS": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"CROSS": true, "OUTER": true, "ON": true, "USING": true, "NATURAL": true,
 }
@@ -646,7 +667,8 @@ func (p *parser) isQueryStart() bool { return p.isKeyword("SELECT") || p.isKeywo
 func (p *parser) parseFromItem() (*TableName, *SelectStmt, string, error) {
 	var table *TableName
 	var sub *SelectStmt
-	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH")) {
+	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH") ||
+		(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(")) {
 		p.pos++
 		s, err := p.parseSubquery()
 		if err != nil {
@@ -730,10 +752,150 @@ func (p *parser) parseSelect() (Stmt, error) {
 			}
 		}
 	}
+	body, err := p.parseSetExpr()
+	if err != nil {
+		return nil, err
+	}
+	// ORDER BY / LIMIT / OFFSET after the last branch apply to the whole
+	// query (the combined result of a set operation).
+	sel := &SelectStmt{}
+	if p.acceptKeyword("ORDER", "BY") {
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			item := OrderItem{Expr: e}
+			if p.acceptKeyword("DESC") {
+				item.Desc = true
+			} else {
+				p.acceptKeyword("ASC")
+			}
+			if p.acceptKeyword("NULLS") {
+				switch {
+				case p.acceptKeyword("FIRST"):
+					item.Nulls = NullsFirst
+				case p.acceptKeyword("LAST"):
+					item.Nulls = NullsLast
+				default:
+					return nil, syntaxErr("expected FIRST or LAST after NULLS")
+				}
+			}
+			sel.OrderBy = append(sel.OrderBy, item)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	for {
+		if p.acceptKeyword("LIMIT") {
+			n, err := p.parseCount()
+			if err != nil {
+				return nil, err
+			}
+			sel.Limit = &n
+			if p.acceptOp(",") { // MySQL-style LIMIT offset, count
+				m, err := p.parseCount()
+				if err != nil {
+					return nil, err
+				}
+				sel.Offset = &n
+				sel.Limit = &m
+			}
+			continue
+		}
+		if p.acceptKeyword("OFFSET") {
+			n, err := p.parseCount()
+			if err != nil {
+				return nil, err
+			}
+			sel.Offset = &n
+			p.acceptKeyword("ROWS")
+			continue
+		}
+		break
+	}
+	hasOuter := len(sel.OrderBy) > 0 || sel.Limit != nil || sel.Offset != nil
+	innerHas := len(body.OrderBy) > 0 || body.Limit != nil || body.Offset != nil
+	if (hasOuter && innerHas) || (with != nil && body.With != nil) {
+		// e.g. (SELECT … LIMIT 3) ORDER BY x: wrap the parenthesized query.
+		body = &SelectStmt{Items: []SelectItem{{Star: true, Text: "*"}}, FromSelect: body, FromAlias: "__q"}
+	}
+	if with != nil {
+		body.With = with
+	}
+	if hasOuter {
+		body.OrderBy, body.Limit, body.Offset = sel.OrderBy, sel.Limit, sel.Offset
+	}
+	return body, nil
+}
+
+// parseSetExpr parses branches combined with UNION / EXCEPT (left to right),
+// where INTERSECT binds tighter, as in standard SQL.
+func (p *parser) parseSetExpr() (*SelectStmt, error) {
+	left, err := p.parseSetTerm()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		op := ""
+		switch {
+		case p.acceptKeyword("UNION"):
+			op = "UNION"
+		case p.acceptKeyword("EXCEPT"), p.acceptKeyword("MINUS"):
+			op = "EXCEPT"
+		}
+		if op == "" {
+			return left, nil
+		}
+		all := p.acceptKeyword("ALL")
+		if !all {
+			p.acceptKeyword("DISTINCT")
+		}
+		right, err := p.parseSetTerm()
+		if err != nil {
+			return nil, err
+		}
+		left = &SelectStmt{SetOp: &SetOperation{Op: op, All: all, Left: left, Right: right}}
+	}
+}
+
+func (p *parser) parseSetTerm() (*SelectStmt, error) {
+	left, err := p.parseSetPrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.acceptKeyword("INTERSECT") {
+		all := p.acceptKeyword("ALL")
+		if !all {
+			p.acceptKeyword("DISTINCT")
+		}
+		right, err := p.parseSetPrimary()
+		if err != nil {
+			return nil, err
+		}
+		left = &SelectStmt{SetOp: &SetOperation{Op: "INTERSECT", All: all, Left: left, Right: right}}
+	}
+	return left, nil
+}
+
+// parseSetPrimary parses a SELECT, or a parenthesized query (which may have
+// its own WITH, ORDER BY and LIMIT).
+func (p *parser) parseSetPrimary() (*SelectStmt, error) {
+	if p.isOp("(") && (p.isKeywordAt(1, "SELECT") || p.isKeywordAt(1, "WITH") ||
+		(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(")) {
+		p.pos++
+		return p.parseSubquery()
+	}
+	return p.parseSelectCore()
+}
+
+// parseSelectCore parses SELECT … FROM … WHERE … GROUP BY … HAVING ….
+func (p *parser) parseSelectCore() (*SelectStmt, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	sel := &SelectStmt{With: with}
+	sel := &SelectStmt{}
 	p.acceptKeyword("ALL")
 	for {
 		start := p.peek().pos
@@ -847,57 +1009,6 @@ func (p *parser) parseSelect() (Stmt, error) {
 			return nil, err
 		}
 		sel.Having = e
-	}
-	if p.acceptKeyword("ORDER", "BY") {
-		for {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			item := OrderItem{Expr: e}
-			if p.acceptKeyword("DESC") {
-				item.Desc = true
-			} else {
-				p.acceptKeyword("ASC")
-			}
-			if p.acceptKeyword("NULLS") {
-				if !p.acceptKeyword("FIRST") && !p.acceptKeyword("LAST") {
-					return nil, syntaxErr("expected FIRST or LAST after NULLS")
-				}
-			}
-			sel.OrderBy = append(sel.OrderBy, item)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-	}
-	for {
-		if p.acceptKeyword("LIMIT") {
-			n, err := p.parseCount()
-			if err != nil {
-				return nil, err
-			}
-			sel.Limit = &n
-			if p.acceptOp(",") { // MySQL-style LIMIT offset, count
-				m, err := p.parseCount()
-				if err != nil {
-					return nil, err
-				}
-				sel.Offset = &n
-				sel.Limit = &m
-			}
-			continue
-		}
-		if p.acceptKeyword("OFFSET") {
-			n, err := p.parseCount()
-			if err != nil {
-				return nil, err
-			}
-			sel.Offset = &n
-			p.acceptKeyword("ROWS")
-			continue
-		}
-		break
 	}
 	return sel, nil
 }
