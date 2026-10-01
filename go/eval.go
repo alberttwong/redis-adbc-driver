@@ -45,7 +45,10 @@ type evalEnv struct {
 	action string
 }
 
-var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true}
+var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true,
+	"STRING_AGG": true, "LISTAGG": true, "BOOL_OR": true, "BOOL_AND": true, "EVERY": true, "ANY_VALUE": true,
+	"STDDEV": true, "STDDEV_SAMP": true, "STDDEV_POP": true, "VARIANCE": true, "VAR_SAMP": true, "VAR_POP": true,
+	"PERCENTILE_CONT": true, "PERCENTILE_DISC": true, "MODE": true, "MEDIAN": true}
 
 func isAggregate(e Expr) bool {
 	found := false
@@ -77,6 +80,10 @@ func walkExpr(e Expr, fn func(Expr)) {
 		for _, a := range x.Args {
 			walkExpr(a, fn)
 		}
+		for _, o := range x.OrderBy {
+			walkExpr(o.Expr, fn)
+		}
+		walkExpr(x.Filter, fn)
 	case *Case:
 		walkExpr(x.Operand, fn)
 		for _, w := range x.Whens {
@@ -737,6 +744,9 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 	case *Func:
 		if err := checkArity(x); err != nil {
 			return ColType{}, err
+		}
+		if t, ok, err := aggregateType(x, cols, params, false); ok {
+			return t, err
 		}
 		args := make([]ColType, len(x.Args))
 		for i, a := range x.Args {

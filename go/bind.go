@@ -144,6 +144,9 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 			if v.Name == "MERGE_ACTION" {
 				err = e.checkMergeAction(v)
 			}
+			if err == nil {
+				err = checkCall(v)
+			}
 		}
 	})
 	return err

@@ -2803,8 +2803,8 @@ func TestSQLWindowErrors(t *testing.T) {
 	h.expectError(`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM it_win`,
 		"not supported for ORDER BY type INTEGER")
 	h.expectError(`SELECT SUM(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM it_win`, "GROUPS mode requires an ORDER BY")
-	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM it_win`,
-		"EXCLUDE")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE OTHERS) FROM it_win`,
+		"expected CURRENT ROW, GROUP, TIES or NO OTHERS after EXCLUDE")
 	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS 1) FROM it_win`, "expected PRECEDING or FOLLOWING")
 
 	// Named windows.

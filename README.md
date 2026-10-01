@@ -435,7 +435,8 @@ How SQL is executed:
 |-|-|
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
-| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX` | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened |
+| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1) |
+| Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
 | `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that (or on an unindexed column) the driver checks each row against a hash set of the values, built once per statement: always for `IN (SELECT …)`, and for a literal list of 16 or more constants when the column's type can't fail to compare with them (otherwise value by value, as `=` would) |
@@ -443,7 +444,7 @@ How SQL is executed:
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
 | `SELECT DISTINCT` | Over plain expressions it is the same as `GROUP BY` them, so it runs in the index (`FT.AGGREGATE … GROUPBY`) when they're indexed columns. Otherwise (stars, aggregates, window functions, `DISTINCT ON`) the driver removes duplicate rows after the rest of the query, NULLs counting as equal. `LIMIT` / `OFFSET` apply afterwards and never run in the index. As in Postgres, `ORDER BY` must use the select list, and `DISTINCT ON` keys must match the leading `ORDER BY` expressions |
-| Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row). A query with window functions never pushes its LIMIT into the index |
+| Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows |
@@ -473,11 +474,21 @@ strings `LOAD *` returns.
 Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 
 - `exact` (default): pushes COUNT, plus SUM/AVG/MIN/MAX over 16/32-bit
-  integer, boolean and date columns, which RediSearch returns exactly. Other
-  aggregates are computed by the driver.
+  integer, boolean and date columns, which RediSearch returns exactly, and
+  BOOL_OR/BOOL_AND/EVERY over boolean columns. Other aggregates are computed
+  by the driver.
 - `all`: also pushes floating-point, decimal and 64-bit aggregates.
   RediSearch reports these with 12 significant digits.
 - `none`: always aggregates in the driver.
+
+In every mode, `DISTINCT`, `FILTER (WHERE …)` and the other aggregates run
+in the driver. RediSearch has reducers that look like some of them, but none
+gives SQL's answer: `STDDEV` loses precision on values far from zero (150
+values near 10⁹ came back wrong in the 8th significant digit, on a cluster
+too) and is 0 instead of NULL for a single value, `QUANTILE` is an
+approximate streaming estimate, `TOLIST` de-duplicates in no particular
+order, and `FIRST_VALUE` returns NULL when the group's first row lacks the
+field, even if later rows have it.
 
 ## Supported SQL
 
@@ -586,7 +597,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   where an item is a table, a CTE, or `(SELECT …)`, each with an optional
   alias (`t.col` qualifies a column, and `t.*` selects one item's columns,
   also as `schema.table.*`),
-  with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
+  with aggregates (below), `CASE` (simple and searched), arithmetic,
   `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`/`MERGE`),
@@ -620,6 +631,38 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
+- Aggregates, with `GROUP BY` or over the whole input. They skip NULL
+  inputs, and all but `COUNT` give NULL when there are none:
+  - `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, `COUNT(DISTINCT x)`, and
+    `COUNT(DISTINCT a, b, …)` (as in MySQL), which counts the distinct
+    combinations of rows where none of them is NULL
+  - `STRING_AGG(x, sep [ORDER BY …])`, and `LISTAGG(x [, sep]) [WITHIN GROUP
+    (ORDER BY …)]` (Snowflake, Oracle; `sep` defaults to `''`);
+    `STRING_AGG(x, sep) WITHIN GROUP (ORDER BY …)` also works (SQL Server).
+    Values of any type are joined as text. As in PostgreSQL, each value but
+    the first is preceded by its own row's separator, and with `DISTINCT`
+    (whose `ORDER BY` may only use the arguments) the values come out sorted
+  - `BOOL_OR(b)`, `BOOL_AND(b)` / `EVERY(b)` on booleans, `ANY_VALUE(x)` (a
+    non-NULL value of the group)
+  - `VAR_SAMP` / `VARIANCE`, `VAR_POP`, `STDDEV_SAMP` / `STDDEV`,
+    `STDDEV_POP` return `DOUBLE PRECISION` (PostgreSQL returns `numeric` for
+    integer and numeric inputs). Integers and decimals are summed exactly, so
+    the result is the correctly rounded double whatever the values' size;
+    doubles use Welford's algorithm. The sample versions are NULL for one
+    value, the population ones 0
+  - Ordered-set aggregates: `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)`
+    interpolates (numbers as doubles, and intervals), `PERCENTILE_DISC(f)
+    WITHIN GROUP (ORDER BY x)` returns the first value at or past fraction
+    `f` (any sortable type), `MODE() WITHIN GROUP (ORDER BY x)` the most
+    frequent value (the first in sort order among ties), with PostgreSQL's
+    formulas and errors. `MEDIAN(x)` is `PERCENTILE_CONT(0.5) WITHIN GROUP
+    (ORDER BY x)`. The fraction is evaluated once per group (a constant, a
+    parameter or a grouped column) and must be between 0 and 1
+  - `agg(…) FILTER (WHERE cond)` on any aggregate, also as a window function:
+    only the rows where `cond` is true are aggregated, and their arguments
+    alone are evaluated
+  - Aggregate `ORDER BY` matters only for `STRING_AGG` / `LISTAGG`; its NULLs
+    sort last by default in either direction, as in `ORDER BY`
 - Window functions, `fn(…) OVER ([PARTITION BY …] [ORDER BY …] [frame])`, in
   the SELECT list, `ORDER BY` and `QUALIFY`. They see the rows after `WHERE`,
   `GROUP BY` and `HAVING`, and work anywhere a query does (joins, subqueries,
@@ -627,25 +670,34 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   - Ranking: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`,
     `NTILE(n)`
   - Offset: `LAG` / `LEAD(x [, offset [, default]])`, `FIRST_VALUE(x)`,
-    `LAST_VALUE(x)`, `NTH_VALUE(x, n)`
-  - Aggregates: `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, also over grouped
-    results (`SUM(COUNT(*)) OVER (ORDER BY day)`); `DISTINCT` is not
-    supported (nor is it in PostgreSQL)
+    `LAST_VALUE(x)`, `NTH_VALUE(x, n)`, each with `IGNORE NULLS` or `RESPECT
+    NULLS` (the default) after the call (SQL standard, Snowflake) or after
+    its last argument (BigQuery, DuckDB). `IGNORE NULLS` counts only the rows
+    whose value is not NULL, so `LAST_VALUE(x) IGNORE NULLS OVER (ORDER BY
+    ts)` fills forward; `LAG(x, 0)` is still the current row's value
+  - Aggregates: `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, `STRING_AGG`,
+    `LISTAGG`, `BOOL_OR`, `BOOL_AND`, `EVERY`, `ANY_VALUE`, and the variances
+    and standard deviations, with `FILTER (WHERE …)`, also over grouped
+    results (`SUM(COUNT(*)) OVER (ORDER BY day)`). As in PostgreSQL,
+    `DISTINCT`, an aggregate `ORDER BY` (order the window instead) and the
+    ordered-set aggregates and `MEDIAN` are not supported with `OVER`
   - Frames: `{ROWS | RANGE | GROUPS} {start | BETWEEN start AND end}` with
     `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`,
-    `UNBOUNDED FOLLOWING`. `RANGE` offsets are numbers for a numeric `ORDER BY`
-    key and intervals for dates, timestamps and intervals. Without a frame,
-    the SQL default applies: with `ORDER BY`, from the start of the partition
-    to the current row's last peer (rows with equal keys); without `ORDER BY`,
-    the whole partition. `EXCLUDE` (other than `EXCLUDE NO OTHERS`) is not
-    supported
+    `UNBOUNDED FOLLOWING`, and `EXCLUDE CURRENT ROW | GROUP | TIES | NO
+    OTHERS` (`GROUP` removes the current row and its peers, `TIES` only its
+    peers). `RANGE` offsets are numbers for a numeric `ORDER BY` key and
+    intervals for dates, times, timestamps and intervals; as in PostgreSQL,
+    a `TIME` key moves by the interval's time part and its frames don't wrap
+    around midnight. Without a frame, the SQL default applies: with `ORDER
+    BY`, from the start of the partition to the current row's last peer (rows
+    with equal keys); without `ORDER BY`, the whole partition
   - Named windows: `WINDOW w AS (…)`, `OVER w`, `OVER (w ORDER BY … [frame])`
   - `QUALIFY` filters on window results and may use output aliases
     (`QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC) = 1`)
   - Result types: `BIGINT` for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE` and
     `COUNT`; `DOUBLE PRECISION` for `PERCENT_RANK`, `CUME_DIST` and `AVG`; the
-    argument's type for `MIN`, `MAX` and the offset functions; `SUM` as with
-    `GROUP BY`
+    argument's type for `MIN`, `MAX` and the offset functions; the other
+    aggregates as with `GROUP BY`
   - As in `ORDER BY`, NULLs sort last by default in either direction
     (PostgreSQL puts them first for `DESC`). Rows that tie on the window's
     `ORDER BY` keep their input order
@@ -871,8 +923,10 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
   comparisons, data-modifying statements in `WITH` (`WITH d AS (DELETE …
   RETURNING …) INSERT …`), `RETURNING OLD.* / NEW.*` (Postgres 18),
-  `GROUP BY DISTINCT` (which drops repeated grouping sets), and `GROUPING()`
-  of an enclosing query's columns inside a subquery
+  `GROUP BY DISTINCT` (which drops repeated grouping sets), `GROUPING()`
+  of an enclosing query's columns inside a subquery, `PERCENTILE_CONT` /
+  `PERCENTILE_DISC` of an array of fractions (there is no array type), and
+  the ordered-set aggregates and `MEDIAN` as window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)

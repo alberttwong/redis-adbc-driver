@@ -559,6 +559,7 @@ func (r *groupingRewriter) node(e Expr) Expr {
 	case *WindowFunc:
 		f := *x.Func
 		f.Args = r.rewriteAll(x.Func.Args)
+		f.Filter = r.rewrite(x.Func.Filter)
 		over := *x.Over
 		over.PartitionBy = r.rewriteAll(x.Over.PartitionBy)
 		over.OrderBy = make([]OrderItem, len(x.Over.OrderBy))
@@ -718,7 +719,7 @@ func (gp *groupingPlan) indexable(e *executor, wp wherePlan, set []int) bool {
 			}
 			continue
 		}
-		if f.Distinct || len(f.Args) != 1 {
+		if _, ok := indexReducers[f.Name]; !ok || f.Filter != nil || f.Distinct || len(f.Args) != 1 {
 			return false
 		}
 		col, ok := indexed(f.Args[0])

@@ -130,7 +130,27 @@ type Func struct {
 	Args     []Expr
 	Star     bool
 	Distinct bool
+	// OrderBy orders an aggregate's input: STRING_AGG(x, sep ORDER BY …),
+	// or WITHIN GROUP (ORDER BY …) (WithinGroup is then set). For an
+	// ordered-set aggregate (PERCENTILE_CONT, …) the WITHIN GROUP expression
+	// is the aggregated value and Args are its direct arguments.
+	OrderBy     []OrderItem
+	WithinGroup bool
+	// Filter is an aggregate's FILTER (WHERE …) condition.
+	Filter Expr
+	// Nulls is IGNORE NULLS / RESPECT NULLS (LAG, LEAD and the value
+	// window functions).
+	Nulls NullTreatment
 }
+
+// NullTreatment is the IGNORE NULLS / RESPECT NULLS of a function call.
+type NullTreatment int
+
+const (
+	NullsUnspecified NullTreatment = iota
+	RespectNulls
+	IgnoreNulls
+)
 
 // WindowFunc is a window function call, fn(args) OVER (…). Over is fully
 // resolved by the parser: references to named windows are replaced by the
@@ -180,10 +200,21 @@ type FrameBound struct {
 	Offset Expr
 }
 
-// WindowFrame is `{ROWS | RANGE | GROUPS} BETWEEN start AND end`.
+// FrameExclusion is a frame's EXCLUDE clause.
+type FrameExclusion int
+
+const (
+	ExcludeNoOthers FrameExclusion = iota
+	ExcludeCurrentRow
+	ExcludeGroup // the current row and its peers
+	ExcludeTies  // the current row's peers, but not the row itself
+)
+
+// WindowFrame is `{ROWS | RANGE | GROUPS} BETWEEN start AND end [EXCLUDE …]`.
 type WindowFrame struct {
 	Unit       FrameUnit
 	Start, End FrameBound
+	Exclude    FrameExclusion
 }
 
 // NamedWindow is one `name AS (…)` of a WINDOW clause.
@@ -2857,8 +2888,14 @@ func (p *parser) parsePrimary() (Expr, error) {
 						break
 					}
 				}
+				if err := p.parseCallArgSuffix(f); err != nil {
+					return nil, err
+				}
 			}
 			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			if err := p.parseCallSuffix(f); err != nil {
 				return nil, err
 			}
 			if p.acceptKeyword("OVER") {
@@ -2890,6 +2927,82 @@ func (p *parser) finishCall(name string, first Expr) (Expr, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// parseCallArgSuffix parses what may follow a call's arguments inside its
+// parentheses: an aggregate's ORDER BY (STRING_AGG(x, ',' ORDER BY y)) and
+// IGNORE NULLS / RESPECT NULLS (FIRST_VALUE(x IGNORE NULLS), as in BigQuery
+// and DuckDB), in either order.
+func (p *parser) parseCallArgSuffix(f *Func) error {
+	if err := p.parseNullTreatment(f); err != nil {
+		return err
+	}
+	if p.acceptKeyword("ORDER", "BY") {
+		items, err := p.parseOrderItems()
+		if err != nil {
+			return err
+		}
+		f.OrderBy = items
+	}
+	return p.parseNullTreatment(f)
+}
+
+// parseCallSuffix parses what may follow a call's closing parenthesis, in
+// this order: WITHIN GROUP (ORDER BY …), FILTER (WHERE …) and IGNORE NULLS /
+// RESPECT NULLS (as in the SQL standard). The caller parses OVER.
+func (p *parser) parseCallSuffix(f *Func) error {
+	if p.acceptKeyword("WITHIN", "GROUP") {
+		if len(f.OrderBy) > 0 {
+			return &sqlError{msg: "cannot use multiple ORDER BY clauses with WITHIN GROUP"}
+		}
+		if err := p.expectOp("("); err != nil {
+			return err
+		}
+		if err := p.expectKeyword("ORDER", "BY"); err != nil {
+			return err
+		}
+		items, err := p.parseOrderItems()
+		if err != nil {
+			return err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return err
+		}
+		f.OrderBy, f.WithinGroup = items, true
+	}
+	// FILTER is also a valid column alias (`COUNT(*) filter`).
+	if p.isKeyword("FILTER") && p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+		p.pos += 2
+		if err := p.expectKeyword("WHERE"); err != nil {
+			return err
+		}
+		cond, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return err
+		}
+		f.Filter = cond
+	}
+	return p.parseNullTreatment(f)
+}
+
+func (p *parser) parseNullTreatment(f *Func) error {
+	nt := NullsUnspecified
+	switch {
+	case p.acceptKeyword("IGNORE", "NULLS"):
+		nt = IgnoreNulls
+	case p.acceptKeyword("RESPECT", "NULLS"):
+		nt = RespectNulls
+	default:
+		return nil
+	}
+	if f.Nulls != NullsUnspecified {
+		return syntaxErr("IGNORE NULLS / RESPECT NULLS specified more than once")
+	}
+	f.Nulls = nt
+	return nil
 }
 
 // parseSubstring parses what follows `SUBSTRING(`: either an argument list

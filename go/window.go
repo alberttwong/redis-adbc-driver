@@ -52,6 +52,7 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 // ---- parsing ----
@@ -114,7 +115,8 @@ func (p *parser) parseWindowSpec() (*WindowSpec, error) {
 }
 
 // parseFrame parses `{ROWS | RANGE | GROUPS} {start | BETWEEN start AND end}
-// [EXCLUDE NO OTHERS]`; a lone start bound ends at CURRENT ROW.
+// [EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}]`; a lone start bound
+// ends at CURRENT ROW.
 func (p *parser) parseFrame() (*WindowFrame, error) {
 	f := &WindowFrame{}
 	switch strings.ToUpper(p.next().text) {
@@ -142,8 +144,17 @@ func (p *parser) parseFrame() (*WindowFrame, error) {
 		}
 		f.End = FrameBound{Kind: BoundCurrentRow}
 	}
-	if p.acceptKeyword("EXCLUDE") && !p.acceptKeyword("NO", "OTHERS") {
-		return nil, &sqlError{msg: "EXCLUDE CURRENT ROW / GROUP / TIES is not supported in window frames"}
+	if p.acceptKeyword("EXCLUDE") {
+		switch {
+		case p.acceptKeyword("CURRENT", "ROW"):
+			f.Exclude = ExcludeCurrentRow
+		case p.acceptKeyword("GROUP"):
+			f.Exclude = ExcludeGroup
+		case p.acceptKeyword("TIES"):
+			f.Exclude = ExcludeTies
+		case !p.acceptKeyword("NO", "OTHERS"):
+			return nil, syntaxErr("expected CURRENT ROW, GROUP, TIES or NO OTHERS after EXCLUDE near %q", p.peek().text)
+		}
 	}
 	switch {
 	case f.Start.Kind == BoundUnboundedFollowing:
@@ -261,10 +272,17 @@ func resolveWindowSpec(defs []NamedWindow, s *WindowSpec) (*WindowSpec, error) {
 	return out, nil
 }
 
-// children returns the expressions of a window call: its arguments, its
-// PARTITION BY and ORDER BY expressions and its frame offsets.
+// children returns the expressions of a window call: its arguments (with
+// an aggregate's ORDER BY and FILTER), its PARTITION BY and ORDER BY
+// expressions and its frame offsets.
 func (w *WindowFunc) children() []Expr {
 	out := slices.Clone(w.Func.Args)
+	for _, o := range w.Func.OrderBy {
+		out = append(out, o.Expr)
+	}
+	if w.Func.Filter != nil {
+		out = append(out, w.Func.Filter)
+	}
 	out = append(out, w.Over.PartitionBy...)
 	for _, o := range w.Over.OrderBy {
 		out = append(out, o.Expr)
@@ -417,17 +435,43 @@ func checkWindow(w *WindowFunc, types map[string]ColType, params []ColType) erro
 		if !f.Star && n != 1 {
 			return argErr("one argument or *")
 		}
-	case "SUM", "AVG", "MIN", "MAX":
+	case "SUM", "AVG", "MIN", "MAX", "BOOL_OR", "BOOL_AND", "EVERY", "ANY_VALUE",
+		"STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
 		if f.Star || n != 1 {
 			return argErr("one argument")
 		}
+	case "STRING_AGG":
+		if n != 2 {
+			return argErr("two arguments")
+		}
+	case "LISTAGG":
+		if n < 1 || n > 2 {
+			return argErr("one or two arguments")
+		}
+	case "PERCENTILE_CONT", "PERCENTILE_DISC", "MODE", "MEDIAN":
+		return errorf(adbc.StatusNotImplemented, "OVER is not supported for ordered-set aggregate %s", f.Name)
 	default:
 		return errorf(adbc.StatusInvalidArgument, "%s is not a window function or an aggregate (supported with OVER: "+
 			"ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, "+
-			"COUNT, SUM, AVG, MIN, MAX)", f.Name)
+			"COUNT, SUM, AVG, MIN, MAX, STRING_AGG, LISTAGG, BOOL_OR, BOOL_AND, EVERY, ANY_VALUE, "+
+			"STDDEV, STDDEV_SAMP, STDDEV_POP, VARIANCE, VAR_SAMP, VAR_POP)", f.Name)
+	}
+	switch {
+	case f.Filter != nil && windowOnlyFuncs[f.Name]:
+		return errorf(adbc.StatusInvalidArgument, "FILTER is not implemented for non-aggregate window functions")
+	case len(f.OrderBy) > 0:
+		return errorf(adbc.StatusNotImplemented, "aggregate ORDER BY is not implemented for window functions")
+	case f.Nulls != NullsUnspecified && !nullTreatmentFuncs[f.Name]:
+		if aggregateFuncs[f.Name] {
+			return errorf(adbc.StatusInvalidArgument, "aggregate functions do not accept RESPECT/IGNORE NULLS")
+		}
+		return errorf(adbc.StatusInvalidArgument, "function %s does not allow RESPECT/IGNORE NULLS", f.Name)
 	}
 	return checkFrame(w, types, params)
 }
+
+// nullTreatmentFuncs take IGNORE NULLS / RESPECT NULLS.
+var nullTreatmentFuncs = map[string]bool{"LAG": true, "LEAD": true, "FIRST_VALUE": true, "LAST_VALUE": true, "NTH_VALUE": true}
 
 var frameUnitNames = map[FrameUnit]string{FrameRows: "ROWS", FrameRange: "RANGE", FrameGroups: "GROUPS"}
 
@@ -474,7 +518,7 @@ func checkFrame(w *WindowFunc, types map[string]ColType, params []ColType) error
 
 // rangeOffsetOK reports whether RANGE … PRECEDING/FOLLOWING can offset an
 // ORDER BY key of type key by an offset of type off: numbers by numbers, and
-// dates, timestamps and intervals by intervals.
+// dates, times, timestamps and intervals by intervals.
 func rangeOffsetOK(key, off ColType) bool {
 	if key.Kind == KindNull || off.Kind == KindNull {
 		return true
@@ -482,7 +526,7 @@ func rangeOffsetOK(key, off ColType) bool {
 	switch {
 	case key.Kind.isNumeric():
 		return off.Kind.isNumeric()
-	case key.Kind == KindDate || key.Kind == KindTimestamp || key.Kind == KindInterval:
+	case key.Kind == KindDate || key.Kind == KindTime || key.Kind == KindTimestamp || key.Kind == KindInterval:
 		return off.Kind == KindInterval
 	}
 	return false
@@ -516,6 +560,9 @@ func windowType(w *WindowFunc, cols map[string]ColType, params []ColType) (ColTy
 		return commonType(t, d), nil
 	case "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE":
 		return arg(0)
+	}
+	if t, ok, err := aggregateType(f, cols, params, true); ok {
+		return t, err
 	}
 	return inferType(f, cols, params)
 }
@@ -626,11 +673,19 @@ func exprEqual(a, b Expr) bool {
 		return ok && x.T == y.T && exprEqual(x.X, y.X) && exprEqual(x.OnError, y.OnError)
 	case *Func:
 		y, ok := b.(*Func)
-		if !ok || x.Name != y.Name || x.Star != y.Star || x.Distinct != y.Distinct || len(x.Args) != len(y.Args) {
+		if !ok || x.Name != y.Name || x.Star != y.Star || x.Distinct != y.Distinct || len(x.Args) != len(y.Args) ||
+			len(x.OrderBy) != len(y.OrderBy) || x.WithinGroup != y.WithinGroup || x.Nulls != y.Nulls ||
+			(x.Filter == nil) != (y.Filter == nil) || (x.Filter != nil && !exprEqual(x.Filter, y.Filter)) {
 			return false
 		}
 		for i := range x.Args {
 			if !exprEqual(x.Args[i], y.Args[i]) {
+				return false
+			}
+		}
+		for i, o := range x.OrderBy {
+			q := y.OrderBy[i]
+			if o.Desc != q.Desc || o.Nulls != q.Nulls || !exprEqual(o.Expr, q.Expr) {
 				return false
 			}
 		}
@@ -702,13 +757,19 @@ func computeWindowGroup(env *evalEnv, g *windowGroup, n int, setRow func(int)) e
 		ws.order[i] = planOrder{desc: o.Desc, nullsFirst: o.Nulls == NullsFirst}
 	}
 	// Evaluate the partition keys, the order keys and every call's
-	// arguments for each row.
+	// arguments for each row. A FILTER is evaluated first: the arguments of
+	// the rows it rejects are left NULL, which aggregates skip, and keep
+	// records them for COUNT(*).
 	pkeys := make([]Value, n*np)
 	args := make([][][]Value, len(g.calls))
+	keep := make([][]bool, len(g.calls))
 	for j, c := range g.calls {
 		args[j] = make([][]Value, len(c.fn.Func.Args))
 		for a := range args[j] {
 			args[j][a] = make([]Value, n)
+		}
+		if c.fn.Func.Filter != nil {
+			keep[j] = make([]bool, n)
 		}
 	}
 	for i := 0; i < n; i++ {
@@ -728,6 +789,19 @@ func computeWindowGroup(env *evalEnv, g *windowGroup, n int, setRow func(int)) e
 			ws.okeys[i*no+k] = v
 		}
 		for j, c := range g.calls {
+			if keep[j] != nil {
+				v, err := env.eval(c.fn.Func.Filter)
+				if err != nil {
+					return err
+				}
+				if b, ok := truthy(v); !ok || !b {
+					for a := range args[j] {
+						args[j][a][i] = nullValue(typeNull)
+					}
+					continue
+				}
+				keep[j][i] = true
+			}
 			for a, x := range c.fn.Func.Args {
 				v, err := env.eval(x)
 				if err != nil {
@@ -792,7 +866,7 @@ func computeWindowGroup(env *evalEnv, g *windowGroup, n int, setRow func(int)) e
 
 	for j, c := range g.calls {
 		vals := make([]Value, n)
-		if err := ws.compute(env, c, args[j], vals); err != nil {
+		if err := ws.compute(env, c, args[j], keep[j], vals); err != nil {
 			return err
 		}
 		env.win[c.fn] = vals
@@ -800,8 +874,9 @@ func computeWindowGroup(env *evalEnv, g *windowGroup, n int, setRow func(int)) e
 	return nil
 }
 
-// compute evaluates one window call; vals is indexed by row.
-func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, vals []Value) error {
+// compute evaluates one window call; vals is indexed by row. keep is the
+// result of the call's FILTER for each row (nil without one).
+func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, keep []bool, vals []Value) error {
 	f := c.fn.Func
 	nparts := len(ws.parts) - 1
 	switch f.Name {
@@ -842,50 +917,57 @@ func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, vals []
 	if err != nil {
 		return err
 	}
+	excl := ExcludeNoOthers
+	if fr := c.fn.Over.Frame; fr != nil {
+		excl = fr.Exclude
+	}
 	switch f.Name {
 	case "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE":
-		for i := range ws.perm {
-			row := ws.perm[i]
-			pos := -1
-			switch f.Name {
-			case "FIRST_VALUE":
-				pos = lo[i]
-			case "LAST_VALUE":
-				pos = hi[i] - 1
-			default:
-				nv := args[1][row]
-				if nv.Null {
-					break
-				}
-				nth, err := Coerce(nv, typeInt64)
-				if err != nil {
-					return err
-				}
-				if nth.I <= 0 {
-					return fmt.Errorf("argument of NTH_VALUE must be greater than zero")
-				}
-				if nth.I <= int64(hi[i]-lo[i]) {
-					pos = lo[i] + int(nth.I) - 1
+		return ws.valueAt(c, args, lo, hi, excl, vals)
+	}
+
+	var in []Value
+	star := f.Star
+	switch {
+	case star && keep != nil:
+		// COUNT(*) FILTER (…) counts the rows kept, as non-NULL inputs.
+		in, star = make([]Value, len(keep)), false
+		for r, k := range keep {
+			in[r] = nullValue(typeBool)
+			if k {
+				in[r] = boolValue(true)
+			}
+		}
+	case !star:
+		in = args[0]
+	}
+	agg, err := newFrameAgg(f, star, c.typ, in)
+	if err != nil {
+		return err
+	}
+	if len(args) > 1 {
+		agg.sep = args[1] // STRING_AGG / LISTAGG
+	}
+	if excl != ExcludeNoOthers {
+		// The frame has a hole that moves with the current row, so each
+		// row's frame is aggregated afresh, as PostgreSQL does.
+		for i, row := range ws.perm {
+			agg.reset()
+			for _, part := range ws.frameParts(i, lo[i], hi[i], excl) {
+				for p := part[0]; p < part[1]; p++ {
+					agg.add(ws.perm[p], p)
 				}
 			}
-			if pos >= lo[i] && pos < hi[i] {
-				vals[row] = args[0][ws.perm[pos]]
-			} else {
-				vals[row] = nullValue(c.typ)
+			v, err := agg.result()
+			if err != nil {
+				return err
 			}
+			vals[row] = v
 		}
 		return nil
 	}
 
 	// Aggregates over the frame: add rows entering it, remove rows leaving it.
-	var in []Value
-	if !f.Star {
-		in = args[0]
-	}
-	agg, err := newFrameAgg(f, c.typ, in)
-	if err != nil {
-		return err
-	}
 	for p := 0; p < nparts; p++ {
 		ps, pe := ws.parts[p], ws.parts[p+1]
 		agg.reset()
@@ -905,6 +987,99 @@ func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, vals []
 		}
 	}
 	return nil
+}
+
+// valueAt computes FIRST_VALUE, LAST_VALUE and NTH_VALUE: the value at the
+// first, last or n-th row of the frame (without the rows EXCLUDE removes),
+// counting only rows with a non-NULL value with IGNORE NULLS.
+func (ws *windowSet) valueAt(c windowCall, args [][]Value, lo, hi []int, excl FrameExclusion, vals []Value) error {
+	f := c.fn.Func
+	// count(s, e) is the number of rows that count in positions [s, e), and
+	// kth(s, e, k) the position of the k-th one.
+	count := func(s, e int) int { return max(e-s, 0) }
+	kth := func(s, e, k int) int { return s + k - 1 }
+	if f.Nulls == IgnoreNulls {
+		pre, pos := ws.nonNulls(args[0])
+		count = func(s, e int) int {
+			if e <= s {
+				return 0
+			}
+			return pre[e] - pre[s]
+		}
+		kth = func(s, e, k int) int { return pos[pre[s]+k-1] }
+	}
+	for i, row := range ws.perm {
+		parts := ws.frameParts(i, lo[i], hi[i], excl)
+		k := 1 // FIRST_VALUE
+		switch f.Name {
+		case "LAST_VALUE":
+			k = 0
+			for _, p := range parts {
+				k += count(p[0], p[1])
+			}
+		case "NTH_VALUE":
+			nv := args[1][row]
+			if nv.Null {
+				k = 0
+				break
+			}
+			nth, err := Coerce(nv, typeInt64)
+			if err != nil {
+				return err
+			}
+			if nth.I <= 0 {
+				return fmt.Errorf("argument of NTH_VALUE must be greater than zero")
+			}
+			k = int(min(nth.I, int64(len(ws.perm)+1)))
+		}
+		vals[row] = nullValue(c.typ)
+		for _, p := range parts {
+			if k <= 0 {
+				break
+			}
+			if n := count(p[0], p[1]); k > n {
+				k -= n
+				continue
+			}
+			vals[row] = args[0][ws.perm[kth(p[0], p[1], k)]]
+			break
+		}
+	}
+	return nil
+}
+
+// frameParts returns the frame [lo, hi) of position i without the rows its
+// EXCLUDE clause removes, as up to three ranges of positions in order (an
+// empty range has end <= start).
+func (ws *windowSet) frameParts(i, lo, hi int, excl FrameExclusion) [3][2]int {
+	if excl == ExcludeNoOthers {
+		return [3][2]int{{lo, hi}}
+	}
+	xs, xe := i, i+1 // EXCLUDE CURRENT ROW
+	if excl != ExcludeCurrentRow {
+		xs, xe = ws.groupStart[ws.grp[i]], ws.groupStart[ws.grp[i]+1]
+	}
+	parts := [3][2]int{{lo, min(hi, xs)}, {}, {max(lo, xe), hi}}
+	if excl == ExcludeTies && i >= lo && i < hi {
+		parts[1] = [2]int{i, i + 1}
+	}
+	return parts
+}
+
+// nonNulls indexes the positions where a row's value is not NULL, for
+// IGNORE NULLS: pre[p] is the number of them before position p, and pos
+// lists them in order.
+func (ws *windowSet) nonNulls(arg []Value) ([]int, []int) {
+	pre := make([]int, len(ws.perm)+1)
+	var pos []int
+	for p, row := range ws.perm {
+		pre[p+1] = pre[p]
+		if !arg[row].Null {
+			pre[p+1]++
+			pos = append(pos, p)
+		}
+	}
+	return pre, pos
 }
 
 // ntile splits each partition into n buckets as evenly as possible (the
@@ -944,8 +1119,13 @@ func (ws *windowSet) ntile(arg []Value, vals []Value) error {
 
 // lagLead reads the argument offset rows before (LAG) or after (LEAD) the
 // current row in its partition, or the default when there is no such row.
+// With IGNORE NULLS only the rows with a non-NULL argument count.
 func (ws *windowSet) lagLead(c windowCall, args [][]Value, vals []Value) error {
 	lead := c.fn.Func.Name == "LEAD"
+	var pre, pos []int
+	if c.fn.Func.Nulls == IgnoreNulls {
+		pre, pos = ws.nonNulls(args[0])
+	}
 	for p := 0; p+1 < len(ws.parts); p++ {
 		ps, pe := ws.parts[p], ws.parts[p+1]
 		for i := ps; i < pe; i++ {
@@ -968,8 +1148,23 @@ func (ws *windowSet) lagLead(c windowCall, args [][]Value, vals []Value) error {
 			if !lead {
 				off = -off
 			}
+			t := -1 // the position read
+			switch {
+			case pre == nil || off == 0:
+				if q := int64(i) + off; q >= int64(ps) && q < int64(pe) {
+					t = int(q)
+				}
+			case off < 0: // the -off-th non-NULL value before the current row
+				if k := pre[i] + int(off); k >= pre[ps] {
+					t = pos[k]
+				}
+			default:
+				if k := pre[i+1] + int(off) - 1; k < pre[pe] {
+					t = pos[k]
+				}
+			}
 			v := nullValue(c.typ)
-			if t := int64(i) + off; t >= int64(ps) && t < int64(pe) {
+			if t >= 0 {
 				v = args[0][ws.perm[t]]
 			} else if len(args) > 2 {
 				v = args[2][row]
@@ -1046,9 +1241,13 @@ func (ws *windowSet) frameOffset(env *evalEnv, fr *WindowFrame, b FrameBound, wh
 			return Value{}, fmt.Errorf("RANGE with offset PRECEDING/FOLLOWING is not supported for ORDER BY type %s and offset type %s",
 				key.SQLName(), v.T.SQLName())
 		}
-		if v.T.Kind == KindInterval {
+		switch {
+		case v.T.Kind == KindInterval && key.Kind == KindTime:
+			// A time moves by the interval's time part only (see timeOffset).
+			negative = v.I < 0
+		case v.T.Kind == KindInterval:
 			negative = intervalTotal(v).Sign() < 0
-		} else {
+		default:
 			c, _ := compareValues(v, intValue(typeInt64, 0))
 			negative = c < 0
 		}
@@ -1144,7 +1343,13 @@ func (ws *windowSet) rangeBound(off Value, i, ps, pe int, following, start bool)
 	if toward < 0 {
 		op = "-"
 	}
-	target, err := binaryOp(op, cur, off)
+	var target Value
+	var err error
+	if cur.T.Kind == KindTime {
+		target, err = timeOffset(cur, off, toward)
+	} else {
+		target, err = binaryOp(op, cur, off)
+	}
 	beyond := 0 // the target overflowed: it is beyond every key
 	if err != nil {
 		beyond = toward
@@ -1169,18 +1374,37 @@ func (ws *windowSet) rangeBound(off Value, i, ps, pe int, following, start bool)
 	})
 }
 
+// timeOffset moves a TIME key by dir times an interval for a RANGE bound.
+// As in PostgreSQL, only the interval's time part counts and the result does
+// not wrap around midnight (time ± interval does), so a frame never reaches
+// past the start or end of the day.
+func timeOffset(t, off Value, dir int) (Value, error) {
+	ns := timeOfDay(t)
+	d := off.I
+	if dir < 0 {
+		d = -d
+	}
+	s := ns + d
+	if (d > 0 && s < ns) || (d < 0 && s > ns) {
+		return Value{}, fmt.Errorf("time out of range")
+	}
+	return intValue(timeType(arrow.Nanosecond), s), nil
+}
+
 // ---- frame aggregates ----
 
-// frameAgg is a COUNT / SUM / AVG / MIN / MAX over a frame that rows enter at
-// the end and leave from the start (first in, first out).
+// frameAgg is an aggregate over a frame that rows enter at the end and leave
+// from the start (first in, first out).
 type frameAgg struct {
 	name string
 	star bool
 	typ  ColType
 	in   []Value // argument of each row
+	sep  []Value // STRING_AGG / LISTAGG: separator of each row
 	mode int     // SUM / AVG accumulator
 	// count of non-NULL arguments (rows, for COUNT(*)) in the frame.
 	count int64
+	trues int64 // BOOL_OR / BOOL_AND: true arguments
 	// 128-bit integer sum.
 	hi int64
 	lo uint64
@@ -1188,7 +1412,9 @@ type frameAgg struct {
 	dec   *big.Int
 	scale int32
 	fsum  floatQueue
-	// MIN / MAX: a monotonic deque of (position, value).
+	stat  *statAcc // variances and standard deviations
+	// MIN / MAX: a monotonic deque of (position, value). ANY_VALUE,
+	// STRING_AGG and LISTAGG: the frame's non-NULL arguments, in order.
 	deque []dequeEntry
 	head  int
 }
@@ -1200,12 +1426,24 @@ const (
 )
 
 type dequeEntry struct {
-	pos int
-	v   Value
+	pos, row int
+	v        Value
 }
 
-func newFrameAgg(f *Func, typ ColType, in []Value) (*frameAgg, error) {
-	a := &frameAgg{name: f.Name, star: f.Star, typ: typ, in: in}
+func newFrameAgg(f *Func, star bool, typ ColType, in []Value) (*frameAgg, error) {
+	a := &frameAgg{name: f.Name, star: star, typ: typ, in: in}
+	if statFuncs[f.Name] {
+		// Exact sums unless there is a double to sum.
+		exact := true
+		for _, v := range in {
+			if !v.Null && v.T.Kind.isFloat() {
+				exact = false
+				break
+			}
+		}
+		a.stat = newStatAcc(exact, true)
+		return a, nil
+	}
 	if f.Name != "SUM" && f.Name != "AVG" {
 		return a, nil
 	}
@@ -1258,11 +1496,14 @@ func newFrameAgg(f *Func, typ ColType, in []Value) (*frameAgg, error) {
 }
 
 func (a *frameAgg) reset() {
-	a.count, a.hi, a.lo, a.head = 0, 0, 0, 0
+	a.count, a.trues, a.hi, a.lo, a.head = 0, 0, 0, 0, 0
 	a.deque = a.deque[:0]
 	a.fsum.reset()
 	if a.mode == sumDecimal {
 		a.dec = new(big.Int)
+	}
+	if a.stat != nil {
+		a.stat.reset()
 	}
 }
 
@@ -1297,6 +1538,16 @@ func (a *frameAgg) add(row, pos int) {
 		default:
 			a.fsum.push(v.F)
 		}
+	case "BOOL_OR", "BOOL_AND", "EVERY":
+		if v.I != 0 {
+			a.trues++
+		}
+	case "ANY_VALUE", "STRING_AGG", "LISTAGG":
+		a.deque = append(a.deque, dequeEntry{pos: pos, row: row, v: v})
+	default:
+		if a.stat != nil {
+			a.stat.add(v)
+		}
 	}
 }
 
@@ -1312,7 +1563,7 @@ func (a *frameAgg) remove(row, pos int) {
 	}
 	a.count--
 	switch a.name {
-	case "MIN", "MAX":
+	case "MIN", "MAX", "ANY_VALUE", "STRING_AGG", "LISTAGG":
 		if a.head < len(a.deque) && a.deque[a.head].pos == pos {
 			a.head++
 			if a.head == len(a.deque) {
@@ -1329,6 +1580,14 @@ func (a *frameAgg) remove(row, pos int) {
 		default:
 			a.fsum.pop()
 		}
+	case "BOOL_OR", "BOOL_AND", "EVERY":
+		if v.I != 0 {
+			a.trues--
+		}
+	default:
+		if a.stat != nil {
+			a.stat.remove(v)
+		}
 	}
 }
 
@@ -1336,11 +1595,28 @@ func (a *frameAgg) result() (Value, error) {
 	switch a.name {
 	case "COUNT":
 		return intValue(typeInt64, a.count), nil
-	case "MIN", "MAX":
+	case "MIN", "MAX", "ANY_VALUE":
 		if a.head == len(a.deque) {
 			return nullValue(a.typ), nil
 		}
 		return a.deque[a.head].v, nil
+	case "STRING_AGG", "LISTAGG":
+		if a.head == len(a.deque) {
+			return nullValue(typeString), nil
+		}
+		var b strings.Builder
+		for k, e := range a.deque[a.head:] {
+			if k > 0 && a.sep != nil && !a.sep[e.row].Null {
+				b.WriteString(a.sep[e.row].Text())
+			}
+			b.WriteString(e.v.Text())
+		}
+		return stringValue(b.String()), nil
+	case "BOOL_OR", "BOOL_AND", "EVERY":
+		return boolResult(a.name != "BOOL_OR", a.count, a.trues), nil
+	}
+	if a.stat != nil {
+		return a.stat.result(a.name), nil
 	}
 	if a.count == 0 {
 		return nullValue(a.typ), nil
