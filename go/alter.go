@@ -20,7 +20,9 @@ package redis
 // so it takes the same time at any table size:
 //
 //   - RENAME TO: the table keeps its key prefix and index (fixed at creation
-//     and reserved in a registry), so no row is touched.
+//     and reserved in a registry), so no row is touched. With the option
+//     adbc.redis.rename_rekey, it also moves the rows and index to the new
+//     name's, in time proportional to the number of rows (see rekey.go).
 //   - RENAME COLUMN: the column keeps its HASH field and index attribute;
 //     only its SQL name changes.
 //   - ADD COLUMN: the column gets a HASH field no current or dropped column
@@ -81,6 +83,9 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 	if st.View {
 		return errorf(adbc.StatusInvalidArgument, "%q.%q is a table, not a view; use ALTER TABLE", displaySchema(schema), name)
 	}
+	if err := e.store.checkWritable(ctx, meta); err != nil {
+		return err
+	}
 	switch st.Action {
 	case AlterRenameTable:
 		return e.renameTable(ctx, meta, st.NewTable)
@@ -123,6 +128,9 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 	} else if exists {
 		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", displaySchema(meta.Schema), newName)
 	}
+	if e.rekey {
+		return e.rekeyTable(ctx, meta, newName)
+	}
 	s := e.store
 	oldKey, newKey := metaKey(meta.Schema, meta.Name), metaKey(meta.Schema, newName)
 	oldSeq, newSeq := seqKey(meta.Schema, meta.Name), seqKey(meta.Schema, newName)
@@ -132,6 +140,9 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
 			cur, err := s.getTableWith(ctx, tx, meta.Schema, meta.Name)
 			if err != nil {
+				return err
+			}
+			if err := movingErr(cur); err != nil {
 				return err
 			}
 			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {

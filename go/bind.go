@@ -74,6 +74,8 @@ type execCache struct {
 	extremes map[*Subquery]*quantExtremes
 	// usedTemp is set when a name resolves to a temporary object.
 	usedTemp bool
+	// loaded are the tables the statement read (see checkReads in rekey.go).
+	loaded []*tableMeta
 }
 
 func newExecCache() *execCache {

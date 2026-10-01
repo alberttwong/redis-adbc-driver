@@ -19,7 +19,8 @@ package redis
 // works against them (filters, joins, grouping).
 //
 //	schemata (catalog_name, schema_name)
-//	tables   (table_catalog, table_schema, table_name, table_type)
+//	tables   (table_catalog, table_schema, table_name, table_type,
+//	          key_prefix, index_name)
 //	columns  (table_catalog, table_schema, table_name, column_name,
 //	          ordinal_position, column_default, data_type, is_nullable,
 //	          numeric_precision, numeric_scale, datetime_precision,
@@ -28,13 +29,18 @@ package redis
 //
 // The connection's own temporary tables and views are included under schema
 // pg_temp (temporary tables with table_type LOCAL TEMPORARY, as in
-// Postgres); other connections' temporary objects are not.
+// Postgres); other connections' temporary objects are not. key_prefix and
+// index_name are a table's row key prefix and RediSearch index (NULL for
+// views).
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 const infoSchema = "information_schema"
@@ -51,6 +57,8 @@ var infoSchemaColumns = map[string][]resultColumn{
 		{Name: "table_schema", Type: typeString},
 		{Name: "table_name", Type: typeString},
 		{Name: "table_type", Type: typeString},
+		{Name: "key_prefix", Type: typeString},
+		{Name: "index_name", Type: typeString},
 	},
 	"columns": {
 		{Name: "table_catalog", Type: typeString},
@@ -166,11 +174,20 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 		}
 		switch key {
 		case "tables":
-			for _, t := range tables {
-				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(t), stringValue(tableType)})
+			metas, err := e.store.getTables(ctx, stored, tables)
+			if err != nil {
+				return nil, err
+			}
+			for i, t := range tables {
+				if metas[i] == nil {
+					continue // dropped meanwhile
+				}
+				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(t), stringValue(tableType),
+					stringValue(metas[i].prefix()), stringValue(metas[i].index())})
 			}
 			for _, v := range views {
-				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(v), stringValue("VIEW")})
+				rows = append(rows, []Value{stringValue(catalogName), stringValue(schema), stringValue(v), stringValue("VIEW"),
+					nullValue(typeString), nullValue(typeString)})
 			}
 		case "columns":
 			for _, t := range tables {
@@ -202,6 +219,30 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 		}
 	}
 	return memTable(key, cols, rows, nil)
+}
+
+// getTables reads the metadata of several tables in one round trip. As in
+// information_schema.columns, a table whose metadata can't be read (it was
+// dropped meanwhile) is nil.
+func (s *store) getTables(ctx context.Context, schema string, tables []string) ([]*tableMeta, error) {
+	pipe := s.client.Pipeline()
+	cmds := make([]*goredis.StringCmd, len(tables))
+	for i, t := range tables {
+		cmds[i] = pipe.Get(ctx, metaKey(schema, t))
+	}
+	if len(tables) > 0 {
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, goredis.Nil) {
+			return nil, wrapRedis(err, "failed to read table metadata")
+		}
+	}
+	metas := make([]*tableMeta, len(tables))
+	for i, cmd := range cmds {
+		var meta tableMeta
+		if raw, err := cmd.Result(); err == nil && json.Unmarshal([]byte(raw), &meta) == nil {
+			metas[i] = &meta
+		}
+	}
+	return metas, nil
 }
 
 func infoSchemaReadOnly() error {

@@ -32,6 +32,7 @@ type executor struct {
 	store    *store
 	schema   string // current schema
 	pushdown string // aggregate pushdown mode
+	rekey    bool   // RENAME TO also moves the rows (see rekey.go)
 
 	// Per-statement state (see bind.go).
 	cache      *execCache
@@ -134,11 +135,23 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 	if err != nil {
 		return nil, err
 	}
-	return e.store.getTable(ctx, schema, name)
+	meta, err := e.store.getTable(ctx, schema, name)
+	if err == nil && e.cache != nil {
+		e.cache.loaded = append(e.cache.loaded, meta)
+	}
+	return meta, err
 }
 
-func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (execResult, error) {
+func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (res execResult, err error) {
 	e.cache = newExecCache()
+	// Tables read while their rows were being moved are checked once the
+	// statement is done (see rekey.go).
+	cache := e.cache
+	defer func() {
+		if err == nil {
+			err = e.store.checkReads(ctx, cache.loaded)
+		}
+	}()
 	e.params, e.paramTypes = params, paramTypes
 	e.returning = nil
 	if e.now.IsZero() {
@@ -1163,7 +1176,7 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 			return 0, err
 		}
 	}
-	if err := e.writeUpdates(ctx, changes); err != nil {
+	if err := e.writeUpdates(ctx, meta, changes); err != nil {
 		return 0, err
 	}
 	return int64(len(keys)), nil
@@ -1200,7 +1213,7 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 			return 0, err
 		}
 	}
-	if err := e.deleteKeys(ctx, keys); err != nil {
+	if err := e.deleteKeys(ctx, meta, keys); err != nil {
 		return 0, err
 	}
 	return int64(len(keys)), nil
@@ -1275,9 +1288,16 @@ func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChan
 	return ch
 }
 
-// writeUpdates applies row changes with pipelined HSET / HDEL. The index
-// follows the HASHes by itself.
-func (e *executor) writeUpdates(ctx context.Context, changes []rowChange) error {
+// writeUpdates applies row changes to a table with pipelined HSET / HDEL.
+// The index follows the HASHes by itself. Like every write, it is refused
+// while a re-key moves the table's rows (see checkWritable in rekey.go).
+func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []rowChange) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	if err := e.store.checkWritable(ctx, meta); err != nil {
+		return err
+	}
 	for start := 0; start < len(changes); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(changes))
 		pipe := e.store.client.Pipeline()
@@ -1293,11 +1313,17 @@ func (e *executor) writeUpdates(ctx context.Context, changes []rowChange) error 
 			return wrapRedis(err, "failed to update rows")
 		}
 	}
-	return nil
+	return e.store.checkWritten(ctx, meta)
 }
 
 // deleteKeys deletes row HASHes with pipelined DELs.
-func (e *executor) deleteKeys(ctx context.Context, keys []string) error {
+func (e *executor) deleteKeys(ctx context.Context, meta *tableMeta, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := e.store.checkWritable(ctx, meta); err != nil {
+		return err
+	}
 	for start := 0; start < len(keys); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(keys))
 		// One DEL per key: rows live in different hash slots.
@@ -1309,5 +1335,5 @@ func (e *executor) deleteKeys(ctx context.Context, keys []string) error {
 			return wrapRedis(err, "failed to delete rows")
 		}
 	}
-	return nil
+	return e.store.checkWritten(ctx, meta)
 }
