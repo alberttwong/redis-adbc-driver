@@ -70,12 +70,8 @@ requirement is the Query Engine.
   Driver metadata shares one hash slot (`adbc:{meta}:…`), so the driver's
   multi-key transactions never cross slots. A cluster only has database 0;
   on standalone servers only database 0 has been tested.
-- **ACL permissions** (if ACLs are enabled):
-  - commands: `FT.*`, `HSET/HMGET/HDEL/DEL`, `GET/SET/SETNX/EXISTS/INCRBY`,
-    `SADD/SMEMBERS/SISMEMBER/SREM`, `MULTI/EXEC/WATCH`, `INFO`, `PING`, `HELLO`,
-    plus `CLUSTER` on an OSS Cluster API endpoint (to discover the shards)
-  - keys: `adbc:*`, plus the row prefix of each schema you use (`public:*`
-    by default, and `pg_temp_*` for temporary tables)
+- **ACL permissions,** if the database has ACL users: the commands and keys
+  under **ACL users** below.
 
 **What the driver does for you**
 
@@ -90,7 +86,139 @@ requirement is the Query Engine.
   rows and filters them itself, which is slower on large tables but correct.
 - Every query passes `TIMEOUT 0`, so the server's default search timeout
   (which can return partial results) doesn't apply. You don't need to change
-  any `search-*` settings or enable keyspace notifications.
+  any `search-*` settings or enable keyspace notifications. The client's own
+  timeouts still apply; see **Timeouts** below.
+
+**Timeouts**
+
+The driver's client waits up to 5 minutes for each reply from Redis, and
+to send each command, on standalone servers and clusters alike. Some
+commands take longer as the data grows: an `FT.AGGREGATE` page that sorts or
+groups a big table, `FT.DROPINDEX … DD` of a big table, a pipeline of 1,000
+rows. And a busy or briefly blocked server (a fork for a snapshot, a
+failover, a slow cluster shard) delays every reply. When a reply takes
+longer than the timeout, the statement fails with an error that names the
+setting:
+
+```text
+[redis] FT.AGGREGATE failed: read tcp 127.0.0.1:57705->127.0.0.1:7103: i/o timeout (Redis did not reply within the read timeout, 5m0s: raise adbc.redis.read_timeout, or set it to 0 for no timeout)
+```
+
+| Setting | Default | What it limits |
+|-|-|-|
+| `adbc.redis.read_timeout` (database or connection option), or the URI's `read_timeout` | `5m` | waiting for each reply |
+| `adbc.redis.write_timeout` (database or connection option), or the URI's `write_timeout` | the read timeout | sending each command |
+| the URI's `dial_timeout` | `5s` | connecting |
+
+- **Values** are durations such as `30s`, `10m` or `1h`, or a number of
+  seconds. `0` means no timeout. The URI's parameters are parsed by go-redis
+  (`redis://host:6379/0?read_timeout=30m`), where `0` and `-1` also mean no
+  timeout.
+- **Precedence:** the options override the URI's parameters. A connection's
+  option overrides the database's, for the statements that the connection
+  runs after it is set (the connection gets a new client). Connecting uses
+  the database's.
+- **Retries:** go-redis sends most commands again after a reply timed out
+  or the connection broke (on a standalone server up to 3 times), so a
+  statement can wait a few times the read timeout before it fails. The
+  driver turns that off for the commands where a second run isn't safe:
+  search commands (a repeated `FT.CURSOR READ` would return the next page,
+  and the rows of the lost one would be missing), and `SET … NX` and `SADD`
+  where the driver acts on the reply. Transactions (`MULTI` … `EXEC`) aren't
+  sent again once they were sent.
+- **Other URI parameters** that go-redis parses (`pool_size`, `max_retries`,
+  …) apply to the single-endpoint client only. The cluster client takes the
+  credentials, TLS and the three timeouts from the URI.
+- **Earlier versions** (v0.0.7 and before) used go-redis's defaults: 5
+  seconds, in effect 10 seconds on a standalone server.
+
+**ACL users**
+
+If the database has ACL users, the driver's user needs these commands. The
+lists were checked with users that have exactly these rules, running the Go
+integration tests and the ADBC validation suite on Redis 8.6.2, standalone
+and a 3-shard cluster:
+
+```text
+# Every connection: queries, DDL, DML, views, bulk ingest, temporary tables
++ping +info +ft._list +ft.create +ft.alter +ft.info +ft.dropindex +ft.aggregate +ft.cursor +ft.search +ft.profile +get +set +del +exists +incrby +hset +hget +hmget +hgetall +hdel +hincrby +hexists +sadd +srem +smembers +sismember +multi +exec +watch +unwatch
+# A cluster (OSS Cluster API) also: the client reads the slot map and the commands' key positions
++cluster|slots +command
+# adbc.redis.rename_rekey also
++incr +dump +restore
+```
+
+- **Keys:** `~adbc:*` (the driver's metadata), `~<schema>:*` for each schema
+  the user works in (`~public:*` by default), and `~pg_temp_*` for temporary
+  tables. Temporary tables and bulk ingest need no other commands.
+- **What they're for:** `PING` and `INFO` to connect (`INFO` also tells a
+  cluster apart, and gives the server version); the `FT.*` commands for the
+  tables' indexes and queries (`FT.PROFILE` checks that a `LIKE 'abc%'`
+  filter's prefix expansion was complete: without it such filters are
+  still right, but are evaluated by the driver; `FT.INFO` lists an index's
+  attributes for `ALTER TABLE … ADD COLUMN`); the string, hash and set
+  commands for metadata and rows (`HGETALL` reads pending re-keying
+  renames on every connect, and `HEXISTS` checks that a new table's key
+  prefix was never released); and `MULTI` / `EXEC` / `WATCH` / `UNWATCH`
+  for metadata transactions.
+- **Not needed:** `HELLO` and `AUTH` are always allowed. Add `+select` if the
+  URI names a database other than 0 (not tested).
+- **On a cluster,** ACL users are per node: create the user on every node.
+- **For example,** for dbt on a cluster, with `rename_rekey`:
+
+  ```text
+  ACL SETUSER dbt on >password resetchannels ~adbc:* ~public:* ~pg_temp_* +ping +info +ft._list +ft.create +ft.alter +ft.info +ft.dropindex +ft.aggregate +ft.cursor +ft.search +ft.profile +get +set +del +exists +incrby +hset +hget +hmget +hgetall +hdel +hincrby +hexists +sadd +srem +smembers +sismember +multi +exec +watch +unwatch +cluster|slots +command +incr +dump +restore
+  ```
+
+A **read-only user** needs these commands, and read access to the keys:
+
+```text
++ping +info +ft._list +ft.aggregate +ft.cursor +ft.search +ft.profile +get +exists +hget +hmget +hgetall +smembers +sismember
+```
+
+```text
+ACL SETUSER reader on >password resetchannels %R~adbc:* %R~public:* +ping +info +ft._list +ft.aggregate +ft.cursor +ft.search +ft.profile +get +exists +hget +hmget +hgetall +smembers +sismember
+```
+
+(On a cluster, also `+cluster|slots +command`.)
+
+- **What it can do:** queries, views, `information_schema`, and the ADBC
+  metadata calls (`GetObjects`, `GetTableSchema`): what dbt's tests and
+  `dbt docs generate` run (this was tested with the driver, not with dbt).
+- **What it can't:** every change is refused before anything changes, with
+  Redis's reason, for example `failed to allocate row ids: NOPERM User reader
+  has no permissions to run the 'multi' command` for an `INSERT`. That
+  includes temporary tables (allocating a temporary schema needs `INCRBY`),
+  so dbt unit tests and snapshots need a user that can write.
+- **Connecting needs no writes,** with two exceptions. The first connection
+  to a new database records the table registry, so a read-only user can't
+  be the first to connect (`failed to build the table registry: NOPERM …`).
+  And a connection that finds a re-keying rename or a temporary schema that
+  another connection abandoned cleans it up: a read-only user can't, and
+  leaves that to the next connection that can write. (Redis's `ACL LOG`
+  then shows the refused commands.)
+
+**Key patterns don't cover every search command.** RediSearch commands that
+change indexes declare no keys, so key patterns don't apply to them:
+
+- **`FT.DROPINDEX … DD`** deletes every row of a table, even for a user that
+  may only read the table's keys. `FT.CREATE`, `FT.ALTER` and the
+  `FT.ALIAS*` commands can change what the driver's indexes cover. So a user
+  that mustn't change data must not get `FT.CREATE`, `FT.ALTER`,
+  `FT.DROPINDEX` or `FT.ALIAS*` (the read-only rules above leave them out).
+- **Queries** do check keys in Redis 8.6: `FT.SEARCH` and `FT.AGGREGATE` on
+  an index whose key prefix the user can't read fail with `NOPERM User does
+  not have the required permissions to query the index`, so per-schema key
+  patterns keep a user out of other schemas' tables. `FT._LIST` still lists
+  every index, so such a user sees the other schemas' table names. Check
+  this on other Redis versions.
+
+**Errors:** a command the user may not run fails with Redis's `NOPERM`
+error. One that Redis refuses inside a transaction is reported with the
+command and its key, rather than as `EXECABORT Transaction discarded because
+of previous errors`: `failed to create view: NOPERM No permissions to access
+a key ('set' on adbc:{meta}:view:public:v, in a MULTI transaction that Redis
+discarded)`.
 
 **Limitation: only tables created through the driver are visible**
 
@@ -476,7 +604,8 @@ Stop Redis with `docker compose down`.
   `adbc:{meta}:rekey` records renames that are moving a table's rows
   (`adbc.redis.rename_rekey`), keyed by the old prefix, and
   `adbc:{meta}:rekey:alive:<id>` (30-second TTL, renewed by the renaming
-  connection) shows that the connection doing one is alive.
+  connection) shows that the connection doing one is alive. A record taken
+  over from a connection that went away is marked `recovering`.
   `adbc:{meta}:released` counts how often each key prefix was released (by
   `DROP TABLE` or a re-keying rename), one field per prefix that was ever
   released; a statement checks it and `adbc:{meta}:prefixes` to tell when
@@ -774,11 +903,25 @@ field, even if later rows have it.
       prefixes" in the architecture section).
     - If the renaming process exits, the table is unchanged under its old
       name and refuses changes until the move's 30-second lease has
-      expired. Then the next connection to open, the next statement refused,
-      or the next re-keying rename rolls the move back (its copies, its
-      index and the names it reserved are removed). If it had already
-      switched the metadata, the rename stands, and the next connection to
-      open or re-keying rename removes the old rows. A renaming connection
+      expired. Until then the refusal says to try again when the rename
+      has finished, and that a rename whose connection has gone away is
+      rolled back once its lease has expired. Then the move is rolled back
+      (its copies, its index and the names it reserved are removed), before
+      anything else uses the table:
+      - **A connection that opens** rolls it back before it is open, even
+        one that is closed straight away, as dbt's metadata connections
+        are. Connections that open while another one rolls it back wait
+        for that (up to 30 seconds).
+      - **A connection that was already open** rolls it back at its next
+        statement that would change the table, or its next re-keying
+        rename, and that statement then goes on.
+      - **If the rollback fails** (for example, the user lacks
+        `FT.DROPINDEX`), the connection gives it up at once, and the
+        statement fails with the reason and says that the next connection
+        tries again.
+
+      If it had already switched the metadata, the rename stands, and the
+      same connections remove the old rows instead. A renaming connection
       that can't renew its lease for 15 seconds stops before its next step
       and fails; another connection then rolls the move back.
   - `RENAME COLUMN` keeps the column's HASH field; only its SQL name changes.
@@ -1754,6 +1897,8 @@ clients can see a partly applied statement.
 | `adbc.redis.default_schema` | database | Schema for unqualified names (default `public`). `SET search_path` and the ADBC current schema change it for one connection; `RESET search_path` goes back to it |
 | `adbc.redis.aggregate_pushdown` | database, statement | `exact` / `all` / `none` |
 | `adbc.redis.rename_rekey` | database, connection | `false` (default): `RENAME TO` only changes metadata. `true`: it also moves the rows and index to the new name's keys, in time proportional to the number of rows, and the table refuses changes meanwhile (see `ALTER TABLE`). The connection option overrides the database's |
+| `adbc.redis.read_timeout` | database, connection | How long the client waits for each reply: `30s`, `10m`, … or a number of seconds; `0` for no timeout. Default `5m`, or the URI's `read_timeout` (see **Timeouts** under [Server requirements](#server-requirements)). The connection option overrides the database's |
+| `adbc.redis.write_timeout` | database, connection | How long the client waits to send each command, in the same format. Default: the read timeout, or the URI's `write_timeout` |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |
 
 Scale tips: keep column names short (they are repeated in every HASH), raise
@@ -1895,6 +2040,18 @@ REDIS_URI=redis://localhost:6379/0 go test -run TestSQL ./...
 `TestSQLRowValueScale` times dbt's `delete+insert` with a composite key
 (with `-v`) on 20,000 rows; `REDIS_ROW_VALUES_ROWS=200000` runs it on
 200,000 (a multiple of 200), as measured under Performance.
+
+Some tests need more:
+
+- **The ACL tests** (`TestACL…`) create ACL users `it_acl_*` and delete them
+  afterwards, so the user needs the `ACL` command. To run the whole suite as
+  a user with only the driver's commands (see **ACL users** under
+  [Server requirements](#server-requirements)), set `REDIS_URI` to that user
+  and `REDIS_ADMIN_URI` to one that can do everything: the tests' own checks
+  use it (`KEYS`, `ACL`, …).
+- **`TestTimeoutServerPaused`** pauses the server (`CLIENT PAUSE`, on one
+  shard of a cluster) for about half a minute, so it only runs with
+  `REDIS_PAUSE_TESTS=1`. Run it against a test server only.
 
 To test against a local 3-shard Redis Cluster (from `go`):
 

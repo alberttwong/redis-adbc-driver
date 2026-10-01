@@ -806,11 +806,23 @@ func TestSQLViews(t *testing.T) {
 	h.exec(`DROP VIEW IF EXISTS v_tmp`)
 }
 
-// rawClient connects to REDIS_URI directly (cluster-aware) so tests can
+// adminURI is the URI tests use to inspect and set up the database
+// themselves: REDIS_ADMIN_URI if set, else REDIS_URI. Setting it lets the
+// driver run as an ACL user that has only the commands it needs (see
+// acl_integration_test.go), while the tests' own commands (KEYS, ACL, …)
+// use another user.
+func adminURI() string {
+	if uri := os.Getenv("REDIS_ADMIN_URI"); uri != "" {
+		return uri
+	}
+	return os.Getenv("REDIS_URI")
+}
+
+// rawClient connects to adminURI directly (cluster-aware) so tests can
 // inspect row HASHes.
 func (h *sqlHarness) rawClient() goredis.UniversalClient {
 	h.t.Helper()
-	opts, err := goredis.ParseURL(os.Getenv("REDIS_URI"))
+	opts, err := goredis.ParseURL(adminURI())
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -819,7 +831,8 @@ func (h *sqlHarness) rawClient() goredis.UniversalClient {
 	if info, err := c.Info(h.ctx, "cluster").Result(); err == nil && strings.Contains(info, "cluster_enabled:1") {
 		_ = c.Close()
 		c = goredis.NewClusterClient(&goredis.ClusterOptions{Addrs: []string{opts.Addr}, Password: opts.Password,
-			Username: opts.Username, TLSConfig: opts.TLSConfig, Protocol: 2})
+			Username: opts.Username, TLSConfig: opts.TLSConfig, Protocol: 2,
+			ReadTimeout: opts.ReadTimeout, WriteTimeout: opts.WriteTimeout})
 	}
 	h.t.Cleanup(func() { _ = c.Close() })
 	return c

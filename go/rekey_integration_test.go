@@ -445,19 +445,22 @@ func TestSQLRekeyResumes(t *testing.T) {
 	job.lease.release()
 	expectRolledBack(h, job, "1|a", "2|b", "3|c")
 
-	// Interrupted before the switch: a new connection rolls it back.
+	// Interrupted before the switch: a new connection rolls it back before
+	// it is open.
 	job = stop(false)
 	h2 := newSQLHarness(t)
-	waitFor(t, "rollback", func() bool { return !h2.rekeyPending(raw, oldPrefix) })
+	if h2.rekeyPending(raw, oldPrefix) {
+		t.Error("a new connection did not roll back the abandoned move")
+	}
 	expectRolledBack(h2, job, "1|a", "2|b", "3|c")
 
-	// Or the first statement that it refuses.
+	// Or, on a connection that was already open, the first statement that
+	// it would refuse, which then goes on.
 	job = stop(false)
-	h2.expectError(`INSERT INTO it_rk_res VALUES (4, 'd')`, "being renamed")
-	if h2.rekeyPending(raw, oldPrefix) {
-		t.Error("a refused statement did not roll back the abandoned move")
-	}
 	h2.exec(`INSERT INTO it_rk_res VALUES (4, 'd')`)
+	if h2.rekeyPending(raw, oldPrefix) {
+		t.Error("a statement did not roll back the abandoned move")
+	}
 	expectRolledBack(h2, job, "1|a", "2|b", "3|c", "4|d")
 
 	// Interrupted after the switch: the table already reads the new keys,
@@ -469,7 +472,9 @@ func TestSQLRekeyResumes(t *testing.T) {
 		t.Fatalf("setup: %d old keys, want 4", got)
 	}
 	h3 := newSQLHarness(t)
-	waitFor(t, "finish", func() bool { return !h3.rekeyPending(raw, oldPrefix) })
+	if h3.rekeyPending(raw, oldPrefix) {
+		t.Error("a new connection did not finish the abandoned move")
+	}
 	h3.expectReleased(raw, oldPrefix, oldIndex)
 	h3.expectRows(`SELECT id, label FROM it_rk_res2 WHERE label = 'd'`, "4|d")
 	h3.exec(`INSERT INTO it_rk_res2 VALUES (5, 'e')`)

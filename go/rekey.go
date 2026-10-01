@@ -70,10 +70,19 @@ package redis
 // If the renaming connection goes away, its lease expires. Then the next
 // connection to open, the next statement refused because of rekey_to, or
 // the next re-keying rename takes the job over (one transaction makes it
-// the owner). Before the switch it rolls the rename back: it drops the new
-// index with DD, which deletes the copies, releases the new names and
-// clears rekey_to, so the table is unchanged under its old name. After the
-// switch it finishes step 4.
+// the owner, and marks the job recovering). Before the switch it rolls the
+// rename back: it drops the new index with DD, which deletes the copies,
+// releases the new names and clears rekey_to, so the table is unchanged
+// under its old name. After the switch it finishes step 4.
+//
+// A takeover never outlives the call that made it: a connection that opens
+// settles every abandoned re-key before Open returns, and a statement before
+// it goes on. Otherwise a connection that closed right after opening (as
+// dbt's metadata connections do) would leave the job with a lease of its own
+// that nobody renews, and every other connection would wait for that to
+// expire too. Connections that find a job being settled by another one wait
+// for it (up to rekeyTTL), and a takeover that fails deletes its lease key
+// at once, so the next connection can try again (see settleAbandoned).
 
 import (
 	"context"
@@ -123,6 +132,9 @@ type rekeyJob struct {
 	// Switched is set once the table's metadata names the new prefix and
 	// index (step 3).
 	Switched bool `json:"switched,omitempty"`
+	// Recovering is set when a connection has taken the job over from one
+	// that went away, to roll it back or finish it.
+	Recovering bool `json:"recovering,omitempty"`
 
 	// lease is held by the connection running the job.
 	lease *lease
@@ -146,7 +158,7 @@ func (e *executor) rekeyTable(ctx context.Context, meta *tableMeta, to string) e
 	s := e.store
 	// Leftovers of abandoned re-keys (one may hold this table's prefix or
 	// the new names).
-	_ = s.recoverDead(ctx, false)
+	_ = s.recoverDead(ctx)
 	job, start, err := s.beginRekey(ctx, meta.Schema, meta.Name, to)
 	if err != nil {
 		return err
@@ -204,14 +216,19 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 		var job *rekeyJob
 		var start tableMeta
 		var names tableNames
+		// moving is the table's metadata if another re-key is moving its
+		// rows, busy its prefix if an earlier re-key of the prefix is left.
+		var moving *tableMeta
+		var busy string
 		sent := time.Now()
 		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
 			cur, err := s.getTableWith(ctx, tx, schema, from)
 			if err != nil {
 				return err
 			}
-			if err := movingErr(cur); err != nil {
-				return err
+			if cur.RekeyTo != "" {
+				moving = cur
+				return errRekeyBusy
 			}
 			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {
 				return err
@@ -220,10 +237,15 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 			}
 			// Pin the physical names, as a plain rename does.
 			cur.KeyPrefix, cur.IndexName = cur.prefix(), cur.index()
-			if busy, err := tx.HExists(ctx, rekeyKey, cur.KeyPrefix).Result(); err != nil {
+			if found, err := tx.HExists(ctx, rekeyKey, cur.KeyPrefix).Result(); err != nil {
 				return err
-			} else if busy {
-				return errorf(adbc.StatusIO, "an earlier rename of table %q.%q has not finished cleaning up; try again later", displaySchema(schema), from)
+			} else if found {
+				// A table that was dropped while its rows were being moved
+				// (DROP TABLE isn't refused), and then created again by an
+				// earlier version of the driver, which reused prefixes, has
+				// the same prefix (claimNames never hands one out again).
+				busy = cur.KeyPrefix
+				return errRekeyBusy
 			}
 			// Names no table has had, as for a new table (claimNames), so
 			// the generation of the new prefix is 0.
@@ -254,6 +276,18 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 		}, oldKey, newKey, prefixesKey, indexesKey, rekeyKey, releasedKey)
 		if errors.Is(err, goredis.TxFailedErr) {
 			continue
+		}
+		if errors.Is(err, errRekeyBusy) {
+			// Go on once a re-key abandoned by its connection is settled.
+			if moving != nil {
+				err = s.checkWritable(ctx, moving)
+			} else {
+				err = s.earlierRekeyErr(ctx, schema, from, busy)
+			}
+			if err == nil {
+				continue
+			}
+			return nil, nil, err
 		}
 		if err != nil {
 			return nil, nil, wrapRedis(err, "failed to start the rename")
@@ -644,63 +678,169 @@ func ownRekey(ctx context.Context, tx *goredis.Tx, job *rekeyJob) (*rekeyJob, er
 
 // ---- recovery ----
 
-// resumeRekeys takes over, in the background, the re-keys of connections
-// that went away (their lease has expired).
-func (s *store) resumeRekeys(ctx context.Context) error {
-	return s.recoverDead(ctx, true)
-}
+var (
+	// errRekeyBusy stops beginRekey's transaction when a re-key is in the
+	// way; beginRekey then settles it or says why it can't.
+	errRekeyBusy = errors.New("a rename is in the way")
+	// errRekeyOwnerAlive means that a job's owner renewed its lease after
+	// all.
+	errRekeyOwnerAlive = errors.New("the rename's owner is alive")
+)
 
-// recoverDead takes over every re-key whose owner's lease has expired, and
-// rolls it back or finishes it, now or in the background.
-func (s *store) recoverDead(ctx context.Context, background bool) error {
+// rekeyOutcome is what settleAbandoned found.
+type rekeyOutcome int
+
+const (
+	// rekeyGone: there is no re-key of the prefix (any more).
+	rekeyGone rekeyOutcome = iota
+	// rekeySettled: its connection had gone away, and it has now been rolled
+	// back (or finished, if it had switched).
+	rekeySettled
+	// rekeyRunning: the connection doing it is renewing its lease.
+	rekeyRunning
+	// rekeyRecovering: another connection is still settling it.
+	rekeyRecovering
+	// rekeyStuck: its connection has gone away, and settling it failed.
+	rekeyStuck
+)
+
+// recoverDead settles every re-key whose connection has gone away (its
+// lease has expired) before it returns: it takes the job over and rolls it
+// back or finishes it, or waits while another connection does. Re-keys whose
+// connection renews its lease are left alone. Only a failure to read the
+// jobs is an error: statements that run into a job that couldn't be settled
+// say so, and try again.
+func (s *store) recoverDead(ctx context.Context) error {
 	jobs, err := s.client.HGetAll(ctx, rekeyKey).Result()
 	if err != nil {
 		return wrapRedis(err, "failed to read pending renames")
 	}
-	for _, raw := range jobs {
+	for prefix, raw := range jobs {
 		var job rekeyJob
 		if json.Unmarshal([]byte(raw), &job) != nil {
 			continue
 		}
-		if n, err := s.client.Exists(ctx, rekeyAliveKey(job.Owner)).Result(); err != nil || n > 0 {
-			continue
+		if !job.Recovering {
+			if alive, err := s.ownerAlive(ctx, &job); err != nil || alive {
+				continue
+			}
 		}
-		if !background {
-			_ = s.recoverRekey(ctx, &job)
-			continue
-		}
-		// As for cleanups, the task keeps its own reference to the client.
-		worker := &store{client: s.client}
-		go func() { _ = worker.recoverRekey(context.Background(), &job) }()
+		_, _, _ = s.settleAbandoned(ctx, prefix, true)
 	}
 	return nil
 }
 
-// recoverStale is recoverDead for the re-key of one prefix.
-func (s *store) recoverStale(ctx context.Context, prefix string) error {
+// recoverStale settles the re-key of a prefix if its connection has gone
+// away, without waiting for another connection that does.
+func (s *store) recoverStale(ctx context.Context, prefix string) {
+	_, _, _ = s.settleAbandoned(ctx, prefix, false)
+}
+
+// settleAbandoned rolls back (or finishes) the re-key of a prefix if its
+// connection has gone away. If another connection is doing that, it waits
+// for it, up to rekeyTTL, when wait is set. It returns what it found, the
+// job as last read, and why settling it failed (rekeyStuck).
+func (s *store) settleAbandoned(ctx context.Context, prefix string, wait bool) (rekeyOutcome, *rekeyJob, error) {
+	var seen *rekeyJob
+	var waitUntil time.Time
+	for attempt := 0; attempt < 100; attempt++ {
+		job, err := s.readRekey(ctx, prefix)
+		if err != nil {
+			return rekeyStuck, seen, err
+		}
+		if job == nil {
+			if seen == nil {
+				return rekeyGone, nil, nil
+			}
+			return rekeySettled, seen, nil
+		}
+		seen = job
+		alive, err := s.ownerAlive(ctx, job)
+		if err != nil {
+			return rekeyStuck, job, err
+		}
+		if alive && !job.Recovering {
+			return rekeyRunning, job, nil
+		}
+		if alive {
+			if waitUntil.IsZero() {
+				waitUntil = time.Now().Add(rekeyTTL)
+			}
+			if !wait || time.Now().After(waitUntil) {
+				return rekeyRecovering, job, nil
+			}
+			select {
+			case <-ctx.Done():
+				return rekeyRecovering, job, nil
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
+		switch err := s.recoverRekey(ctx, job); {
+		case err == nil:
+			return rekeySettled, job, nil
+		case errors.Is(err, errLostRekey), errors.Is(err, goredis.TxFailedErr), errors.Is(err, errRekeyOwnerAlive):
+			// Another connection took it over first, or it changed: look
+			// again.
+		default:
+			return rekeyStuck, job, err
+		}
+	}
+	return rekeyRecovering, seen, nil
+}
+
+// readRekey returns the re-key of a prefix, or nil if there is none.
+func (s *store) readRekey(ctx context.Context, prefix string) (*rekeyJob, error) {
 	raw, err := s.client.HGet(ctx, rekeyKey, prefix).Result()
 	if errors.Is(err, goredis.Nil) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return wrapRedis(err, "failed to read pending renames")
+		return nil, wrapRedis(err, "failed to read pending renames")
 	}
 	var job rekeyJob
 	if err := json.Unmarshal([]byte(raw), &job); err != nil {
-		return nil
+		return nil, errorf(adbc.StatusInternal, "corrupt record of a rename of key prefix %q: %v", prefix, err)
 	}
-	if n, err := s.client.Exists(ctx, rekeyAliveKey(job.Owner)).Result(); err != nil || n > 0 {
-		return wrapRedis(err, "failed to read pending renames")
+	return &job, nil
+}
+
+// ownerAlive reports whether the lease of a job's owner has not expired.
+func (s *store) ownerAlive(ctx context.Context, job *rekeyJob) (bool, error) {
+	n, err := s.client.Exists(ctx, rekeyAliveKey(job.Owner)).Result()
+	if err != nil {
+		return false, wrapRedis(err, "failed to read pending renames")
 	}
-	return s.recoverRekey(ctx, &job)
+	return n > 0, nil
 }
 
 // recoverRekey takes a job over from an owner whose lease has expired, then
-// rolls it back or finishes it.
+// rolls it back or finishes it. If that fails, it gives the job up at once,
+// by deleting its own lease key, rather than keeping it from every other
+// connection until that expires.
 func (s *store) recoverRekey(ctx context.Context, job *rekeyJob) error {
+	taken, err := s.takeOver(ctx, job)
+	if err != nil {
+		return err
+	}
+	defer taken.lease.release()
+	if taken.Switched {
+		err = s.finishRekey(taken.lease.ctx, taken)
+	} else {
+		err = s.rollbackRekey(taken.lease.ctx, taken)
+	}
+	if err != nil {
+		s.client.Del(context.WithoutCancel(ctx), rekeyAliveKey(taken.Owner))
+	}
+	return err
+}
+
+// takeOver makes this connection the owner of a job whose owner's lease has
+// expired, and marks it recovering. The caller releases the lease.
+func (s *store) takeOver(ctx context.Context, job *rekeyJob) (*rekeyJob, error) {
 	n, err := s.client.Incr(ctx, rekeyNextKey).Result()
 	if err != nil {
-		return wrapRedis(err, "failed to recover a rename")
+		return nil, wrapRedis(err, "failed to recover a rename")
 	}
 	owner := strconv.FormatInt(n, 10)
 	var taken *rekeyJob
@@ -713,9 +853,9 @@ func (s *store) recoverRekey(ctx context.Context, job *rekeyJob) error {
 		if n, err := tx.Exists(ctx, rekeyAliveKey(job.Owner)).Result(); err != nil {
 			return err
 		} else if n > 0 {
-			return errorf(adbc.StatusInvalidState, "the rename's owner is alive")
+			return errRekeyOwnerAlive
 		}
-		cur.Owner = owner
+		cur.Owner, cur.Recovering = owner, true
 		raw, err := json.Marshal(cur)
 		if err != nil {
 			return err
@@ -729,36 +869,111 @@ func (s *store) recoverRekey(ctx context.Context, job *rekeyJob) error {
 		return err
 	}, rekeyKey, rekeyAliveKey(job.Owner))
 	if err != nil {
-		return err // including another connection taking it first
+		return nil, err // including another connection taking it first
 	}
 	taken.lease = s.holdLease(ctx, owner, sent)
-	defer taken.lease.release()
-	if taken.Switched {
-		return s.finishRekey(taken.lease.ctx, taken)
-	}
-	return s.rollbackRekey(taken.lease.ctx, taken)
+	return taken, nil
 }
 
 // ---- checks for concurrent statements ----
 
-// movingErr refuses to change a table whose rows are being moved.
+// movingErr refuses to change a table whose rows are being moved by a
+// connection that renews its lease.
 func movingErr(meta *tableMeta) error {
 	if meta.RekeyTo == "" {
 		return nil
 	}
-	return errorf(adbc.StatusIO, "table %q.%q is being renamed and its rows moved to new keys (%s); try again when that has finished",
-		displaySchema(meta.Schema), meta.Name, OptionStringRenameRekey)
+	return errorf(adbc.StatusIO, "table %q.%q is being renamed and its rows moved to new keys (%s); try again when that has finished. "+
+		"If the connection renaming it has gone away, the next connection to open, or the next statement that changes the table, "+
+		"rolls the rename back once its lease (%s) has expired",
+		displaySchema(meta.Schema), meta.Name, OptionStringRenameRekey, rekeyTTL)
 }
 
-// checkWritable is movingErr for a statement about to change a table. If
-// the connection moving the rows went away, the move is rolled back (or
-// finished) first, so that the statement can be retried.
+// checkWritable refuses a statement about to change a table whose rows are
+// being moved. If the connection moving them went away, the move is rolled
+// back (or finished) first, or the statement waits while another connection
+// does; then a statement whose table is back as it was goes on.
 func (s *store) checkWritable(ctx context.Context, meta *tableMeta) error {
-	err := movingErr(meta)
-	if err != nil {
-		_ = s.recoverStale(ctx, meta.prefix())
+	if meta.RekeyTo == "" {
+		return nil
 	}
-	return err
+	outcome, job, err := s.settleAbandoned(ctx, meta.prefix(), true)
+	sch, t := displaySchema(meta.Schema), meta.Name
+	switch outcome {
+	case rekeyRunning:
+		return movingErr(meta)
+	case rekeyRecovering:
+		return errorf(adbc.StatusIO, "table %q.%q was being renamed (%s) by a connection that has gone away, "+
+			"and another connection is still rolling the rename back; try again in a moment", sch, t, OptionStringRenameRekey)
+	case rekeyStuck:
+		return errorf(adbc.StatusIO, "table %q.%q is being renamed (%s), but the connection renaming it has gone away, "+
+			"and rolling the rename back failed: %v. The next connection to open, or the next statement that changes "+
+			"the table, tries again", sch, t, OptionStringRenameRekey, errMessage(err))
+	case rekeySettled:
+		if job.Switched {
+			return errorf(adbc.StatusIO, "table %q.%q was being renamed to %q (%s) by a connection that has gone away; "+
+				"that rename has now been completed", sch, t, job.To, OptionStringRenameRekey)
+		}
+	}
+	// The move is over (rolled back now, or ended since the metadata was
+	// read). Unless the table changed otherwise, the statement goes on.
+	fresh, ferr := s.getTable(ctx, meta.Schema, meta.Name)
+	if ferr == nil && sameTable(meta, fresh) {
+		meta.RekeyTo, meta.readAt = "", fresh.readAt
+		return nil
+	}
+	if outcome == rekeySettled {
+		return errorf(adbc.StatusIO, "table %q.%q was being renamed (%s) by a connection that has gone away; "+
+			"the rename has now been rolled back, so try again", sch, t, OptionStringRenameRekey)
+	}
+	return errorf(adbc.StatusIO, "table %q.%q was being renamed (%s) when this statement started, and that has "+
+		"ended since; try again", sch, t, OptionStringRenameRekey)
+}
+
+// sameTable reports whether fresh metadata is the moving table's, with
+// rekey_to cleared and nothing else changed.
+func sameTable(moving, fresh *tableMeta) bool {
+	if fresh.RekeyTo != "" {
+		return false
+	}
+	was := *moving
+	was.RekeyTo = ""
+	a, aerr := json.Marshal(&was)
+	b, berr := json.Marshal(fresh)
+	return aerr == nil && berr == nil && string(a) == string(b)
+}
+
+// errMessage is an error's text without the driver's prefix.
+func errMessage(err error) string {
+	var ae adbc.Error
+	if asAdbc(err, &ae) {
+		return strings.TrimPrefix(ae.Msg, "[redis] ")
+	}
+	return err.Error()
+}
+
+// earlierRekeyErr says why a table can't be re-keyed while an earlier
+// re-key of its key prefix is left, or returns nil once that is settled.
+func (s *store) earlierRekeyErr(ctx context.Context, schema, table, prefix string) error {
+	outcome, job, err := s.settleAbandoned(ctx, prefix, true)
+	if job != nil {
+		schema, table = job.Schema, job.From
+	}
+	sch := displaySchema(schema)
+	switch outcome {
+	case rekeyRunning:
+		return errorf(adbc.StatusIO, "an earlier rename of table %q.%q is still moving its rows (%s); try again when it has finished. "+
+			"If the connection doing it has gone away, the next connection to open, or the next such rename, "+
+			"rolls it back once its lease (%s) has expired", sch, table, OptionStringRenameRekey, rekeyTTL)
+	case rekeyRecovering:
+		return errorf(adbc.StatusIO, "an earlier rename of table %q.%q (%s) was left unfinished by a connection that has gone away, "+
+			"and another connection is still rolling it back; try again in a moment", sch, table, OptionStringRenameRekey)
+	case rekeyStuck:
+		return errorf(adbc.StatusIO, "an earlier rename of table %q.%q (%s) was left unfinished by a connection that has gone away, "+
+			"and rolling it back failed: %v. The next connection to open, or the next such rename, tries again",
+			sch, table, OptionStringRenameRekey, errMessage(err))
+	}
+	return nil
 }
 
 // checkWritten runs after a statement has written rows of a table. If the
@@ -809,7 +1024,7 @@ func (s *store) checkKeys(ctx context.Context, meta *tableMeta, writing bool) er
 		if json.Unmarshal([]byte(raw), &j) == nil && j.OldPrefixGen == meta.PrefixGen {
 			moved = moved || writing || j.Switched
 			// The move may have been abandoned.
-			_ = s.recoverStale(ctx, meta.prefix())
+			s.recoverStale(ctx, meta.prefix())
 		}
 	}
 	if !moved {

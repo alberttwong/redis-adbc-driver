@@ -25,6 +25,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 type connectionImpl struct {
@@ -38,6 +39,13 @@ type connectionImpl struct {
 	// rekey is adbc.redis.rename_rekey (from the database unless set on the
 	// connection).
 	rekey bool
+
+	// clientOpts are the go-redis options the client was made from, and
+	// timeouts its timeouts (see timeout.go). writeFollows is set while
+	// the write timeout follows the read timeout.
+	clientOpts   *goredis.Options
+	timeouts     timeouts
+	writeFollows bool
 }
 
 func (c *connectionImpl) executor() *executor {
@@ -45,22 +53,73 @@ func (c *connectionImpl) executor() *executor {
 }
 
 func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
-	if key == OptionStringRenameRekey {
+	switch key {
+	case OptionStringRenameRekey:
 		return strconv.FormatBool(c.rekey), nil
+	case OptionStringReadTimeout:
+		return formatTimeout(c.timeouts.read), nil
+	case OptionStringWriteTimeout:
+		return formatTimeout(c.timeouts.write), nil
 	}
 	return c.ConnectionImplBase.GetOption(ctx, key)
 }
 
 func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
-	if key == OptionStringRenameRekey {
+	switch key {
+	case OptionStringRenameRekey:
 		rekey, err := parseRenameRekey(value)
 		if err != nil {
 			return err
 		}
 		c.rekey = rekey
 		return nil
+	case OptionStringReadTimeout, OptionStringWriteTimeout:
+		d, err := parseTimeout(key, value)
+		if err != nil {
+			return err
+		}
+		t, follows := c.timeouts, c.writeFollows
+		if key == OptionStringReadTimeout {
+			t.read = d
+			if follows {
+				t.write = d
+			}
+		} else {
+			t.write, follows = d, false
+		}
+		if err := c.setTimeouts(ctx, t); err != nil {
+			return err
+		}
+		c.writeFollows = follows
+		return nil
 	}
 	return c.ConnectionImplBase.SetOption(ctx, key, value)
+}
+
+// setTimeouts gives the connection a client with other timeouts. go-redis
+// fixes them when a client is made, so this makes a new one. The old one
+// stays open until the connection closes, for background work that still
+// uses it (cleanups, string column checks, the temporary schema's
+// heartbeat).
+func (c *connectionImpl) setTimeouts(ctx context.Context, t timeouts) error {
+	if t == c.timeouts {
+		return nil
+	}
+	if c.store == nil || c.store.client == nil {
+		return errorf(adbc.StatusInvalidState, "the connection is closed")
+	}
+	_, cluster := c.store.client.(*goredis.ClusterClient)
+	client := newClient(c.clientOpts, cluster, t)
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return wrapRedis(err, "failed to connect to Redis")
+	}
+	c.store.mu.Lock()
+	c.store.retired = append(c.store.retired, c.store.client)
+	c.store.mu.Unlock()
+	c.store.client = client
+	c.timeouts = t
+	return nil
 }
 
 func (c *connectionImpl) Close(ctx context.Context) error {
@@ -70,6 +129,13 @@ func (c *connectionImpl) Close(ctx context.Context) error {
 		_ = c.store.dropTempSchema(ctx)
 		err := c.store.client.Close()
 		c.store.client = nil
+		c.store.mu.Lock()
+		retired := c.store.retired
+		c.store.retired = nil
+		c.store.mu.Unlock()
+		for _, old := range retired {
+			_ = old.Close()
+		}
 		return err
 	}
 	return nil

@@ -36,9 +36,14 @@ type databaseImpl struct {
 	pushdown string
 	cluster  string
 	rekey    bool
+	// timeouts are adbc.redis.read_timeout and write_timeout (see
+	// timeout.go).
+	timeouts timeoutSettings
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
+// clientOptions returns the go-redis options from the URI, or the address,
+// and the credentials.
+func (d *databaseImpl) clientOptions() (*goredis.Options, error) {
 	var opts *goredis.Options
 	if d.uri != "" {
 		parsed, err := goredis.ParseURL(d.uri)
@@ -58,7 +63,16 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 	// The driver parses RESP2 replies of FT.AGGREGATE / FT.CURSOR.
 	opts.Protocol = 2
 	opts.DisableIdentity = true
-	client, err := d.connect(ctx, opts)
+	return opts, nil
+}
+
+func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
+	opts, err := d.clientOptions()
+	if err != nil {
+		return nil, err
+	}
+	t, writeFollows := d.timeouts.resolve(opts)
+	client, err := d.connect(ctx, opts, t)
 	if err != nil {
 		return nil, err
 	}
@@ -85,8 +99,8 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		return nil, err
 	}
 	// Roll back or finish renames that were moving rows when their
-	// connection went away (see rekey.go).
-	if err := st.resumeRekeys(ctx); err != nil {
+	// connection went away, before any statement runs (see rekey.go).
+	if err := st.recoverDead(ctx); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
@@ -98,6 +112,9 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		sess:               newSession(d.schema),
 		pushdown:           d.pushdown,
 		rekey:              d.rekey,
+		clientOpts:         opts,
+		timeouts:           t,
+		writeFollows:       writeFollows,
 	}
 	return driverbase.NewConnectionBuilder(conn).
 		WithCurrentNamespacer(conn).
@@ -127,10 +144,10 @@ func (s *store) refuseFlex(ctx context.Context) error {
 
 // connect opens a single-endpoint or OSS Cluster API client, depending on
 // the cluster option and (for "auto") what the server reports.
-func (d *databaseImpl) connect(ctx context.Context, opts *goredis.Options) (goredis.UniversalClient, error) {
+func (d *databaseImpl) connect(ctx context.Context, opts *goredis.Options, t timeouts) (goredis.UniversalClient, error) {
 	useCluster := d.cluster == "true"
 	if d.cluster != "true" {
-		single := goredis.NewClient(opts)
+		single := newClient(opts, false, t)
 		if err := single.Ping(ctx).Err(); err != nil {
 			_ = single.Close()
 			return nil, errorf(adbc.StatusIO, "failed to connect to Redis: %v", err)
@@ -153,17 +170,7 @@ func (d *databaseImpl) connect(ctx context.Context, opts *goredis.Options) (gore
 	if opts.DB != 0 {
 		return nil, errorf(adbc.StatusInvalidArgument, "Redis Cluster only supports database 0 (got %d)", opts.DB)
 	}
-	cluster := goredis.NewClusterClient(&goredis.ClusterOptions{
-		Addrs:           []string{opts.Addr},
-		Username:        opts.Username,
-		Password:        opts.Password,
-		TLSConfig:       opts.TLSConfig,
-		Protocol:        opts.Protocol,
-		DisableIdentity: opts.DisableIdentity,
-		DialTimeout:     opts.DialTimeout,
-		ReadTimeout:     opts.ReadTimeout,
-		WriteTimeout:    opts.WriteTimeout,
-	})
+	cluster := newClient(opts, true, t)
 	if err := cluster.Ping(ctx).Err(); err != nil {
 		_ = cluster.Close()
 		return nil, errorf(adbc.StatusIO, "failed to connect to Redis Cluster: %v", err)
@@ -191,6 +198,17 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.cluster, nil
 	case OptionStringRenameRekey:
 		return strconv.FormatBool(d.rekey), nil
+	case OptionStringReadTimeout, OptionStringWriteTimeout:
+		// The timeout a connection opened now gets.
+		opts, err := d.clientOptions()
+		if err != nil {
+			opts = &goredis.Options{}
+		}
+		t, _ := d.timeouts.resolve(opts)
+		if key == OptionStringReadTimeout {
+			return formatTimeout(t.read), nil
+		}
+		return formatTimeout(t.write), nil
 	}
 	return d.DatabaseImplBase.GetOption(ctx, key)
 }
@@ -237,6 +255,16 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 			return err
 		}
 		d.rekey = rekey
+	case OptionStringReadTimeout, OptionStringWriteTimeout:
+		t, err := parseTimeout(key, value)
+		if err != nil {
+			return err
+		}
+		if key == OptionStringReadTimeout {
+			d.timeouts.read = &t
+		} else {
+			d.timeouts.write = &t
+		}
 	default:
 		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}
