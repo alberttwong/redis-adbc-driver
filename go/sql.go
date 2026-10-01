@@ -131,9 +131,10 @@ type Func struct {
 	Star     bool
 	Distinct bool
 	// OrderBy orders an aggregate's input: STRING_AGG(x, sep ORDER BY …),
-	// or WITHIN GROUP (ORDER BY …) (WithinGroup is then set). For an
-	// ordered-set aggregate (PERCENTILE_CONT, …) the WITHIN GROUP expression
-	// is the aggregated value and Args are its direct arguments.
+	// JSON_AGG(x ORDER BY …), or WITHIN GROUP (ORDER BY …) (WithinGroup is
+	// then set). For an ordered-set aggregate (PERCENTILE_CONT, …) the
+	// WITHIN GROUP expression is the aggregated value and Args are its direct
+	// arguments.
 	OrderBy     []OrderItem
 	WithinGroup bool
 	// Filter is an aggregate's FILTER (WHERE …) condition.
@@ -141,6 +142,8 @@ type Func struct {
 	// Nulls is IGNORE NULLS / RESPECT NULLS (LAG, LEAD and the value
 	// window functions).
 	Nulls NullTreatment
+	// JSON holds the clauses of a SQL/JSON function (RETURNING, ON ERROR, …).
+	JSON *jsonClauses
 }
 
 // NullTreatment is the IGNORE NULLS / RESPECT NULLS of a function call.
@@ -680,7 +683,7 @@ func lex(src string) ([]token, error) {
 			}
 			toks = append(toks, token{kind: tokOp, text: src[start:i], pos: start, end: i})
 		default:
-			ops := []string{"<>", "!=", "<=", ">=", "||", "::", "==", "(", ")", ",", ";", "*", "+", "-", "/", "%", "=", "<", ">", "."}
+			ops := []string{"->>", "->", "#>>", "#>", "<>", "!=", "<=", ">=", "||", "::", "==", "(", ")", ",", ";", "*", "+", "-", "/", "%", "=", "<", ">", ".", ":"}
 			matched := false
 			for _, op := range ops {
 				if strings.HasPrefix(src[i:], op) {
@@ -2434,6 +2437,13 @@ func (p *parser) parseComparison() (Expr, error) {
 		}
 		if p.acceptKeyword("IS") {
 			not := p.acceptKeyword("NOT")
+			if p.acceptKeyword("JSON") {
+				l = p.parseIsJSON(l)
+				if not {
+					l = &Unary{Op: "NOT", X: l}
+				}
+				continue
+			}
 			if !p.acceptKeyword("NULL") {
 				return nil, syntaxErr("expected NULL after IS")
 			}
@@ -2555,11 +2565,13 @@ func (p *parser) parseComparison() (Expr, error) {
 }
 
 // parseOtherOp parses the operators Postgres puts at its "any other
-// operator" precedence: || and the regular-expression matches ~, ~*, !~ and
-// !~*, left to right. They bind tighter than comparisons, IS, LIKE, BETWEEN
-// and IN, and looser than arithmetic: `s ~ 'a' || 'b'` is (s ~ 'a') || 'b',
-// and 'n=' || 1 + 1 is 'n=2'. `x ~ p` is the function "~" (case-sensitive),
-// `x ~* p` is "~*", and the negated forms are NOT around them.
+// operator" precedence: ||, the regular-expression matches ~, ~*, !~ and
+// !~*, and the JSON operators ->, ->>, #> and #>>, all left to right. They
+// bind tighter than comparisons, IS, LIKE, BETWEEN and IN, and looser than
+// arithmetic: `s ~ 'a' || 'b'` is (s ~ 'a') || 'b', j ->> 'a' || 'b' is
+// (j ->> 'a') || 'b', and 'n=' || 1 + 1 is 'n=2'. `x ~ p` is the function
+// "~" (case-sensitive), `x ~* p` is "~*", and the negated forms are NOT
+// around them; the JSON operators are functions too (json.go).
 func (p *parser) parseOtherOp() (Expr, error) {
 	l, err := p.parseAdditive()
 	if err != nil {
@@ -2567,7 +2579,12 @@ func (p *parser) parseOtherOp() (Expr, error) {
 	}
 	for {
 		t := p.peek()
-		if t.kind != tokOp || (t.text != "||" && t.text != "~" && t.text != "~*" && t.text != "!~" && t.text != "!~*") {
+		if t.kind != tokOp {
+			return l, nil
+		}
+		switch t.text {
+		case "||", "~", "~*", "!~", "!~*", "->", "->>", "#>", "#>>":
+		default:
 			return l, nil
 		}
 		p.pos++
@@ -2575,13 +2592,16 @@ func (p *parser) parseOtherOp() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if t.text == "||" {
+		switch t.text {
+		case "||":
 			l = &Binary{Op: "||", L: l, R: r}
-			continue
-		}
-		l = &Func{Name: strings.TrimPrefix(t.text, "!"), Args: []Expr{l, r}}
-		if strings.HasPrefix(t.text, "!") {
-			l = &Unary{Op: "NOT", X: l}
+		case "->", "->>", "#>", "#>>":
+			l = &Func{Name: t.text, Args: []Expr{l, r}}
+		default:
+			l = &Func{Name: strings.TrimPrefix(t.text, "!"), Args: []Expr{l, r}}
+			if strings.HasPrefix(t.text, "!") {
+				l = &Unary{Op: "NOT", X: l}
+			}
 		}
 	}
 }
@@ -2666,6 +2686,10 @@ func (p *parser) parsePostfix(x Expr) (Expr, error) {
 		spec, err := p.parseTypeSpec()
 		if err != nil {
 			return nil, err
+		}
+		if j, ok := jsonCast(spec, x); ok {
+			x = j
+			continue
 		}
 		ct, err := colTypeFromSQL(spec)
 		if err != nil {
@@ -2826,6 +2850,9 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
 				}
+				if j, ok := jsonCast(spec, x); ok {
+					return j, nil
+				}
 				ct, err := colTypeFromSQL(spec)
 				if err != nil {
 					return nil, &sqlError{msg: err.Error()}
@@ -2836,6 +2863,12 @@ func (p *parser) parsePrimary() (Expr, error) {
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
 				return p.parseDateArith(upper)
+			}
+		case "JSON_VALUE", "JSON_QUERY", "JSON_EXISTS", "JSON_OBJECT", "JSON_ARRAY":
+			// SQL/JSON functions, with clauses such as RETURNING and ON ERROR.
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				return p.parseSQLJSONFunc(upper)
 			}
 		case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "DATETIME":
 			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...'
