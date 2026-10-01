@@ -72,6 +72,8 @@ type execCache struct {
 	working map[*CTE]*tableMeta
 	// extremes are the bounds of uncorrelated ANY / ALL subqueries.
 	extremes map[*Subquery]*quantExtremes
+	// prefixes caches prefixComplete by index and query (tags.go).
+	prefixes map[string]bool
 	// usedTemp is set when a name resolves to a temporary object.
 	usedTemp bool
 	// loaded are the tables the statement read (see checkReads in rekey.go).

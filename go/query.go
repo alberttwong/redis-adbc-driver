@@ -35,7 +35,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -89,18 +88,22 @@ func isConstant(e Expr) bool {
 
 var flipOp = map[string]string{"=": "=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
-// escapeTag escapes a value for a DIALECT 2 TAG query.
+// escapeTag escapes a tag for a DIALECT 2 TAG query (see tagQueryable for
+// the tags it can write). ASCII punctuation and whitespace are escaped; the
+// bytes of other characters are written as they are, since an escaped one
+// is no longer part of the tag.
 func escapeTag(s string) string {
 	if s == "" {
 		return `""`
 	}
 	var b strings.Builder
-	for _, r := range s {
-		if r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '_' || c >= utf8.RuneSelf || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
 		} else {
 			b.WriteByte('\\')
-			b.WriteRune(r)
+			b.WriteByte(c)
 		}
 	}
 	return b.String()
@@ -138,9 +141,10 @@ func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 
 // planWhere pushes down every predicate the index can answer: ranges on
 // NUMERIC columns and equality on TAG (string) columns. Predicates the index
-// may answer inexactly (double rounding of large integers) are pushed down
-// inclusively and also kept in the residual, as are predicates widened to
-// the rows that read a column's missing value (widenMissing).
+// may answer inexactly (double rounding of large integers, strings the TAG
+// index doesn't hold exactly) are pushed down inclusively and also kept in
+// the residual, as are predicates widened to the rows that read a column's
+// missing value (widenMissing).
 func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
 	wp := wherePlan{query: "*"}
 	if where == nil {
@@ -192,7 +196,11 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			continue
 		}
 		if term, ok := likePrefixTerm(c, meta, env); ok {
-			terms = append(terms, term)
+			// A prefix whose tags the index doesn't all expand is checked
+			// on the rows alone (see tags.go).
+			if e.prefixComplete(ctx, meta, term) {
+				terms = append(terms, term)
+			}
 			addResidual(c) // re-checked exactly on fetched rows
 			continue
 		}
@@ -283,7 +291,13 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 				addResidual(c)
 				continue
 			}
-			push(fmt.Sprintf("%s:{%s}", field, escapeTag(v.S)), strings.Contains(v.S, tagSeparator))
+			// The tag of 'ab ' is 'ab' (see tags.go).
+			lit, exact, ok := tagLookup(col, v.S)
+			if !ok {
+				addResidual(c)
+				continue
+			}
+			push(fmt.Sprintf("%s:{%s}", field, lit), !exact)
 		default:
 			addResidual(c)
 		}
@@ -440,7 +454,8 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 // LOAD reads SORTABLE attributes from the index's sorting vector, where
 // numbers are doubles printed with 12 significant digits: strings (stored
 // UNF) and integers below 2^53 survive, other numbers must be read from the
-// HASH with LOAD *. Unindexed fields are always read from the HASH.
+// HASH with LOAD *, as must strings cut at a NUL byte (see tags.go).
+// Unindexed fields are always read from the HASH.
 func loadsExactly(c columnMeta) bool {
 	if !simpleName(c.field()) {
 		return false
@@ -449,7 +464,9 @@ func loadsExactly(c columnMeta) bool {
 		return true
 	}
 	switch c.Type.Kind {
-	case KindString, KindBool, KindInt16, KindInt32, KindDate, KindTime:
+	case KindString:
+		return c.sortsExactly()
+	case KindBool, KindInt16, KindInt32, KindDate, KindTime:
 		return true
 	}
 	return false
@@ -550,8 +567,9 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 			break
 		}
 		col, ok := meta.column(c.Name)
-		// Rows that read a missing value have no index entry to sort on.
-		if !ok || !col.Indexed || col.MissingThrough > 0 {
+		// Rows that read a missing value have no index entry to sort on,
+		// and strings cut at a NUL byte sort on what is left.
+		if !ok || !col.Indexed || col.MissingThrough > 0 || !col.sortsExactly() {
 			indexSort = false
 			break
 		}
@@ -803,8 +821,9 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		col, ok := meta.column(c.Name)
-		// The index doesn't see the missing values of rows without a field.
-		if !ok || !col.Indexed || !simpleName(col.field()) || col.MissingThrough > 0 {
+		// The index doesn't see the missing values of rows without a field,
+		// and groups strings cut at a NUL byte by what is left.
+		if !ok || !col.Indexed || !simpleName(col.field()) || col.MissingThrough > 0 || !col.sortsExactly() {
 			return nil, false, nil
 		}
 		if !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
@@ -1185,10 +1204,12 @@ func unionQuery(cm columnMeta, values []Value) (string, bool) {
 			continue // cannot equal any stored value
 		}
 		if cm.Type.Kind == KindString {
-			if strings.Contains(cv.S, tagSeparator) {
+			// The tag the value is found by (see tags.go).
+			lit, _, ok := tagLookup(cm, cv.S)
+			if !ok {
 				return "", false
 			}
-			parts = append(parts, escapeTag(cv.S))
+			parts = append(parts, lit)
 		} else if cm.Type.Kind.indexedAsNumeric() {
 			b := encodeStored(cv)
 			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.field(), b, b))
@@ -1234,7 +1255,8 @@ func widenMissing(term string, col columnMeta, holds func(Value) bool) (string, 
 }
 
 // likePrefixTerm turns `col LIKE 'abc%'` on an indexed string column into a
-// TAG prefix query `@col:{abc*}` (RediSearch needs at least two characters).
+// TAG prefix query `@col:{abc*}` (RediSearch needs at least two characters),
+// on the prefix's tag (see tags.go). The caller re-checks the predicate.
 func likePrefixTerm(c Expr, meta *tableMeta, env *evalEnv) (string, bool) {
 	f, ok := c.(*Func)
 	if !ok || f.Name != "LIKE" || len(f.Args) != 2 {
@@ -1257,10 +1279,14 @@ func likePrefixTerm(c Expr, meta *tableMeta, env *evalEnv) (string, bool) {
 		return "", false
 	}
 	prefix := strings.TrimSuffix(pat, "%")
-	if utf8.RuneCountInString(prefix) < 2 || strings.ContainsAny(prefix, "%_") || strings.Contains(prefix, tagSeparator) {
+	if strings.ContainsAny(prefix, "%_") || strings.Contains(prefix, tagSeparator) {
 		return "", false
 	}
-	term, _ := widenMissing(fmt.Sprintf("@%s:{%s*}", col.field(), escapeTag(prefix)), col, func(m Value) bool {
+	lit, ok := prefixLookup(prefix)
+	if !ok {
+		return "", false
+	}
+	term, _ := widenMissing(fmt.Sprintf("@%s:{%s*}", col.field(), lit), col, func(m Value) bool {
 		return strings.HasPrefix(m.S, prefix)
 	})
 	return term, true

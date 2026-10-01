@@ -271,6 +271,12 @@ func (e *executor) addColumn(ctx context.Context, meta *tableMeta, def ColumnDef
 		}
 	}
 	col.Indexed = indexable(col.Type) && !def.NoIndex && simpleName(col.field()) && indexed < maxIndexed
+	// Rows written meanwhile by statements that read the metadata before get
+	// the missing value (see addedMissing).
+	col.initTags()
+	if col.TagsChecked {
+		col.TagValues = tagLevelOf(col.Missing)
+	}
 	if col.Indexed {
 		// Add the attribute first: an unused attribute is harmless if the
 		// metadata update below fails.

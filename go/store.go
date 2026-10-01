@@ -31,8 +31,9 @@ package redis
 //
 // Secondary index: a RediSearch index over the row prefix that only covers the
 // columns used for filtering, sorting and aggregation. Numeric-like columns
-// are NUMERIC SORTABLE and strings are TAG SORTABLE UNF; binary columns and
-// columns declared NOINDEX are not indexed and just sit in the HASHes:
+// are NUMERIC SORTABLE and strings are TAG SORTABLE UNF (which doesn't hold
+// every string exactly, see tags.go); binary columns and columns declared
+// NOINDEX are not indexed and just sit in the HASHes:
 //
 //	idx:<schema>:<table>            FT index ON HASH PREFIX 1 <schema>:<table>:
 //
@@ -108,6 +109,12 @@ type columnMeta struct {
 	// in defaults.go). MissingThrough is 0 when there were none.
 	Missing        string `json:"missing,omitempty"`
 	MissingThrough int64  `json:"missing_through,omitempty"`
+	// TagValues is how exactly the index holds the values of an indexed
+	// string column: "" (all as they are), tagsNormalized or tagsTruncated
+	// (see tags.go). TagsChecked says it covers every stored value; columns
+	// of tables created before it was recorded are checked once.
+	TagValues   string `json:"tag_values,omitempty"`
+	TagsChecked bool   `json:"tags_checked,omitempty"`
 	// label is the name a result column takes from the column when it
 	// differs from Name: joined relations name columns alias.column but
 	// output them as column.
@@ -412,9 +419,13 @@ type store struct {
 	// server exposes the OSS Cluster API.
 	client goredis.UniversalClient
 
-	// Background dropped-column cleanups running on this connection.
-	mu       sync.Mutex
-	cleaning map[string]bool
+	// Background dropped-column cleanups and string column checks (see
+	// tags.go) running on this connection, and the number of cluster shards
+	// (see store.shards).
+	mu         sync.Mutex
+	cleaning   map[string]bool
+	tagChecks  map[string]time.Time
+	shardCount int
 
 	// The connection's temporary tables and views (see temp.go).
 	temp tempSpace
@@ -557,6 +568,9 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 			return false, errorf(adbc.StatusAlreadyExists, "duplicate column name %q", c.Name)
 		}
 		seen[strings.ToLower(c.Name)] = true
+	}
+	for i := range meta.Columns {
+		meta.Columns[i].initTags()
 	}
 	raw, err := json.Marshal(meta)
 	if err != nil {
@@ -874,6 +888,9 @@ func (s *store) allocRows(ctx context.Context, meta *tableMeta, rows [][]Value) 
 
 // writeRows writes rows allocated by allocRows as HASHes.
 func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows [][]Value) (int64, error) {
+	if err := s.raiseTagLevels(ctx, meta, rowTagLevels(meta, rows)); err != nil {
+		return 0, err
+	}
 	prefix := meta.prefix()
 	for start := 0; start < len(rows); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(rows))
