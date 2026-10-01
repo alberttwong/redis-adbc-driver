@@ -2292,6 +2292,12 @@ func (p *parser) parseMultiplicative() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
+			if op == "%" {
+				// a % b is MOD(a, b), with its result type and its error on
+				// a zero divisor.
+				l = &Func{Name: "MOD", Args: []Expr{l, r}}
+				continue
+			}
 			l = &Binary{Op: op, L: l, R: r}
 		default:
 			return l, nil

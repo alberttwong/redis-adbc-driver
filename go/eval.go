@@ -562,14 +562,11 @@ func binaryOp(op string, l, r Value) (Value, error) {
 				return intValue(rt, p), nil
 			}
 			return intValue(rt, 0), nil
-		case "/", "%":
+		case "/":
 			if b == 0 {
 				return Value{}, fmt.Errorf("division by zero")
 			}
-			if op == "/" {
-				return intValue(rt, a/b), nil
-			}
-			return intValue(rt, a%b), nil
+			return intValue(rt, a/b), nil
 		}
 	case KindFloat64:
 		a, _ := l.asFloat()
@@ -586,8 +583,6 @@ func binaryOp(op string, l, r Value) (Value, error) {
 				return Value{}, fmt.Errorf("division by zero")
 			}
 			return floatValue(rt, a/b), nil
-		case "%":
-			return floatValue(rt, math.Mod(a, b)), nil
 		}
 	case KindDecimal:
 		ad, as, _ := asDecimal(l)
@@ -629,7 +624,7 @@ func arithmeticType(op string, a, b ColType) (ColType, error) {
 	case a.Kind.isFloat() || b.Kind.isFloat():
 		return typeFloat64, nil
 	case a.Kind == KindDecimal || b.Kind == KindDecimal:
-		if op == "/" || op == "%" {
+		if op == "/" {
 			return typeFloat64, nil
 		}
 		as, bs := int32(0), int32(0)

@@ -582,7 +582,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   while computing `x`, and a cast between types that never convert (`DATE`
   to `BOOLEAN`), are still errors
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
-  negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD`,
+  negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD` / `%`,
   `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
   `EXP`, `SIGN`, `ABS`, `RANDOM()`
   - `ROUND` rounds half away from zero: exactly on `NUMERIC`, and on
@@ -590,11 +590,14 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
     2.68). Postgres rounds doubles half to even
   - Integers and doubles keep their type. `ROUND(NUMERIC(p,s), n)` has scale
     `n` (at most `s`); `ROUND(x)`, `TRUNC(x)`, `FLOOR` and `CEIL` scale 0.
-    `MOD` has its arguments' common type; `SQRT`, `LN`, `LOG`, `EXP`,
+    `MOD` and `%` have their arguments' common type (`NUMERIC` stays
+    exact); `SQRT`, `LN`, `LOG`, `EXP`,
     `POWER` and `RANDOM` return `DOUBLE PRECISION`
   - Errors as in Postgres for the square root of a negative number, the
-    logarithm of zero or of a negative number, `MOD` by zero, zero to a
-    negative power, and overflow
+    logarithm of zero or of a negative number, `MOD` / `%` by zero (of any
+    numeric type), zero to a negative power, and overflow. `EXP` of a double
+    that underflows is an error too ("value out of range: underflow"); `EXP`
+    of a `NUMERIC` then returns 0, as Postgres's `exp(numeric)` does
 - String functions; positions are 1-based and count characters, not bytes:
   - `SUBSTRING(s, start [, len])`, `SUBSTRING(s FROM start [FOR len])`,
     `SUBSTR`, `LEFT(s, n)` / `RIGHT(s, n)` (a negative `n` drops characters
