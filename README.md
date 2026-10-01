@@ -417,7 +417,10 @@ How SQL is executed:
 
 Pushed down into the index: numeric range/equality predicates on indexed
 columns (`@c:[lo hi]`), string equality on indexed columns (`@c:{value}`),
-`ORDER BY` on indexed columns, `LIMIT/OFFSET`, and aggregates.
+`ORDER BY` on indexed columns, `LIMIT/OFFSET`, and aggregates. A constant
+that doesn't fit the column's type exactly (`int_col > 1.5`, `numeric_col =
+1.249`, `date_col < TIMESTAMP '… 12:00:00'`) is pushed as an inclusive bound
+at its rounded value and re-checked by the driver.
 
 Row values always come from the HASHes as stored, never from the index sort
 vectors: `LOAD @c` on a SORTABLE numeric attribute returns the sort vector's

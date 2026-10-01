@@ -229,6 +229,15 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			case KindDecimal:
 				exact = ct.Precision <= 15
 			}
+			// A constant that doesn't fit the column type (1.5 for an
+			// integer, 1.249 for NUMERIC(6,2), a timestamp with a time of
+			// day for a DATE) was rounded to a neighbouring value. No stored
+			// value lies strictly between the two, so inclusive bounds at
+			// the rounded value still cover every match, and the residual
+			// makes the comparison exact.
+			if cmp, ok := compareValues(v, cv); !ok || cmp != 0 {
+				exact = false
+			}
 			lo, hi := "-inf", "+inf"
 			switch op {
 			case "=":
@@ -250,6 +259,12 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		case ct.Kind == KindString && op == "=":
 			v, err := Coerce(cv, ct)
 			if err != nil {
+				addResidual(c)
+				continue
+			}
+			// Only push string constants: `s = 1` is an error, which the
+			// residual reports, not a match for the row with '1'.
+			if cv.T.Kind != KindString {
 				addResidual(c)
 				continue
 			}
