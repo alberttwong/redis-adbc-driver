@@ -482,7 +482,7 @@ func TestRegexSimilarTranslation(t *testing.T) {
 func TestRegexPushdownPlan(t *testing.T) {
 	meta := &tableMeta{Schema: "public", Name: "t", Columns: []columnMeta{
 		{Name: "n", Type: typeInt64, Indexed: true},
-		{Name: "s", Type: typeString, Indexed: true},
+		{Name: "s", Type: typeString, Indexed: true, TagsChecked: true},
 	}}
 	for _, c := range []struct {
 		where, query string

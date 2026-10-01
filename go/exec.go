@@ -139,6 +139,10 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 	if err == nil && e.cache != nil {
 		e.cache.loaded = append(e.cache.loaded, meta)
 	}
+	if err == nil {
+		// String columns of an older table are checked once (tags.go).
+		e.store.startTagCheck(meta)
+	}
 	return meta, err
 }
 
@@ -1289,13 +1293,17 @@ func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChan
 }
 
 // writeUpdates applies row changes to a table with pipelined HSET / HDEL.
-// The index follows the HASHes by itself. Like every write, it is refused
+// The index follows the HASHes by itself, once the levels of the strings
+// written are recorded (see tags.go). Like every write, it is refused
 // while a re-key moves the table's rows (see checkWritable in rekey.go).
 func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []rowChange) error {
 	if len(changes) == 0 {
 		return nil
 	}
 	if err := e.store.checkWritable(ctx, meta); err != nil {
+		return err
+	}
+	if err := e.store.raiseTagLevels(ctx, meta, changeTagLevels(meta, changes)); err != nil {
 		return err
 	}
 	for start := 0; start < len(changes); start += pipelineChunk {

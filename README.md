@@ -390,10 +390,46 @@ Stop Redis with `docker compose down`.
 - **Selective index**: `FT.CREATE idx:<schema>:<table> ON HASH PREFIX 1
   <schema>:<table>:` covering only filterable columns: numeric, boolean,
   decimal, date/time and timestamp columns as `NUMERIC SORTABLE`, strings as
-  `TAG CASESENSITIVE INDEXEMPTY SORTABLE UNF`. Binary columns and columns
+  `TAG SEPARATOR "\x1f" CASESENSITIVE INDEXEMPTY SORTABLE UNF`. Binary columns and columns
   declared `NOINDEX` are stored in the HASH only.
+- **Strings in the index**: a TAG doesn't hold every string as it is.
+  RediSearch cuts a value at its first NUL byte, splits it at the separator,
+  trims ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`) from both
+  ends of each piece and cuts each piece to 4,096 bytes: so `'ab '`, `' ab'`
+  and `'ab'` all have the tag `ab`, and `' '` has the tag `''` (Unicode
+  spaces are kept). The sort vector holds the whole value, except that it
+  also stops at a NUL byte. So each indexed string column's metadata
+  records whether the index holds all its values exactly, or some only as
+  other tags (`tag_values: normalized`), or some cut at a NUL byte
+  (`truncated`). Every write (`INSERT`, `UPDATE`, `MERGE`, bulk ingest,
+  `ADD COLUMN … DEFAULT`) raises it before writing the rows, and it never
+  goes down (not even on `DELETE` or `TRUNCATE`). Then:
+  - On a column held exactly, `col = 'v'` is the exact TAG query `@c:{v}`,
+    so `COUNT`, aggregates and `LIMIT` still run in the index.
+  - Otherwise, and for a constant that isn't held exactly, the query looks
+    up the constant's tag (`@c:{ab}` for `'ab '`) and the driver re-checks
+    the rows, so the index no longer counts, aggregates or limits on its
+    own for that predicate. `IN` lists, index lookup joins and `LIKE`
+    prefixes look tags up the same way (and are always re-checked).
+  - A truncated column is also sorted, grouped and read (`LOAD *`) by the
+    driver. A constant with an ASCII control character other than
+    whitespace can't be written in a TAG query, so it is checked by the
+    driver.
+  - Tables created by earlier versions (no `tags_checked` in their
+    columns' metadata) count as truncated until a background check,
+    started by the first statement that reads one on a connection, has read
+    every row (about 0.4 s for 100,000 rows of 10 columns) and recorded
+    what they hold. It records nothing if the table's metadata changed
+    meanwhile (a writer raising a level), and starts over; a connection
+    whose check failed tries again a minute later.
+  - A statement that read a table's metadata before another connection
+    raised a level may see that connection's new rows as the index holds
+    them (count a new `'ab '` as `'ab'`, or sort or read a new value with a
+    NUL byte up to that byte), in the same window in which it may or may
+    not see them at all. Earlier versions of the driver don't raise levels
+    when they write.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
-  (column types, defaults and missing values as JSON), `adbc:{meta}:seq:*` (row ids),
+  (column types, defaults, missing values and string levels as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
   `adbc:{meta}:view:<schema>:<view>` (the SELECT text and its columns) and
   `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
@@ -449,7 +485,7 @@ How SQL is executed:
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1) |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
 | `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
-| `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` (other patterns are checked by the driver) |
+| `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` on the prefix's tag, re-checked by the driver (other patterns are checked by the driver alone). RediSearch expands a prefix into at most `search-max-prefix-expansions` tags (200 by default, per shard) and silently ignores the rest, so the driver first runs the prefix query under `FT.PROFILE … LIMIT 0 1` (one more round trip, about 0.3 ms) and, unless every shard's profile reports no warning, checks the prefix on every row the rest of the WHERE clause selects instead. The server's configuration is never changed |
 | `col IN (…)`, `col IN (SELECT …)`, `col = a OR col = b` on an indexed column | Index union query (`(@c:[a a] \| @c:[b b])` or `@c:{a \| b}`), for up to 1,000 values. Above that (or on an unindexed column) the driver checks each row against a hash set of the values, built once per statement: always for `IN (SELECT …)`, and for a literal list of 16 or more constants when the column's type can't fail to compare with them (otherwise value by value, as `=` would) |
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `x op ANY / ALL (SELECT …)` | `= ANY` is `IN` and `<> ALL` is `NOT IN`, with the same index unions, hash sets and semi-joins. Other operators: an uncorrelated subquery runs once, and `<`, `<=`, `>`, `>=` compare with its smallest or largest value (when all the values are of one type class); otherwise each row is compared with every value |
@@ -468,8 +504,10 @@ How SQL is executed:
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
 Pushed down into the index: numeric range/equality predicates on indexed
-columns (`@c:[lo hi]`), string equality on indexed columns (`@c:{value}`),
-`ORDER BY` on indexed columns, `LIMIT/OFFSET`, and aggregates. A constant
+columns (`@c:[lo hi]`), string equality on indexed columns (`@c:{value}`,
+re-checked by the driver once the column holds a value the index trims,
+splits or cuts; see "Strings in the index" above), `ORDER BY` on indexed
+columns, `LIMIT/OFFSET`, and aggregates. A constant
 that doesn't fit the column's type exactly (`int_col > 1.5`, `numeric_col =
 1.249`, `date_col < TIMESTAMP '… 12:00:00'`) is pushed as an inclusive bound
 at its rounded value and re-checked by the driver.
@@ -478,7 +516,8 @@ Row values always come from the HASHes as stored, never from the index sort
 vectors: `LOAD @c` on a SORTABLE numeric attribute returns the sort vector's
 double printed with 12 significant digits, which would round 64-bit integers,
 timestamps, decimals and doubles. So the driver names the columns it needs
-(`LOAD n @__key @__rowid @c …`) only when each one is a string, a 16/32-bit
+(`LOAD n @__key @__rowid @c …`) only when each one is a string (unless the
+column may hold a NUL byte, at which the sort vector stops), a 16/32-bit
 integer, boolean, date or time, or not indexed, and otherwise uses `LOAD *`,
 which returns the HASH fields unchanged. Sorts run on aliases
 (`LOAD @c AS __sort0 SORTBY @__sort0`) so that on a cluster the coordinator
@@ -1190,7 +1229,7 @@ and 0.56 s on a 3-shard cluster (180,000 rows/s).
 | Correlated scalar subquery for each of 50 customers | 50 | 31 | 28 | 54 |
 | `UNION` of two indexed filters | 1,750 | 48 | 46 | 6 |
 | Fetch 10% of the rows (indexed range) | 10,000 | 50 | 68 | 4 |
-| `COUNT(*)` with `LIKE 'gi%'` (index prefix query) | 1 | 62 | 64 | 4 |
+| `COUNT(*)` with `LIKE 'gi%'` (index prefix query, profiled first) | 1 | 62 | 64 | 5 |
 | Filter on a non-indexed column (`notes LIKE '%x%'`) | 1 | 272 | 279 | 12 |
 | Unfiltered join + `GROUP BY` (hash join over all rows) | 6 | 345 | 358 | 16 |
 | `GROUP BY` with `AVG` of a `DOUBLE` (driver-side) | 6 | 463 | 522 | 12 |

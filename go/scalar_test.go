@@ -448,7 +448,7 @@ func TestScalarTrimKeywordColumns(t *testing.T) {
 func TestScalarPushdownPlan(t *testing.T) {
 	meta := &tableMeta{Schema: "public", Name: "t", Columns: []columnMeta{
 		{Name: "n", Type: typeInt64, Indexed: true},
-		{Name: "s", Type: typeString, Indexed: true},
+		{Name: "s", Type: typeString, Indexed: true, TagsChecked: true},
 		{Name: "amt", Type: decimalType(10, 2), Indexed: true},
 	}}
 	for _, c := range []struct {
@@ -460,7 +460,9 @@ func TestScalarPushdownPlan(t *testing.T) {
 		{"n = MOD(17, 5)", "@n:[2 2]", false},
 		{"s = LOWER(SUBSTRING('xABC' FROM 2))", "@s:{abc}", false},
 		{"s = TRIM(BOTH '*' FROM '**abc**')", "@s:{abc}", false},
-		{"s LIKE LEFT('abcdef', 2) || '%'", "@s:{ab*}", true}, // LIKE is always re-checked
+		// LIKE is always re-checked, and a prefix is pushed only once the
+		// server has profiled it (see tags.go).
+		{"s LIKE LEFT('abcdef', 2) || '%'", "*", true},
 		{"amt <= NULLIF(9.5, 0)", "@amt:[-inf 9.50]", false},
 		{"ROUND(amt) = 3", "*", true},
 		{"UPPER(s) = 'A'", "*", true},
