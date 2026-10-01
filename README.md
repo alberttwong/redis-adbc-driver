@@ -101,7 +101,10 @@ Requirements: Go 1.26+, a C toolchain (cgo), Docker, and
 
 Each [GitHub release](https://github.com/alberttwong/redis-adbc-driver/releases)
 also has prebuilt libraries for macOS (Apple Silicon) and Linux (x86-64 and
-arm64, glibc 2.34+). To use one instead of building, put it at the path
+arm64). The Linux libraries run on every Linux that
+[Redis Software supports](https://redis.io/docs/latest/operate/rs/references/supported-platforms/):
+RHEL 8 and 9 (and compatible distributions), Ubuntu 20.04 and later, and
+Amazon Linux 2023. To use one instead of building, put it at the path
 `make build` would create (`go/build/libadbc_driver_redis.dylib` or `.so`).
 
 **1. Start Redis 8.6 and build the driver**
@@ -966,22 +969,26 @@ docker compose --profile cluster up --detach --wait redis-cluster
 cd validation && REDIS_URI=redis://localhost:7001/0 uv run pytest -v tests/
 ```
 
-To build the Linux library on a Mac, build inside a Go container (cgo
-needs a Linux C toolchain). From `go`, for arm64; use `--platform
-linux/amd64` for x86-64, which Docker emulates and is much slower:
+To build the Linux library (on Linux or a Mac, with Docker), run
+`build-linux.sh` from `go` with `amd64` or `arm64`. It writes
+`build/linux-<arch>/libadbc_driver_redis.so`. A foreign architecture runs
+under emulation and is much slower.
 
 ```bash
-docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src -e CGO_ENABLED=1 golang:1.26-bookworm go build -buildmode=c-shared -tags driverlib -o build/linux-arm64/libadbc_driver_redis.so ./pkg
+./build-linux.sh arm64
 ```
 
-Built on Debian 12, the library needs glibc 2.34 or newer (Ubuntu 22.04+,
-Debian 12+, RHEL 9+).
+The script builds in an AlmaLinux 8 container, against glibc 2.28: the
+oldest glibc among the platforms Redis Software supports. So one library
+loads on all of them, and the script fails if it would need a newer glibc.
 
 Release binaries come from `.github/workflows/release.yml`. When a release is
 published, it builds the Linux (amd64, arm64) and macOS (arm64) libraries,
 runs the Go tests and the validation suite against Redis on both Linux
-builds (standalone and a 3-shard cluster), and attaches the tarballs and
-their `.sha256` files to the release. GitHub's macOS runners can't run the
+builds (standalone and a 3-shard cluster), and then runs the validation suite
+on each Linux tarball under Ubuntu 20.04, 22.04 and 24.04, AlmaLinux 8 and 9
+(RHEL 8 and 9), and Amazon Linux 2023. Only then does it attach the tarballs
+and their `.sha256` files to the release. GitHub's macOS runners can't run the
 Redis containers, so the macOS build is only checked to load and to pass the
 Go unit tests. To rebuild an existing release's assets, run the workflow
 by hand with its tag:
