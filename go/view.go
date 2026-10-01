@@ -325,6 +325,9 @@ func (e *executor) runCreateView(ctx context.Context, st *CreateViewStmt, numPar
 	e.cache.materializing[key] = true
 	defer delete(e.cache.materializing, key)
 	e.cache.usedTemp = false
+	// The body is only planned: its derived tables and CTEs aren't run (see
+	// empty.go).
+	defer e.planningOnly(true)()
 	err = e.isolated(home, true, func() error {
 		plan, err := e.planSelect(ctx, st.Select, nil)
 		if err != nil {
@@ -413,9 +416,11 @@ func (e *executor) viewRelation(ctx context.Context, v *viewMeta, alias string) 
 			}
 			return nil
 		}
-		rows, err := e.runSelect(ctx, plan, e.params)
-		if err != nil {
-			return err
+		var rows [][]Value
+		if !e.planOnly {
+			if rows, err = e.runSelect(ctx, plan, e.params); err != nil {
+				return err
+			}
 		}
 		out, err = memTable(v.Name, plan.columns(), rows, names)
 		return err

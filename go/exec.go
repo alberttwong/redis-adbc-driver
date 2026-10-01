@@ -49,6 +49,9 @@ type executor struct {
 	// returning is the RETURNING list of the INSERT, UPDATE, DELETE or
 	// MERGE being run (see returning.go).
 	returning *returning
+	// planOnly is set while planning queries whose rows are never read:
+	// derived tables, CTEs and views are planned but not run (see empty.go).
+	planOnly bool
 }
 
 // execResult is the outcome of one statement.
@@ -568,11 +571,26 @@ type selectPlan struct {
 	// grouping is set for a query with grouping sets (or GROUPING()): it
 	// runs over the combined groups of its sets (see grouping.go).
 	grouping *groupingPlan
+	// noRows is set when the query returns no rows whatever the tables
+	// hold (LIMIT 0, or a HAVING or QUALIFY that is never true); it then
+	// reads nothing (see empty.go).
+	noRows bool
 }
 
 // windowed reports whether the query computes window functions (or
 // filters with QUALIFY) before its ORDER BY and LIMIT.
 func (p *selectPlan) windowed() bool { return len(p.windows) > 0 || p.qualify != nil }
+
+// withoutFrom reports whether the query has no FROM clause.
+func (p *selectPlan) withoutFrom() bool {
+	switch {
+	case p.setop != nil:
+		return false
+	case p.grouping != nil:
+		return p.grouping.base.meta == nil
+	}
+	return p.meta == nil
+}
 
 func (p *selectPlan) columns() []resultColumn {
 	cols := make([]resultColumn, len(p.items))
@@ -593,6 +611,10 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		return nil, err
 	}
 	defer pop()
+	// A query that returns no rows runs nothing, and one whose WHERE is never
+	// true doesn't read its FROM items (see empty.go).
+	plan.noRows = (sel.Limit != nil && *sel.Limit == 0) || e.neverTrue(ctx, sel.Having) || e.neverTrue(ctx, sel.Qualify)
+	defer e.planningOnly(plan.noRows)()
 	if sel.SetOp != nil {
 		return e.planSetOp(ctx, sel, plan)
 	}
@@ -606,6 +628,8 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			return gp, nil
 		}
 	}
+	noInput := e.neverTrue(ctx, sel.Where)
+	fromOnly := e.planningOnly(noInput)
 	var types map[string]ColType
 	var rels []relation
 	var jp *joinPlan
@@ -639,6 +663,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			return nil, err
 		}
 	}
+	fromOnly()
 	itemStart := make([]int, len(sel.Items))
 	for i, it := range sel.Items {
 		itemStart[i] = len(plan.items)
@@ -741,7 +766,10 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if containsWindow(sel.Where) {
 			return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in WHERE; filter on them with QUALIFY or in an outer query")
 		}
-		if err := e.bind(ctx, sel.Where); err != nil {
+		restore := e.planningOnly(noInput)
+		err := e.bind(ctx, sel.Where)
+		restore()
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -1009,6 +1037,11 @@ func (e *executor) selectWithoutTable(ctx context.Context, plan *selectPlan, par
 	if plan.aggregate {
 		return nil, errorf(adbc.StatusNotImplemented, "aggregates require a FROM clause")
 	}
+	if plan.noRows || e.neverTrue(ctx, plan.sel.Where) {
+		// Nothing to compute: its subqueries were only planned (see
+		// empty.go).
+		return nil, nil
+	}
 	env := e.newEnv(ctx, nil, params)
 	if plan.sel.Where != nil {
 		ok, err := env.eval(plan.sel.Where)
@@ -1165,6 +1198,9 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 	if len(st.From) > 0 {
 		return e.runUpdateFrom(ctx, st, params)
 	}
+	// With a WHERE that is never true, no row is read, and the subqueries of
+	// the statement are only planned (see empty.go).
+	defer e.planningOnly(e.neverTrue(ctx, st.Where))()
 	meta, err := e.loadTable(ctx, st.Table)
 	if err != nil {
 		return 0, err
@@ -1230,6 +1266,7 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 	if len(st.Using) > 0 {
 		return e.runDeleteUsing(ctx, st, params)
 	}
+	defer e.planningOnly(e.neverTrue(ctx, st.Where))() // as in runUpdate
 	meta, err := e.loadTable(ctx, st.Table)
 	if err != nil {
 		return 0, err

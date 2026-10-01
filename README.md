@@ -483,6 +483,7 @@ How SQL is executed:
 | Query shape | Execution |
 |-|-|
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
+| Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables and columns are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1) |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
@@ -492,7 +493,7 @@ How SQL is executed:
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated `[NOT] EXISTS` / `[NOT] IN` over one table, CTE or derived table, whose only references to the outer query are `inner = outer` conditions in its WHERE: a hash semi-join (anti-join for `NOT`), which runs the subquery once without those conditions. A small inner side (≤ 1,000 rows, counted by the index) is read first, and then `EXISTS` / `IN` also filter the outer table in its index (nothing matches if the subquery has no rows; a union of ≤ 1,000 keys on an indexed outer column); a larger one is read only once running per outer row has cost about as much. Other correlated subqueries: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `x op ANY / ALL (SELECT …)` | `= ANY` is `IN` and `<> ALL` is `NOT IN`, with the same index unions, hash sets and semi-joins. Other operators: an uncorrelated subquery runs once, and `<`, `<=`, `>`, `>=` compare with its smallest or largest value (when all the values are of one type class); otherwise each row is compared with every value |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
-| CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| CTEs, derived tables | Run once, unless the query that reads them can't return rows (see above); the outer query filters, sorts and groups them in memory |
 | `WITH RECURSIVE` | Working-table iteration in memory: the non-recursive term runs once, then the recursive term runs against the rows the last iteration added (its joins with tables still use their indexes, such as an index lookup join on the new rows' keys) until it adds none. `UNION` drops rows produced before. At most 10,000 iterations and 1,000,000 rows. With `SEARCH` / `CYCLE`, the recursive term runs once per row of the working table, to know each row's parent |
 | `LATERAL`, `GENERATE_SERIES` | Join items computed while the join runs. One that reads earlier FROM items runs for each row joined so far (a `LATERAL` subquery memoised on the values it reads, like a correlated subquery); otherwise it runs once and is joined like a derived table. A join with such an item keeps its written order. `GENERATE_SERIES` makes its rows in memory, at most 1,000,000 per call |
 | `SELECT DISTINCT` | Over plain expressions it is the same as `GROUP BY` them, so it runs in the index (`FT.AGGREGATE … GROUPBY`) when they're indexed columns. Otherwise (stars, aggregates, window functions, `DISTINCT ON`) the driver removes duplicate rows after the rest of the query, NULLs counting as equal. `LIMIT` / `OFFSET` apply afterwards and never run in the index. As in Postgres, `ORDER BY` must use the select list, and `DISTINCT ON` keys must match the leading `ORDER BY` expressions |
@@ -501,7 +502,7 @@ How SQL is executed:
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
 | Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
-| Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING` |
+| Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING`. An item whose `ON` can never be true (`ON false`), or that has no rows, isn't read when that settles the result: an inner join is then empty and reads no item, a `LEFT JOIN` keeps the left rows with NULLs for the item, and a `RIGHT JOIN` returns the item's rows without reading the items before it |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
 
@@ -801,7 +802,7 @@ field, even if later rows have it.
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item |
   NATURAL [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item}
   [WHERE …] [GROUP BY …] [HAVING …] [WINDOW w AS (…), …] [QUALIFY …]
-  [ORDER BY …] [LIMIT n] [OFFSET m]`,
+  [ORDER BY …] [LIMIT n] [OFFSET m [ROW | ROWS]] [FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY]`,
   where an item is a table, a CTE, `[LATERAL] (SELECT …)` or
   `[LATERAL] GENERATE_SERIES(…)`, each with an optional alias and column
   aliases (`AS a(x, y)`; `t.col` qualifies a column, and `t.*` selects one
@@ -813,6 +814,14 @@ field, even if later rows have it.
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
   `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
   returns NULL if either side is NULL), `from_hex`
+- `FETCH FIRST n ROWS ONLY` is `LIMIT n` (`FETCH FIRST ROW ONLY` is `LIMIT
+  1`); `WITH TIES` is not supported, and a query has at most one `LIMIT` or
+  `FETCH` (Postgres's "multiple LIMIT clauses not allowed")
+- A query that can't return rows (`WHERE false`, `LIMIT 0`, …; see "How SQL
+  is executed") reads none. Errors the driver raises only when it computes
+  a value on a row (division by zero, a failed cast, an unknown function or
+  a wrong argument count for most functions) are then not raised, as on an
+  empty table: `SELECT 1/0 FROM t WHERE false` returns no rows
 - `GROUP BY` items are expressions, output positions or aliases, and also
   (as in Postgres) `ROLLUP (…)`, `CUBE (…)`, `GROUPING SETS (…)` and `()`:
   - `ROLLUP (a, b)` is the grouping sets `(a, b), (a), ()`, and `CUBE (a, b)`
@@ -1378,6 +1387,14 @@ What drives the numbers:
   the index then rules out every row. Without the hash set, each row was
   compared with every value (23 s), and without the semi-join the subquery
   ran once per outer row (100,000 `FT.AGGREGATE` commands, 22–23 s).
+- **Queries that can't return rows read nothing**, only the tables'
+  metadata. On a table of 152,686 rows (measured separately, best of 3,
+  standalone), dbt's `select * from (<model>) as __dbt_sbq where false
+  limit 0` over a model with two `GROUP BY`s and a join takes 1.2 ms, and
+  the model's `dbt run --empty` form (each ref read as `(select * from t
+  where false limit 0)`) 1.0 ms. Up to v0.0.6 they ran in full, in 1.0 s
+  (as long as the model itself) and 2.7 s; `select * from t where false
+  limit 0` took 1.4 s, and now 0.5 ms.
 
 Known ways to make the slow cases faster (not done yet):
 

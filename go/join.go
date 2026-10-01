@@ -89,11 +89,20 @@ func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, [
 	jp := &joinPlan{}
 	first := JoinClause{Table: sel.From, Select: sel.FromSelect, Func: sel.FromFunc, Lateral: sel.FromLateral,
 		Alias: sel.FromAlias, Columns: sel.FromColumns}
-	if err := e.addFromItem(ctx, jp, first); err != nil {
-		return nil, nil, nil, err
+	items := append([]JoinClause{first}, sel.Joins...)
+	// Items that can't change the result, given the ON conditions that are
+	// never true, are only planned (see joinReads).
+	kinds := make([]string, len(items))
+	never := make([]bool, len(items))
+	for i, jc := range sel.Joins {
+		kinds[i+1], never[i+1] = jc.Kind, e.neverTrue(ctx, jc.On)
 	}
-	for _, jc := range sel.Joins {
-		if err := e.addFromItem(ctx, jp, jc); err != nil {
+	read, _ := joinReads(kinds, never, make([]bool, len(items)))
+	for i, jc := range items {
+		restore := e.planningOnly(!read[i])
+		err := e.addFromItem(ctx, jp, jc)
+		restore()
+		if err != nil {
 			return nil, nil, nil, err
 		}
 	}
@@ -109,10 +118,13 @@ func (e *executor) addJoinItem(ctx context.Context, jp *joinPlan, kind string, t
 		return err
 	}
 	if meta.view != nil {
-		// Joins read each item fully; compute the view now.
-		rows, err := e.runView(ctx, meta.view, nil, nil, e.params)
-		if err != nil {
-			return err
+		// Joins read each item fully; compute the view now (unless only
+		// planning).
+		var rows []map[string]Value
+		if !e.planOnly {
+			if rows, err = e.runView(ctx, meta.view, nil, nil, e.params); err != nil {
+				return err
+			}
 		}
 		m := *meta
 		m.view, m.mem = nil, rows
@@ -418,6 +430,7 @@ func (e *executor) joinOrder(ctx context.Context, jp *joinPlan, wps []wherePlan)
 		switch {
 		case it.base.isMem:
 			counts[i] = int64(len(it.base.mem))
+		case wps[i].none:
 		case wps[i].keys != nil:
 			counts[i] = int64(len(wps[i].keys))
 		default:
@@ -527,16 +540,39 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 	}
 	env := e.newEnv(ctx, types, params)
 
+	// Items that can't change the result aren't read (see joinReads): those
+	// left out by ON conditions that are never true and by in-memory items
+	// without rows, then also by items whose own filters match nothing.
+	kinds := make([]string, len(jp.items))
+	never := make([]bool, len(jp.items))
+	empty := make([]bool, len(jp.items))
+	for i, it := range jp.items {
+		kinds[i], never[i] = it.kind, i > 0 && e.neverTrue(ctx, it.on)
+		empty[i] = it.lateral == nil && it.base.isMem && it.base.view == nil && it.base.join == nil && len(it.base.mem) == 0
+	}
+	read, none := joinReads(kinds, never, empty)
+	if none {
+		return nil, nil
+	}
+
 	// Each item's own filters, pushed into its scan.
 	views := make([]*tableMeta, len(jp.items))
 	wps := make([]wherePlan, len(jp.items))
 	for i, it := range jp.items {
 		views[i] = it.view()
+		if !read[i] {
+			wps[i] = wherePlan{query: "*"}
+			continue
+		}
 		wp, err := e.planWhere(ctx, andAll(it.pushed), views[i], params)
 		if err != nil {
 			return nil, err
 		}
 		wps[i] = wp
+		empty[i] = empty[i] || wp.none
+	}
+	if read, none = joinReads(kinds, never, empty); none {
+		return nil, nil
 	}
 	steps, err := e.joinOrder(ctx, jp, wps)
 	if err != nil {
@@ -569,6 +605,19 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 			filters = append(filters, c)
 		}
 		avail[i] = true
+		if !read[i] {
+			// The item can't change the result: a LEFT or FULL item adds
+			// nothing to the rows joined so far, and otherwise those rows
+			// are replaced later.
+			if st.kind == "LEFT" || st.kind == "FULL" {
+				if err := jp.fillMerged(env, i, left); err != nil {
+					return nil, err
+				}
+			} else {
+				left = nil
+			}
+			continue
+		}
 
 		itemNeed := map[string]bool{}
 		for c := range allNeed {
@@ -631,9 +680,12 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 					continue
 				}
 				if q, ok := unionQuery(cm, values); ok {
-					if wp.query == "*" {
+					switch {
+					case q == noMatchQuery:
+						wp.none = true // no key of the left rows can match
+					case wp.query == "*":
 						wp.query = q
-					} else {
+					default:
 						wp.query += " " + q
 					}
 				}

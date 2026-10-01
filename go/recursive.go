@@ -149,6 +149,10 @@ func (e *executor) materializeRecursive(ctx context.Context, def *CTE, rc *recur
 		return rows, nil
 	}
 	var result [][]Value
+	if e.planOnly {
+		// Only the columns are wanted (see empty.go).
+		return e.recursiveResult(def, cols, tr, nil)
+	}
 	seen := map[string]bool{}
 	// add appends rows to the result (for UNION, those not in it yet) and
 	// returns their positions. With a tracer, traceOf gives their traces,
@@ -243,6 +247,12 @@ func (e *executor) materializeRecursive(ctx context.Context, def *CTE, rc *recur
 		}
 		work = next
 	}
+	return e.recursiveResult(def, cols, tr, result)
+}
+
+// recursiveResult is the relation of a recursive CTE with the given rows,
+// with the columns of its SEARCH and CYCLE clauses if it has a tracer.
+func (e *executor) recursiveResult(def *CTE, cols []resultColumn, tr *tracer, result [][]Value) (*tableMeta, error) {
 	if tr != nil {
 		names := slices.Clone(def.Columns)
 		if names == nil {

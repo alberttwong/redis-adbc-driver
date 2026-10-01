@@ -144,6 +144,9 @@ func (e *executor) infoSchemaTable(ctx context.Context, name string) (*tableMeta
 	if !ok {
 		return nil, tableNotFound(infoSchema, name)
 	}
+	if e.planOnly {
+		return memTable(key, cols, nil, nil) // only its columns are wanted (see empty.go)
+	}
 	schemas, err := e.store.listSchemas(ctx)
 	if err != nil {
 		return nil, err
