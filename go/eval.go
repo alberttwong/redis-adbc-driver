@@ -70,6 +70,7 @@ func walkExpr(e Expr, fn func(Expr)) {
 		walkExpr(x.X, fn)
 	case *Cast:
 		walkExpr(x.X, fn)
+		walkExpr(x.OnError, fn)
 	case *Func:
 		for _, a := range x.Args {
 			walkExpr(a, fn)
@@ -113,6 +114,7 @@ func walkOutsideAggregates(e Expr, fn func(Expr)) {
 		walkOutsideAggregates(x.X, fn)
 	case *Cast:
 		walkOutsideAggregates(x.X, fn)
+		walkOutsideAggregates(x.OnError, fn)
 	case *Func:
 		for _, a := range x.Args {
 			walkOutsideAggregates(a, fn)
@@ -178,7 +180,18 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return Coerce(v, x.T)
+		c, err := Coerce(v, x.T)
+		if err != nil && x.OnError != nil && castable(v.T, x.T) {
+			// TRY_CAST and DEFAULT … ON CONVERSION ERROR: a value that
+			// cannot be converted gives the fallback, but types that never
+			// convert (DATE to BOOLEAN) are still an error.
+			d, err := env.eval(x.OnError)
+			if err != nil {
+				return Value{}, err
+			}
+			return Coerce(d, x.T)
+		}
+		return c, err
 	case *IsNull:
 		v, err := env.eval(x.X)
 		if err != nil {

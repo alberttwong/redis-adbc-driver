@@ -323,7 +323,7 @@ func replaceAliases(e Expr, aliases map[string]Expr, meta *tableMeta) Expr {
 	case *IsNull:
 		return &IsNull{X: replaceAliases(x.X, aliases, meta), Not: x.Not}
 	case *Cast:
-		return &Cast{X: replaceAliases(x.X, aliases, meta), T: x.T}
+		return &Cast{X: replaceAliases(x.X, aliases, meta), T: x.T, OnError: replaceAliases(x.OnError, aliases, meta)}
 	case *Func:
 		if aggregateFuncs[x.Name] {
 			return x

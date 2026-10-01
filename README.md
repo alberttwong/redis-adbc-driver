@@ -531,7 +531,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   alias (`t.col` qualifies a column, and `t.*` selects one item's columns,
   also as `schema.table.*`),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
-  `CAST(x AS type)` / `x::type`, `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
+  `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`), subqueries (scalar `(SELECT …)`, `EXISTS`,
   `[NOT] IN (SELECT …)`, correlated or not, in SELECT/WHERE/HAVING and in
   `UPDATE`/`DELETE`/`MERGE`),
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
@@ -574,6 +574,13 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   - As in `ORDER BY`, NULLs sort last by default in either direction
     (PostgreSQL puts them first for `DESC`). Rows that tie on the window's
     `ORDER BY` keep their input order
+- Casts: `CAST(x AS type)` and `x::type` fail on a value that doesn't
+  convert (text that doesn't parse, a value out of the type's range,
+  overflow). `TRY_CAST(x AS type)` and `SAFE_CAST(x AS type)` return NULL
+  for it instead, and `CAST(x AS type DEFAULT v ON CONVERSION ERROR)` returns
+  `v` (converted to the type). The result has the target type. An error
+  while computing `x`, and a cast between types that never convert (`DATE`
+  to `BOOLEAN`), are still errors
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
   negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD`,
   `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,

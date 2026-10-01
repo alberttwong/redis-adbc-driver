@@ -90,9 +90,14 @@ type IsNull struct {
 	X   Expr
 	Not bool
 }
+
+// Cast is CAST(x AS t) or x::t. OnError, if set, is the result when the
+// value cannot be converted: NULL for TRY_CAST and SAFE_CAST, v for
+// CAST(x AS t DEFAULT v ON CONVERSION ERROR).
 type Cast struct {
-	X Expr
-	T ColType
+	X       Expr
+	T       ColType
+	OnError Expr
 }
 
 // Case is CASE [operand] WHEN … THEN … [ELSE …] END. With an operand, each
@@ -2459,7 +2464,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				return &Subquery{Select: sub, Kind: SubqueryExists}, nil
 			}
-		case "CAST", "TRY_CAST":
+		case "CAST", "TRY_CAST", "SAFE_CAST":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
 				x, err := p.parseExpr()
@@ -2473,6 +2478,18 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
+				var onError Expr
+				if upper != "CAST" {
+					onError = &Literal{V: nullValue(typeNull)}
+				} else if p.acceptKeyword("DEFAULT") {
+					// CAST(x AS t DEFAULT v ON CONVERSION ERROR), as in Oracle.
+					if onError, err = p.parseExpr(); err != nil {
+						return nil, err
+					}
+					if err := p.expectKeyword("ON", "CONVERSION", "ERROR"); err != nil {
+						return nil, err
+					}
+				}
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
 				}
@@ -2480,7 +2497,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err != nil {
 					return nil, &sqlError{msg: err.Error()}
 				}
-				return &Cast{X: x, T: ct}, nil
+				return &Cast{X: x, T: ct, OnError: onError}, nil
 			}
 		case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "DATETIME":
 			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...'
