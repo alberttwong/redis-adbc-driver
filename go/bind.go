@@ -56,6 +56,7 @@ type scope struct {
 type execCache struct {
 	sub           map[*Subquery][][]Value
 	inSets        map[*Subquery]*inSet
+	inLists       map[*Binary]*inList // nil: evaluate the OR chain as written
 	memo          map[*Subquery]map[string][][]Value
 	semi          map[*Subquery]*semiResult
 	ctes          map[*CTE]*tableMeta
@@ -69,6 +70,7 @@ func newExecCache() *execCache {
 	return &execCache{
 		sub:           map[*Subquery][][]Value{},
 		inSets:        map[*Subquery]*inSet{},
+		inLists:       map[*Binary]*inList{},
 		memo:          map[*Subquery]map[string][][]Value{},
 		semi:          map[*Subquery]*semiResult{},
 		ctes:          map[*CTE]*tableMeta{},
