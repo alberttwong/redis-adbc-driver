@@ -14,7 +14,8 @@
 
 # Builds the driver library for Linux (amd64, arm64) and macOS (arm64),
 # tests the Linux builds against Redis (standalone and a 3-shard cluster),
-# and attaches the tarballs to the release.
+# runs the validation suite on each Linux tarball on every distribution
+# Redis Software supports, and attaches the tarballs to the release.
 #
 # Runs when a release is published, or by hand for an existing release tag
 # (its assets are replaced). Pull requests that change this file run the
@@ -32,6 +33,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - go/build-linux.sh
 
 permissions:
   contents: read
@@ -61,19 +63,14 @@ jobs:
         with:
           ref: ${{ env.REF }}
 
-      # Built against Debian 12's glibc, so the library runs on any
-      # distribution with glibc 2.34 or newer (Ubuntu 22.04+, RHEL 9+).
+      # Built on AlmaLinux 8 against glibc 2.28 (checked), so the library
+      # loads on RHEL 8 and 9, Ubuntu 20.04 and later, and Amazon Linux 2023.
       - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod -e CGO_ENABLED=1 \
-            -v "$PWD/go:/src" -w /src golang:1.26-bookworm \
-            go build -buildmode=c-shared -tags driverlib \
-              -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=$VERSION" \
-              -o build/libadbc_driver_redis.so ./pkg
-          glibc=$(objdump -T go/build/libadbc_driver_redis.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-          echo "requires $glibc"
-          test "$(printf '%s\n' "$glibc" GLIBC_2.34 | sort -V | tail -1)" = GLIBC_2.34
+          ./go/build-linux.sh "$ARCH" "$VERSION"
+          cp "go/build/linux-$ARCH"/* go/build/
 
       - uses: actions/setup-go@v7
         with:
@@ -120,6 +117,56 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/
 
+  # The release tarball, tested on each Linux that Redis Software supports
+  # (the linux job above already ran it on the Ubuntu 24.04 runner).
+  platforms:
+    name: ${{ matrix.image }} (${{ matrix.arch }})
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        image: ["ubuntu:20.04", "ubuntu:22.04", "almalinux:8", "almalinux:9", "amazonlinux:2023"]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Start Redis
+        working-directory: go
+        run: docker compose up --detach --wait redis
+
+      - name: Validation suite
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          tar xzf "dist/adbc_driver_redis-$VERSION-linux-$ARCH.tar.gz" -C dist
+          docker run --rm --network host \
+            -v "$PWD/go/validation:/src/validation:ro" \
+            -v "$PWD/dist/adbc_driver_redis-$VERSION-linux-$ARCH:/lib-in:ro" \
+            -v "$(dirname "$(command -v uv)"):/uv:ro" \
+            -e REDIS_URI=redis://localhost:6379/0 "$IMAGE" sh -euc '
+              if command -v apt-get >/dev/null; then
+                apt-get -qq update
+                DEBIAN_FRONTEND=noninteractive apt-get -qq install -y git ca-certificates >/dev/null
+              else
+                dnf -q -y install git >/dev/null
+              fi
+              grep PRETTY_NAME /etc/os-release
+              ldd --version | head -1
+              mkdir -p /work/go/build
+              cp -r /src/validation /work/go/
+              cp /lib-in/libadbc_driver_redis.so /work/go/build/
+              cd /work/go/validation
+              /uv/uv run -q pytest -q tests/'
+
   # GitHub's macOS runners can't run the Redis containers, so the macOS
   # library is built and checked to load; the Go unit tests run without a
   # server (integration tests skip).
@@ -163,7 +210,7 @@ jobs:
 
   upload:
     if: github.event_name != 'pull_request'
-    needs: [linux, macos]
+    needs: [linux, platforms, macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
