@@ -1836,6 +1836,32 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "CASE":
 			p.pos++
 			return p.parseCase()
+		case "CURRENT_DATE", "CURRENT_TIMESTAMP", "CURRENT_TIME", "LOCALTIMESTAMP", "LOCALTIME":
+			// SQL-standard niladic functions (no parentheses needed).
+			if !(p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(") {
+				p.pos++
+				return &Func{Name: upper}, nil
+			}
+		case "EXTRACT":
+			// EXTRACT(field FROM expr) is DATE_PART('field', expr).
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				ft := p.next()
+				if ft.kind != tokIdent && ft.kind != tokString && ft.kind != tokQuotedIdent {
+					return nil, syntaxErr("expected a field name in EXTRACT near %q", ft.text)
+				}
+				if err := p.expectKeyword("FROM"); err != nil {
+					return nil, err
+				}
+				x, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				return &Func{Name: "DATE_PART", Args: []Expr{&Literal{V: stringValue(strings.ToLower(ft.text))}, x}}, nil
+			}
 		case "EXISTS":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
