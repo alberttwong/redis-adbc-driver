@@ -50,13 +50,32 @@ func (e *executor) runAlter(ctx context.Context, st *AlterTableStmt) error {
 	if err != nil {
 		return err
 	}
+	isView, err := e.store.viewExists(ctx, schema, name)
+	if err != nil {
+		return err
+	}
+	if isView {
+		// As in Postgres, ALTER TABLE … RENAME TO also renames a view.
+		if st.Action != AlterRenameTable {
+			return errorf(adbc.StatusInvalidArgument, "%q.%q is a view; ALTER TABLE on a view supports only RENAME TO", schema, name)
+		}
+		return e.store.renameView(ctx, schema, name, st.NewTable)
+	}
 	meta, err := e.store.getTable(ctx, schema, name)
 	if err != nil {
 		var ae adbc.Error
-		if st.IfExists && asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
-			return nil
+		if asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
+			if st.IfExists {
+				return nil
+			}
+			if st.View {
+				return viewNotFound(schema, name)
+			}
 		}
 		return err
+	}
+	if st.View {
+		return errorf(adbc.StatusInvalidArgument, "%q.%q is a table, not a view; use ALTER TABLE", schema, name)
 	}
 	switch st.Action {
 	case AlterRenameTable:

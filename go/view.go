@@ -118,6 +118,67 @@ func (s *store) dropView(ctx context.Context, schema, name string, ifExists bool
 	return nil
 }
 
+// renameView renames a view within its schema. Its stored SELECT is
+// unchanged; other views that read it by the old name stop working, as they
+// do when a table is renamed. All keys are in the {meta} hash slot, so the
+// check and the rename are one transaction even on a cluster.
+func (s *store) renameView(ctx context.Context, schema, name string, to TableName) error {
+	if to.Catalog != "" && to.Catalog != catalogName {
+		return errorf(adbc.StatusInvalidArgument, "catalog %q does not exist", to.Catalog)
+	}
+	if to.Schema != "" && to.Schema != schema {
+		return errorf(adbc.StatusNotImplemented, "RENAME TO cannot move a view to another schema")
+	}
+	newName := to.Name
+	if newName == name {
+		return nil
+	}
+	oldKey, newKey, tableKey := viewKey(schema, name), viewKey(schema, newName), metaKey(schema, newName)
+	for attempt := 0; attempt < 20; attempt++ {
+		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			raw, err := tx.Get(ctx, oldKey).Result()
+			if errors.Is(err, goredis.Nil) {
+				return viewNotFound(schema, name)
+			}
+			if err != nil {
+				return err
+			}
+			var v viewMeta
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				return errorf(adbc.StatusInternal, "corrupt metadata for view %q.%q: %v", schema, name, err)
+			}
+			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {
+				return err
+			} else if n > 0 {
+				return errorf(adbc.StatusAlreadyExists, "view %q.%q already exists", schema, newName)
+			}
+			if n, err := tx.Exists(ctx, tableKey).Result(); err != nil {
+				return err
+			} else if n > 0 {
+				return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a table", schema, newName)
+			}
+			v.Name = newName
+			out, err := json.Marshal(&v)
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Set(ctx, newKey, out, 0)
+				p.Del(ctx, oldKey)
+				p.SRem(ctx, viewsKey(schema), name)
+				p.SAdd(ctx, viewsKey(schema), newName)
+				return nil
+			})
+			return err
+		}, oldKey, newKey, tableKey)
+		if errors.Is(err, goredis.TxFailedErr) {
+			continue // concurrent change: retry
+		}
+		return wrapRedis(err, "failed to rename view")
+	}
+	return errorf(adbc.StatusIO, "view %q.%q is being changed concurrently; try again", schema, name)
+}
+
 func (s *store) listViews(ctx context.Context, schema string) ([]string, error) {
 	members, err := s.client.SMembers(ctx, viewsKey(schema)).Result()
 	if err != nil {
