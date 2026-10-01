@@ -151,21 +151,50 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 		case *Func:
 			// A window call's own *Func is not visited, so this is a call
 			// without OVER.
-			if windowOnlyFuncs[v.Name] {
-				err = errorf(adbc.StatusInvalidArgument, "window function %s requires an OVER clause", v.Name)
-			}
-			if v.Name == "MERGE_ACTION" {
+			err = e.bindCall(ctx, v, nil)
+			if err == nil && v.Name == "MERGE_ACTION" {
 				err = e.checkMergeAction(v)
 			}
-			if v.Name == "GENERATE_SERIES" {
-				err = errorf(adbc.StatusNotImplemented, "generate_series is only supported in FROM (SELECT … FROM generate_series(…) AS g)")
-			}
-			if err == nil {
-				err = checkCall(v)
-			}
+		case *WindowFunc:
+			err = e.bindCall(ctx, v.Func, v)
 		}
 	})
 	return err
+}
+
+// bindCall resolves a call while it is bound (resolveCall in funcs.go); w is
+// its OVER, if any. A call is visited before its arguments, so when it is
+// wrong its arguments are bound first: as in Postgres, an unknown column or
+// function in an argument is reported before the call's own error, and the
+// argument types of an unknown function are known.
+func (e *executor) bindCall(ctx context.Context, f *Func, w *WindowFunc) error {
+	err := resolveCall(f, w != nil)
+	if err == nil {
+		return nil
+	}
+	for _, a := range callArgs(f, w) {
+		if aerr := e.bind(ctx, a); aerr != nil {
+			return aerr
+		}
+	}
+	if err == errUnknownFunction {
+		return noSuchFunction(f.Name, f.Star, inferArgTypes(f.Args, e.scopeTypes(), e.paramTypes))
+	}
+	return err
+}
+
+// scopeTypes returns the types of the columns of the innermost scope, by
+// the names column references resolve to.
+func (e *executor) scopeTypes() map[string]ColType {
+	types := map[string]ColType{}
+	if n := len(e.scopes); n > 0 {
+		for _, rel := range e.scopes[n-1].rels {
+			for _, c := range rel.meta.Columns {
+				types[rel.prefix+c.Name] = c.Type
+			}
+		}
+	}
+	return types
 }
 
 func (e *executor) resolveColumn(c *ColumnRef) error {

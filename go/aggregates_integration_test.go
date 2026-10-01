@@ -104,8 +104,8 @@ func TestSQLAggStringAgg(t *testing.T) {
 		"5|z|x-z-z|zz", "6|z,z|z-z|z", "7|NULL|z|NULL")
 
 	// Errors.
-	h.expectError(`SELECT STRING_AGG(k) FROM it_agg`, "STRING_AGG expects two arguments")
-	h.expectError(`SELECT LISTAGG(k, ',', ';') FROM it_agg`, "LISTAGG expects one or two arguments")
+	h.expectError(`SELECT STRING_AGG(k) FROM it_agg`, "STRING_AGG expects 2 arguments")
+	h.expectError(`SELECT LISTAGG(k, ',', ';') FROM it_agg`, "LISTAGG expects 1 or 2 arguments")
 	h.expectError(`SELECT STRING_AGG(DISTINCT k, ',' ORDER BY id) FROM it_agg`,
 		"in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
 	h.expectError(`SELECT STRING_AGG(k, ',' ORDER BY id) WITHIN GROUP (ORDER BY id) FROM it_agg`,
@@ -157,11 +157,11 @@ func TestSQLAggBoolAnyValueCountDistinct(t *testing.T) {
 		"1|x", "2|y", "3|x", "4|x", "5|z", "6|z", "7|NULL")
 
 	// Errors.
-	h.expectError(`SELECT BOOL_OR(v) FROM it_agg`, "function BOOL_OR(INTEGER) does not exist")
-	h.expectError(`SELECT EVERY(k) FROM it_agg GROUP BY g`, "function EVERY(VARCHAR) does not exist")
+	h.expectError(`SELECT BOOL_OR(v) FROM it_agg`, "function bool_or(integer) does not exist")
+	h.expectError(`SELECT EVERY(k) FROM it_agg GROUP BY g`, "function every(varchar) does not exist")
 	h.expectError(`SELECT COUNT(k, v) FROM it_agg`, "COUNT of more than one argument requires DISTINCT")
 	h.expectError(`SELECT COUNT(DISTINCT k, v) OVER () FROM it_agg`, "DISTINCT is not supported")
-	h.expectError(`SELECT ANY_VALUE(k, v) FROM it_agg`, "ANY_VALUE expects one argument")
+	h.expectError(`SELECT ANY_VALUE(k, v) FROM it_agg`, "ANY_VALUE expects 1 argument")
 	h.expectError(`SELECT SUM(SUM(v)) FROM it_agg`, "aggregate function calls cannot be nested")
 }
 
@@ -218,9 +218,9 @@ func TestSQLAggStatistics(t *testing.T) {
 		"7|NULL|0|NULL|0|NULL")
 
 	// Errors.
-	h.expectError(`SELECT STDDEV(k) FROM it_agg`, "function STDDEV(VARCHAR) does not exist")
-	h.expectError(`SELECT VAR_POP(b) FROM it_agg`, "function VAR_POP(BOOLEAN) does not exist")
-	h.expectError(`SELECT VARIANCE(*) FROM it_agg`, "VARIANCE expects one argument")
+	h.expectError(`SELECT STDDEV(k) FROM it_agg`, "function stddev(varchar) does not exist")
+	h.expectError(`SELECT VAR_POP(b) FROM it_agg`, "function var_pop(boolean) does not exist")
+	h.expectError(`SELECT VARIANCE(*) FROM it_agg`, "VARIANCE does not accept *")
 }
 
 func TestSQLAggOrderedSet(t *testing.T) {
@@ -274,8 +274,8 @@ func TestSQLAggOrderedSet(t *testing.T) {
 	h.expectError(`SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) OVER () FROM it_agg`,
 		"OVER is not supported for ordered-set aggregate PERCENTILE_CONT")
 	h.expectError(`SELECT MEDIAN(v) OVER () FROM it_agg`, "OVER is not supported for ordered-set aggregate MEDIAN")
-	h.expectError(`SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY k) FROM it_agg`, "function PERCENTILE_CONT(VARCHAR) does not exist")
-	h.expectError(`SELECT MEDIAN(d) FROM (SELECT DATE '2024-01-01' AS d) s`, "function MEDIAN(DATE) does not exist")
+	h.expectError(`SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY k) FROM it_agg`, "function percentile_cont(varchar) does not exist")
+	h.expectError(`SELECT MEDIAN(d) FROM (SELECT DATE '2024-01-01' AS d) s`, "function median(date) does not exist")
 	h.expectError(`SELECT PERCENTILE_DISC('x') WITHIN GROUP (ORDER BY v) FROM it_agg`, "the fraction of PERCENTILE_DISC must be a number")
 	h.expectError(`SELECT MODE(v) WITHIN GROUP (ORDER BY v) FROM it_agg`, "MODE expects no arguments")
 	h.expectError(`SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v, id) FROM it_agg`, "expects one ORDER BY expression")

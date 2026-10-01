@@ -42,28 +42,6 @@ import (
 	"unicode/utf8"
 )
 
-// scalarArity gives the minimum and maximum number of arguments of each
-// scalar function (-1: no maximum).
-var scalarArity = map[string][2]int{
-	"ROUND": {1, 2}, "TRUNC": {1, 2}, "FLOOR": {1, 1}, "CEIL": {1, 1}, "CEILING": {1, 1},
-	"MOD": {2, 2}, "POWER": {2, 2}, "POW": {2, 2}, "SQRT": {1, 1}, "LN": {1, 1},
-	"LOG": {1, 2}, "LOG10": {1, 1}, "EXP": {1, 1}, "SIGN": {1, 1}, "RANDOM": {0, 0},
-
-	"SUBSTRING": {2, 3}, "SUBSTR": {2, 3}, "LEFT": {2, 2}, "RIGHT": {2, 2}, "REPLACE": {3, 3},
-	"TRIM": {1, 2}, "BTRIM": {1, 2}, "LTRIM": {1, 2}, "RTRIM": {1, 2},
-	"POSITION": {2, 2}, "STRPOS": {2, 2}, "SPLIT_PART": {3, 3}, "LPAD": {2, 3}, "RPAD": {2, 3},
-	"REVERSE": {1, 1}, "REPEAT": {2, 2}, "INITCAP": {1, 1}, "MD5": {1, 1},
-	"REGEXP_REPLACE": {3, 6}, "STARTS_WITH": {2, 2},
-	"REGEXP_LIKE": {2, 3}, "REGEXP_COUNT": {2, 4}, "REGEXP_INSTR": {2, 7}, "REGEXP_SUBSTR": {2, 6},
-	"REGEXP_MATCH": {2, 3}, "~": {2, 2}, "~*": {2, 2}, "SIMILAR TO": {2, 3},
-
-	"NULLIF": {2, 2}, "GREATEST": {1, -1}, "LEAST": {1, -1}, "IIF": {3, 3},
-}
-
-// volatileFuncs return a different value on every call, so expressions
-// using them are never constants.
-var volatileFuncs = map[string]bool{"RANDOM": true}
-
 // hasVolatile reports whether an expression calls a volatile function.
 func hasVolatile(e Expr) bool {
 	found := false
@@ -75,26 +53,19 @@ func hasVolatile(e Expr) bool {
 	return found
 }
 
-// checkArity validates the argument count of a scalar function.
+// checkArity checks a call of a scalar function: its argument count, no *
+// or DISTINCT, and the JSON functions' own rules (checkJSONArgs). Binding
+// does this for every call (resolveCall); type inference and evaluation
+// check again for expressions that aren't bound.
 func checkArity(f *Func) error {
-	a, ok := scalarArity[f.Name]
-	if !ok {
-		return checkJSONArity(f)
+	d, ok := lookupFunc(f.Name)
+	if !ok || d.kind != scalarKind {
+		return nil
 	}
-	n := len(f.Args)
-	switch {
-	case f.Star || f.Distinct:
-		return fmt.Errorf("%s does not accept * or DISTINCT", f.Name)
-	case a[1] < 0 && n < a[0]:
-		return fmt.Errorf("%s expects at least %d argument(s)", f.Name, a[0])
-	case a[0] == a[1] && n != a[0]:
-		return fmt.Errorf("%s expects %d argument(s)", f.Name, a[0])
-	case a[1] > a[0]+1 && (n < a[0] || n > a[1]):
-		return fmt.Errorf("%s expects %d to %d arguments", f.Name, a[0], a[1])
-	case n < a[0] || (a[1] >= 0 && n > a[1]):
-		return fmt.Errorf("%s expects %d or %d arguments", f.Name, a[0], a[1])
+	if err := d.argsError(f); err != nil {
+		return err
 	}
-	return nil
+	return checkJSONArgs(f)
 }
 
 // maxStringLen bounds the results of LPAD, RPAD (characters) and REPEAT
@@ -130,7 +101,7 @@ func scalarFuncType(f *Func, args []ColType) (ColType, bool) {
 			return typeBinary, true
 		}
 		return typeString, true
-	case "LEFT", "RIGHT", "REPLACE", "TRIM", "BTRIM", "LTRIM", "RTRIM", "SPLIT_PART", "LPAD", "RPAD",
+	case "LEFT", "RIGHT", "REPLACE", "BTRIM", "LTRIM", "RTRIM", "SPLIT_PART", "LPAD", "RPAD",
 		"REVERSE", "REPEAT", "INITCAP", "MD5", "REGEXP_REPLACE":
 		return typeString, true
 	case "POSITION", "STRPOS":
@@ -352,16 +323,9 @@ func (env *evalEnv) evalIIF(f *Func) (Value, error) {
 	return env.eval(f.Args[2])
 }
 
-// evalScalarFunc evaluates a math or string function; ok is false if f is
-// not one. Arguments are non-NULL (NULLs are handled by the caller).
-func evalScalarFunc(f *Func, args []Value) (Value, bool, error) {
-	if _, ok := scalarArity[f.Name]; !ok {
-		return Value{}, false, nil
-	}
-	v, err := scalarFunc(f, args)
-	return v, true, err
-}
-
+// scalarFunc evaluates a math, string or regular-expression function
+// (implScalar in funcs.go). Arguments are non-NULL (NULLs are handled by the
+// caller).
 func scalarFunc(f *Func, args []Value) (Value, error) {
 	text := func(i int) string { return args[i].Text() }
 	switch f.Name {
@@ -445,7 +409,7 @@ func scalarFunc(f *Func, args []Value) (Value, error) {
 			return stringValue(s), nil
 		}
 		return stringValue(strings.ReplaceAll(s, from, text(2))), nil
-	case "TRIM", "BTRIM", "LTRIM", "RTRIM":
+	case "BTRIM", "LTRIM", "RTRIM":
 		chars := " "
 		if len(args) == 2 {
 			chars = text(1)

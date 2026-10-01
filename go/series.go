@@ -48,7 +48,8 @@ var maxSeriesRows = 1_000_000
 // returns its relation (one column, named after the column alias or the
 // table alias) and the column's type.
 func (e *executor) planTableFunc(ctx context.Context, f *Func, alias string, cols []string, sc *scope) (*tableMeta, ColType, error) {
-	if f.Name != "GENERATE_SERIES" {
+	d, ok := lookupFunc(f.Name)
+	if !ok || d.kind != tableKind {
 		return nil, ColType{}, errorf(adbc.StatusNotImplemented, "table function %s is not supported (only GENERATE_SERIES is)", strings.ToLower(f.Name))
 	}
 	if f.Star || f.Distinct {
@@ -80,6 +81,11 @@ func (e *executor) planTableFunc(ctx context.Context, f *Func, alias string, col
 		}
 		argTypes[i] = t
 	}
+	// As in an expression, the arguments are bound before the call's
+	// argument count is checked.
+	if err := d.argsError(f); err != nil {
+		return nil, ColType{}, err
+	}
 	t, err := seriesType(argTypes)
 	if err != nil {
 		return nil, ColType{}, err
@@ -98,13 +104,7 @@ func (e *executor) planTableFunc(ctx context.Context, f *Func, alias string, col
 // seriesType resolves GENERATE_SERIES's overload for its argument types and
 // returns the column type.
 func seriesType(args []ColType) (ColType, error) {
-	bad := func() (ColType, error) {
-		names := make([]string, len(args))
-		for i, a := range args {
-			names[i] = a.SQLName()
-		}
-		return ColType{}, errorf(adbc.StatusInvalidArgument, "function generate_series(%s) does not exist", strings.Join(names, ", "))
-	}
+	bad := func() (ColType, error) { return ColType{}, noSuchFunction("generate_series", false, args) }
 	if len(args) < 2 || len(args) > 3 {
 		return bad()
 	}

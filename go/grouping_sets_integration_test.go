@@ -301,7 +301,7 @@ func TestSQLGroupingFunction(t *testing.T) {
 		"aggregate function calls cannot be nested")
 	h.expectError(`SELECT GROUPING(id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id,
 		id, id, id, id, id, id, id, id) FROM it_gs_sales GROUP BY id`, "GROUPING must have fewer than 32 arguments")
-	h.expectError("SELECT GROUPING() FROM it_gs_sales GROUP BY ROLLUP (region)", "GROUPING expects one or more grouping expressions")
+	h.expectError("SELECT GROUPING() FROM it_gs_sales GROUP BY ROLLUP (region)", "GROUPING expects at least 1 argument")
 	h.expectError("SELECT GROUPING(region) OVER () FROM it_gs_sales GROUP BY ROLLUP (region)", "GROUPING is not a window function")
 }
 

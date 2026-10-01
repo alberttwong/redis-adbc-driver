@@ -404,7 +404,7 @@ func (e *executor) viewRelation(ctx context.Context, v *viewMeta, alias string) 
 	err = e.isolated(home, temp, func() error {
 		plan, err := e.planSelect(ctx, sel, nil)
 		if err != nil {
-			return errorf(adbc.StatusInvalidArgument, "view %q is no longer valid: %v", v.Name, err)
+			return errorf(adbc.StatusInvalidArgument, "view %q is no longer valid: %s", v.Name, errText(err))
 		}
 		if len(plan.items) != len(names) {
 			return errorf(adbc.StatusInvalidArgument, "view %q is no longer valid: its query now returns %d columns, not %d", v.Name, len(plan.items), len(names))

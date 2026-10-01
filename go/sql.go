@@ -153,6 +153,10 @@ type Func struct {
 	Nulls NullTreatment
 	// JSON holds the clauses of a SQL/JSON function (RETURNING, ON ERROR, …).
 	JSON *jsonClauses
+	// named is set for a call written as name(…), not built by the parser
+	// for an operator or a special form: it can't name an internal function
+	// (funcs.go).
+	named bool
 }
 
 // NullTreatment is the IGNORE NULLS / RESPECT NULLS of a function call.
@@ -3495,7 +3499,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		p.pos++
 		if p.acceptOp("(") {
-			f := &Func{Name: upper}
+			f := &Func{Name: upper, named: true}
 			if p.acceptOp("*") {
 				f.Star = true
 			} else if !p.isOp(")") {

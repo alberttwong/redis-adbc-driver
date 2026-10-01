@@ -353,7 +353,7 @@ func TestScalarFixesDateAddDiff(t *testing.T) {
 	h.expectError(`SELECT DATEADD(fortnight, 1, d) FROM it_sf_dates`, "fortnight")
 	h.expectError(`SELECT DATEADD(day, 'x', d) FROM it_sf_dates`, "DATEADD: the number of units must be an integer")
 	h.expectError(`SELECT DATEADD(day, 1, 5)`, "DATEADD expects a date, time or timestamp")
-	h.expectError(`SELECT DATEADD(day, 1)`, "DATEADD expects 3 argument(s)")
+	h.expectError(`SELECT DATEADD(day, 1)`, "DATEADD expects 3 arguments")
 	h.expectError(`SELECT DATEADD(year, 10000000, DATE '2024-01-01')`, "DATEADD: date out of range")
 	h.expectError(`SELECT DATEADD(day, 3000000000, DATE '2024-01-01')`, "DATEADD: interval out of range")
 	h.expectError(`SELECT DATEADD(year, 300000, TIMESTAMP '2024-01-01 00:00:00')`, "out of range")

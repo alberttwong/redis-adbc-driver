@@ -1849,7 +1849,7 @@ func TestSQLScalarFunctions(t *testing.T) {
 	h.expectError(`SELECT SUBSTRING(s, 1, -1) FROM it_fn`, "negative substring length not allowed")
 	h.expectError(`SELECT SPLIT_PART(code, '-', 0) FROM it_fn`, "field position must not be zero")
 	h.expectError(`SELECT ROUND(s) FROM it_fn WHERE id = 1`, "cannot convert")
-	h.expectError(`SELECT LEFT(s) FROM it_fn WHERE id > 100`, "LEFT expects 2 argument(s)")
+	h.expectError(`SELECT LEFT(s) FROM it_fn WHERE id > 100`, "LEFT expects 2 arguments")
 	h.expectError(`SELECT GREATEST(d, id) FROM it_fn`, "GREATEST types DATE and INTEGER cannot be matched")
 }
 
@@ -2300,7 +2300,7 @@ func TestSQLConcatNulls(t *testing.T) {
 	h.exec("CREATE TABLE it_concat_out AS SELECT id, CONCAT_WS('-', id, first, last) AS label FROM it_concat")
 	h.expectRows("SELECT label FROM it_concat_out ORDER BY id", "1-Ada-Lovelace", "2-Bo", "3")
 	h.expectRows("SELECT data_type FROM information_schema.columns WHERE table_name = 'it_concat_out' AND column_name = 'label'", "VARCHAR")
-	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects a separator")
+	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects at least 1 argument")
 }
 
 // setupWindows creates the window-function data set. By g, ordered by k
@@ -2774,11 +2774,11 @@ func TestSQLWindowErrors(t *testing.T) {
 	h.expectError(`SELECT LOWER(g) OVER () FROM it_win`, "not a window function")
 	h.expectError(`SELECT COUNT(DISTINCT g) OVER () FROM it_win`, "DISTINCT is not supported")
 	h.expectError(`SELECT ROW_NUMBER(id) OVER () FROM it_win`, "expects no arguments")
-	h.expectError(`SELECT NTILE() OVER () FROM it_win`, "expects one argument")
+	h.expectError(`SELECT NTILE() OVER () FROM it_win`, "NTILE expects 1 argument")
 	h.expectError(`SELECT NTILE(0) OVER () FROM it_win`, "greater than zero")
 	h.expectError(`SELECT NTH_VALUE(v, 0) OVER () FROM it_win`, "greater than zero")
 	h.expectError(`SELECT LAG(v, 'x') OVER () FROM it_win`, "must be an integer")
-	h.expectError(`SELECT SUM(*) OVER () FROM it_win`, "expects one argument")
+	h.expectError(`SELECT SUM(*) OVER () FROM it_win`, "SUM does not accept *")
 	h.expectError(`SELECT id, ROW_NUMBER() OVER (ORDER BY rn) AS rn FROM it_win`, "does not exist")
 
 	// Frames.

@@ -779,17 +779,12 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 }
 
 // evalDateTimeFunc evaluates a date/time function; ok is false if f is not
-// one. Arguments are non-NULL (NULLs are handled by the caller).
+// one. Arguments are non-NULL (NULLs are handled by the caller), and there
+// are as many as the registry allows (funcs.go).
 func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error) {
 	t, ok := dateTimeFuncType(f, argTypes(args))
 	if !ok {
 		return Value{}, false, nil
-	}
-	need := func(n int) error {
-		if len(args) != n {
-			return fmt.Errorf("%s expects %d argument(s)", f.Name, n)
-		}
-		return nil
 	}
 	intArg := func(v Value) (int, error) {
 		c, err := Coerce(v, typeInt64)
@@ -805,18 +800,12 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		// An optional precision argument is accepted and ignored.
 		return done(fromTime(env.now(), t))
 	case "DATE_PART":
-		if err := need(2); err != nil {
-			return done(Value{}, err)
-		}
 		if args[1].T.Kind == KindInterval {
 			return done(intervalPart(args[0].Text(), args[1]))
 		}
 		return done(datePart(args[0].Text(), args[1]))
 	case "__INTERVAL":
 		// INTERVAL n UNIT / INTERVAL 'n' UNIT
-		if err := need(2); err != nil {
-			return done(Value{}, err)
-		}
 		u, ok := intervalUnits[args[1].Text()]
 		if !ok {
 			return done(Value{}, fmt.Errorf("unknown interval unit %q", args[1].Text()))
@@ -829,9 +818,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		p.add(n.F, u)
 		return done(p.value())
 	case "AGE":
-		if len(args) != 1 && len(args) != 2 {
-			return done(Value{}, fmt.Errorf("AGE expects 1 or 2 arguments"))
-		}
 		var a, b time.Time
 		var err error
 		if len(args) == 1 {
@@ -849,9 +835,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		}
 		return done(age(a, b))
 	case "YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "DAYOFMONTH", "DAYOFYEAR", "HOUR", "MINUTE", "SECOND":
-		if err := need(1); err != nil {
-			return done(Value{}, err)
-		}
 		field := map[string]string{"DAYOFMONTH": "day", "DAYOFYEAR": "doy"}[f.Name]
 		if field == "" {
 			field = strings.ToLower(f.Name)
@@ -862,9 +845,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		}
 		return done(v, err)
 	case "EPOCH", "EPOCH_MS":
-		if err := need(1); err != nil {
-			return done(Value{}, err)
-		}
 		tm, err := toTime(args[0])
 		if err != nil {
 			return done(Value{}, err)
@@ -874,9 +854,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		}
 		return done(floatValue(typeFloat64, epochSeconds(args[0], tm)), nil)
 	case "DATE_TRUNC":
-		if err := need(2); err != nil {
-			return done(Value{}, err)
-		}
 		tm, err := toTime(args[1])
 		if err != nil {
 			return done(Value{}, err)
@@ -887,9 +864,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		}
 		return done(fromTime(tr, t))
 	case "DATE_DIFF", "DATEDIFF", "TIMESTAMPDIFF":
-		if err := need(3); err != nil {
-			return done(Value{}, err)
-		}
 		a, err := toTime(args[1])
 		if err != nil {
 			return done(Value{}, err)
@@ -905,27 +879,18 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		n, err := dateDiff(unit, a, b)
 		return done(intValue(typeInt64, n), err)
 	case "DATEADD", "DATE_ADD", "DATE_SUB", "TIMESTAMPADD":
-		if err := need(3); err != nil {
-			return done(Value{}, err)
-		}
 		sign := int64(1)
 		if f.Name == "DATE_SUB" {
 			sign = -1
 		}
 		return done(dateAdd(f.Name, args, sign, t))
 	case "LAST_DAY":
-		if err := need(1); err != nil {
-			return done(Value{}, err)
-		}
 		tm, err := toTime(args[0])
 		if err != nil {
 			return done(Value{}, err)
 		}
 		return done(fromTime(time.Date(tm.Year(), tm.Month()+1, 0, 0, 0, 0, 0, time.UTC), typeDate))
 	case "MAKE_DATE":
-		if err := need(3); err != nil {
-			return done(Value{}, err)
-		}
 		var ymd [3]int
 		for i := range ymd {
 			n, err := intArg(args[i])
@@ -953,9 +918,6 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		want := 6
 		if f.Name == "MAKE_TIME" {
 			want = 3
-		}
-		if err := need(want); err != nil {
-			return done(Value{}, err)
 		}
 		parts := make([]int, want-1)
 		for i := range parts {
@@ -992,18 +954,12 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 			whole := math.Floor(sv.F)
 			return done(fromTime(time.Unix(int64(whole), int64(math.Round((sv.F-whole)*1e9))).UTC(), t))
 		}
-		if err := need(2); err != nil {
-			return done(Value{}, err)
-		}
 		tm, err := parseWithFormat(args[0].Text(), args[1].Text())
 		if err != nil {
 			return done(Value{}, err)
 		}
 		return done(fromTime(tm, t))
 	case "TO_CHAR":
-		if err := need(2); err != nil {
-			return done(Value{}, err)
-		}
 		s, err := toChar(args[0], args[1].Text())
 		return done(stringValue(s), err)
 	}

@@ -18,9 +18,10 @@ package redis
 //
 // A column's DEFAULT is stored as SQL text in the table metadata
 // (columnMeta.Default) and checked when it is defined: it may not read
-// columns, run subqueries, take parameters or call aggregates or window
-// functions, and it is evaluated once so that a value the column can't hold
-// is an error then. A NULL default is not stored, as in Postgres. Inserted
+// columns, run subqueries, take parameters or call aggregates, GROUPING or
+// window functions, its calls are resolved as in a query (funcs.go), and it
+// is evaluated once so that a value the column can't hold is an error then.
+// A NULL default is not stored, as in Postgres. Inserted
 // rows that give a column no value (or DEFAULT) get its default: INSERT …
 // VALUES, INSERT … DEFAULT VALUES, INSERT … SELECT with a column list,
 // MERGE's INSERT and bulk ingest of columns the Arrow data lacks. Each
@@ -189,11 +190,19 @@ func (e *executor) checkDefault(ctx context.Context, def ColumnDef) (string, Val
 		case *WindowFunc:
 			err = errorf(adbc.StatusInvalidArgument, "window functions are not allowed in DEFAULT expressions")
 		case *Func:
-			if aggregateFuncs[v.Name] {
+			switch {
+			case aggregateFuncs[v.Name]:
 				err = errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in DEFAULT expressions")
+			case v.Name == "GROUPING":
+				err = errorf(adbc.StatusInvalidArgument, "grouping operations are not allowed in DEFAULT expressions")
 			}
 		}
 	})
+	if err == nil {
+		// Its calls are checked like a query's (funcs.go): a NULL argument
+		// doesn't hide an unknown function or a wrong argument count.
+		err = checkCalls(def.Default)
+	}
 	if err != nil {
 		return "", Value{}, err
 	}
@@ -241,6 +250,11 @@ func (d *columnDefaults) value(i int) (Value, error) {
 		x, err := parseExprText(c.Default)
 		if err != nil {
 			return Value{}, errorf(adbc.StatusInternal, "invalid DEFAULT %q of column %q: %v", c.Default, c.Name, err)
+		}
+		// A default stored before its calls were checked (funcs.go) gets
+		// the same errors as a new one.
+		if err := checkCalls(x); err != nil {
+			return Value{}, err
 		}
 		d.exprs[i] = x
 	}

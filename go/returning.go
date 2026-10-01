@@ -315,13 +315,10 @@ func (e *executor) planTargetReturning(ctx context.Context, with []CTE, table Ta
 	return e.planReturning(ctx, list, []relation{{name: alias, meta: meta}}, meta, false, nil)
 }
 
-// checkMergeAction checks a call of merge_action(): it takes no arguments
-// and may only be used in a MERGE's RETURNING list (here not in a subquery
-// there either).
+// checkMergeAction checks a call of merge_action() (whose arguments the
+// registry checks): it may only be used in a MERGE's RETURNING list (here
+// not in a subquery there either).
 func (e *executor) checkMergeAction(f *Func) error {
-	if len(f.Args) > 0 || f.Star || f.Distinct {
-		return errorf(adbc.StatusInvalidArgument, "MERGE_ACTION expects 0 argument(s)")
-	}
 	if n := len(e.scopes); n == 0 || !e.scopes[n-1].mergeReturning {
 		return errorf(adbc.StatusInvalidArgument, "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command")
 	}
