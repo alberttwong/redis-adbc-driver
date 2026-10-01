@@ -1109,6 +1109,35 @@ field, even if later rows have it.
   - As in `ORDER BY`, NULLs sort last by default in either direction
     (PostgreSQL puts them first for `DESC`). Rows that tie on the window's
     `ORDER BY` keep their input order
+- Dates, times and timestamps become text (`CAST(x AS VARCHAR)`, `||`,
+  `CONCAT`, `STRING_AGG`, `LIKE`, `MD5(CAST(x AS TEXT))`, …) as Postgres
+  writes them, whatever the declared precision: seconds always, then the
+  fraction without trailing zeros (`2024-01-10 10:00:00`,
+  `2024-01-10 10:00:00.5`, `10:00:00.05`), the offset of a timestamp with
+  time zone (`2024-01-10 10:00:00+00`), a year before 1 AD as a BC year
+  (`0044-03-15 BC`), and a year past 9999 with all its digits
+  (`10000-01-01`). Text in those forms reads back as the same value, and
+  there is no year 0. JSON (`TO_JSON`, `JSON_BUILD_OBJECT`, …) has the ISO
+  8601 form, `2024-01-10T10:00:00.5+00:00`. Intervals are written as in
+  Postgres too, with a `+` on a field after a negative one (`-1 days
+  +02:00:00`). Query results are Arrow values, which this doesn't change
+  - **Upgrading from v0.0.7 and earlier:** they kept the declared
+    precision's trailing zeros (`2024-01-10 10:00:00.000000`, `10:00:00.000`,
+    `2024-01-10 10:00:00.000+00`), wrote years before 1 AD as `0000-…` or
+    `-0001-…`, and left out an interval's `+`. The text of such values
+    changes, and with it every hash of the text: dbt_utils'
+    `generate_surrogate_key` over a timestamp or time column, and the
+    `dbt_scd_id` of dbt snapshots (an `md5` of the key and `updated_at` as
+    text). Keys that earlier versions stored don't match the ones computed
+    now (which match Postgres's): an incremental model whose `unique_key`
+    is such a key inserts its rows again instead of updating them, and a
+    snapshot whose `unique_key` is one sees every row as new. Rebuild those
+    (`dbt run --full-refresh`, or drop the snapshot's table and run `dbt
+    snapshot`) before running them with this version. Snapshots only read
+    their stored `dbt_scd_id`s back, so they keep working; the rows they
+    add from now on have ids in the new form. Text stored by earlier
+    versions (`CAST(ts AS VARCHAR)` written to a column) keeps the old form,
+    and still reads back as the same values, except for years before 1 AD
 - Casts: `CAST(x AS type)` and `x::type` fail on a value that doesn't
   convert (text that doesn't parse, a value out of the type's range,
   overflow). `TRY_CAST(x AS type)` and `SAFE_CAST(x AS type)` return NULL
@@ -1205,8 +1234,9 @@ field, even if later rows have it.
   so `WHERE n > ROUND(?)` is still an index query; functions over columns are
   evaluated by the driver on the rows the index returns. `RANDOM()` is
   computed for every row and never pushed down
-- Date/time functions, all in UTC (the current time is fixed once per
-  statement):
+- Date/time functions. The session time zone is UTC: a `TIMESTAMP WITH
+  TIME ZONE` is shown in UTC, and the current time is fixed once per
+  statement:
   - `CURRENT_DATE`, `CURRENT_TIMESTAMP` / `NOW()`, `CURRENT_TIME`,
     `LOCALTIMESTAMP`, `LOCALTIME`
   - `EXTRACT(field FROM x)` / `DATE_PART('field', x)` for `year`, `isoyear`,
@@ -1240,10 +1270,83 @@ field, even if later rows have it.
     BigQuery), which are `DATEADD(part, n, x)` / `DATEADD(part, -n, x)`
   - `MAKE_DATE`, `MAKE_TIME`, `MAKE_TIMESTAMP`, `MAKE_TIMESTAMPTZ`,
     `TO_TIMESTAMP(epoch_seconds)`, `EPOCH(x)`, `EPOCH_MS(x)`
-  - `TO_CHAR(x, format)`, `TO_DATE(text, format)`,
-    `TO_TIMESTAMP(text, format)` with Postgres patterns (`YYYY`, `MM`,
-    `Mon`/`Month`, `DD`, `Day`/`DY`, `HH24`/`HH12`, `MI`, `SS`, `MS`, `US`,
-    `AM`/`PM`, `Q`, `IW`, `"text"`, `FM`)
+  - `TO_CHAR(x, format)` with Postgres's template patterns, read as
+    Postgres reads them (case-sensitive, the first pattern that matches):
+    `HH` / `HH12`, `HH24`, `MI`, `SS`, `MS`, `US`, `FF1` to `FF6`, `SSSS` /
+    `SSSSS`, `AM` / `PM` / `A.M.` / `P.M.`, `Y,YYY`, `YYYY`, `YYY`, `YY`,
+    `Y`, `IYYY`, `IYY`, `IY`, `I`, `BC` / `AD` / `B.C.` / `A.D.`, `MONTH` /
+    `Month` / `month`, `MON` / `Mon` / `mon`, `MM`, `DAY` / `Day` / `day`,
+    `DY` / `Dy` / `dy`, `DDD`, `IDDD`, `DD`, `D`, `ID`, `W`, `WW`, `IW`,
+    `CC`, `J`, `Q`, `RM` / `rm`, `TZ` / `tz`, `TZH`, `TZM` and `OF`. The
+    numbers and the meridiem and era indicators can also be written in
+    lower case (`yyyy-mm-dd`, `pm`).
+    - Modifiers: `FM` before a pattern (no padding), `TM` (names without
+      padding; they are English), and `TH` / `th` after a number (`DDth` is
+      `29th`). `FX`, and `SP` after a pattern, are accepted and ignored, as
+      in Postgres
+    - Names are padded to 9 characters and `RM` to 4 (`'XI  '`), numbers
+      with zeros, unless `FM` is given; `MS`, `US` and `FF1` to `FF6` are
+      always padded. `CC` is the century that starts in a year ending in
+      01, and `-01` for the 1st century BC. Years before 1 AD are their BC
+      years, for `BC` (`0044 BC`)
+    - `TZ` is `UTC` for a timestamp with time zone or a date, and empty for
+      a timestamp; `TZH`, `TZM` and `OF` are `+00`, `00` and `+00`. A time
+      is formatted as on 1970-01-01
+    - Anything else is copied: text in double quotes (where `\` escapes the
+      next character), `\"` (a `"`), and every character that doesn't start
+      a pattern, so `Mm` is `Mm` while `Dd` is two weekday numbers, as in
+      Postgres. An empty format gives NULL
+  - `TO_DATE(text, format)` and `TO_TIMESTAMP(text, format)` read the same
+    templates, with the patterns `YYYY` (also `IYYY`), `YY`, `MM`, `MONTH`
+    / `MON` in any case, `DD`, `HH24`, `HH12` / `HH`, `MI`, `SS`, `MS`, `US`
+    and `AM` / `PM` / `A.M.` / `P.M.`; `FX` is ignored, and other patterns
+    are an error (`format pattern "WW" cannot be parsed`)
+  - Time zones, as in Postgres: `x AT TIME ZONE zone` (also
+    `TIMEZONE(zone, x)`) reads a `TIMESTAMP` as a local time in `zone` and
+    gives that instant, a `TIMESTAMP WITH TIME ZONE`, and gives the local
+    time in `zone` of a `TIMESTAMP WITH TIME ZONE`, a `TIMESTAMP`. A `DATE`
+    and text are read as a `TIMESTAMP WITH TIME ZONE`, and the precision
+    is kept. `x AT LOCAL` (also `TIMEZONE(x)`) converts to or from the
+    session time zone, UTC. There is no `TIME WITH TIME ZONE`, so a `TIME`
+    is an error (`function timezone(varchar, time) does not exist`)
+    - `AT TIME ZONE` binds tighter than `*` and `+` and looser than `::`
+      and unary minus, left to right, so dbt_date's `cast(cast(x as
+      timestamp) at time zone 'UTC' at time zone 'America/Los_Angeles' as
+      timestamp)` converts from UTC to Los Angeles time
+    - `CONVERT_TIMEZONE(source, target, x)` (Snowflake, Redshift; what
+      dbt_date's `convert_timezone` and `now()` emit) reads `x` as a local
+      time in `source` and gives the local time in `target`, a
+      `TIMESTAMP`. A `TIMESTAMP WITH TIME ZONE` is read as its UTC time, as
+      Snowflake reads it. `CONVERT_TIMEZONE(target, x)` reads `x` in UTC and
+      also gives a `TIMESTAMP`, as in Redshift (Snowflake gives a
+      `TIMESTAMP_TZ`, which has no equivalent here)
+    - Zones are looked up in Postgres's order. First the time zone
+      abbreviations, which are fixed offsets: `UTC`, `UT`, `UCT`, `GMT`,
+      `Z`, `ZULU`, `EST` / `EDT`, `CST` / `CDT`, `MST` / `MDT`, `PST` /
+      `PDT`, `AKST` / `AKDT`, `HST`, `AST` / `ADT`, `NST` / `NDT`, `WET` /
+      `WEST`, `BST`, `CET` / `CEST`, `EET` / `EEST`, `JST`, `KST`, `HKT`,
+      `AWST`, `ACST` / `ACDT`, `AEST` / `AEDT` and `NZST` / `NZDT` (so
+      `CET` is UTC+1 in July too). Then the IANA zone names
+      (`America/New_York`, `Etc/GMT+5`), case-insensitive, from the tz
+      database built into the driver. Then POSIX-style offsets: `UTC+5`,
+      `+05:30`, `5` or `<+0530>-05:30`, whose sign is west of Greenwich, as
+      in POSIX and Postgres, so `UTC+5` and `+05:30` are behind UTC. An
+      `INTERVAL` is an offset east of Greenwich, as in ISO 8601 (`INTERVAL
+      '+05:30'` is ahead of UTC), without months or days (`interval time
+      zone "1 day" must not include months or days`). Anything else is
+      `time zone "x" not recognized`. Timestamp text with a zone name
+      (`'2024-03-10 02:30 America/Los_Angeles'`) reads the zone the same way
+    - Daylight saving time as in Postgres: a local time that the
+      spring-forward transition skips is read with the offset before it
+      (`TIMESTAMP '2024-03-10 02:30' AT TIME ZONE 'America/Los_Angeles'` is
+      10:30 UTC), and one that the fall-back transition repeats with the
+      offset after it (`TIMESTAMP '2024-11-03 01:30'` is 01:30 PST, 09:30
+      UTC)
+    - Not supported: a session time zone other than UTC, `TIME WITH TIME
+      ZONE`, POSIX zones with daylight saving rules
+      (`CET-1CEST,M3.5.0,M10.5.0/3`), abbreviations other than those above
+      (such as `IST`, which Postgres reads as Israel's), and `TO_CHAR` of an
+      interval
 - Intervals and date/time arithmetic:
   - `INTERVAL '1 year 2 months 3 days 04:05:06'`, `'1.5 hours'`, `'2 days ago'`,
     `'3 04:05:06'`, `'1-2'` (years-months), ISO 8601 `'P1Y2M3DT4H'`,
@@ -1430,6 +1533,8 @@ field, even if later rows have it.
   NUMERIC(p,s), VARCHAR(n), CHAR(n), VARCHAR/TEXT, VARBINARY/BLOB, DATE,
   TIME(p), TIMESTAMP(p) [WITH TIME ZONE], INTERVAL` (interval columns are
   stored but not indexed; see String lengths for `VARCHAR(n)` / `CHAR(n)`).
+  `TIME WITH TIME ZONE` is a `TIME`: there is no time-of-day type with a
+  zone.
   JSON documents are stored in `VARCHAR` columns (`NOINDEX` if they are
   never compared as a whole); `JSON` and `JSONB` are only cast targets
 

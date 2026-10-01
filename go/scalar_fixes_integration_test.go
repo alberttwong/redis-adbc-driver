@@ -87,7 +87,7 @@ func TestScalarFixesTryCast(t *testing.T) {
 			TRY_CAST('yes' AS BOOLEAN), TRY_CAST('maybe' AS BOOLEAN), TRY_CAST('2.5' AS DOUBLE),
 			TRY_CAST('1e400' AS DOUBLE), CAST(TRY_CAST('3 days' AS INTERVAL) AS VARCHAR), TRY_CAST('soon' AS INTERVAL),
 			CAST(TRY_CAST('2024-01-02 03:04:05' AS TIMESTAMP) AS VARCHAR), TRY_CAST('noon' AS TIMESTAMP)`,
-		"2024-02-29|NULL|true|NULL|2.5|NULL|3 days|NULL|2024-01-02 03:04:05.000000|NULL")
+		"2024-02-29|NULL|true|NULL|2.5|NULL|3 days|NULL|2024-01-02 03:04:05|NULL")
 	expectTypes(t, schema, sfDate, sfDate, sfBool, sfBool, sfDouble, sfDouble, sfString,
 		arrow.FixedWidthTypes.MonthDayNanoInterval, sfString, sfTS)
 
@@ -257,20 +257,20 @@ func TestScalarFixesDateAddDiff(t *testing.T) {
 			DATEADD(day, 1, ts), DATEADD(quarter, 1, tz),
 			DATEADD(day, 1, TIMESTAMP WITH TIME ZONE '2024-01-01 00:00:00+00')
 		FROM it_sf_dates WHERE id = 1`,
-		"2024-02-29 23:30:00.500000|2024-02-01 00:30:00.500000|2024-01-31 23:30:00.000000|2023-02-28 12:00:00.250|"+
+		"2024-02-29 23:30:00.5|2024-02-01 00:30:00.5|2024-01-31 23:30:00|2023-02-28 12:00:00.25|"+
 			"2024-02-01T23:30:00.5|2024-05-29T12:00:00.25|2024-01-02T00:00:00Z")
 	expectTypes(t, schema, sfString, sfString, sfString, sfString, sfTS, sfTSms, sfTSTZ)
 
 	// Times wrap around midnight; date parts are not valid for them.
 	schema = h.expectRows(`SELECT CAST(DATEADD(hour, 25, t) AS VARCHAR), CAST(DATEADD(minute, -30, t) AS VARCHAR), DATEADD(second, 1, t)
 		FROM it_sf_dates ORDER BY id`,
-		"00:30:00.000000|23:00:00.000000|23:30:01.000000", "01:15:00.000000|23:45:00.000000|00:15:01.000000", "NULL|NULL|NULL")
+		"00:30:00|23:00:00|23:30:01.000000", "01:15:00|23:45:00|00:15:01.000000", "NULL|NULL|NULL")
 	expectTypes(t, schema, sfString, sfString, sfTime)
 	h.expectError(`SELECT DATEADD(day, 1, t) FROM it_sf_dates`, "date part day is not valid for TIME values")
 
 	// Text is read as a timestamp.
 	schema = h.expectRows(`SELECT CAST(DATEADD(day, 1, '2024-01-01') AS VARCHAR), DATEADD(hour, 1, '2024-01-01 10:00:00')`,
-		"2024-01-02 00:00:00.000000|2024-01-01T11:00:00")
+		"2024-01-02 00:00:00|2024-01-01T11:00:00")
 	expectTypes(t, schema, sfString, sfTS)
 
 	// Abbreviations, bare or quoted, in any case.
@@ -283,8 +283,8 @@ func TestScalarFixesDateAddDiff(t *testing.T) {
 			CAST(DATEADD(m, 1, ts) AS VARCHAR), CAST(DATEADD(ss, 1, ts) AS VARCHAR), CAST(DATEADD(s, 1, ts) AS VARCHAR),
 			CAST(DATEADD(ms, 1, ts) AS VARCHAR), CAST(DATEADD(us, 1, ts) AS VARCHAR), CAST(DATEADD(mcs, 1, ts) AS VARCHAR)
 		FROM it_sf_dates WHERE id = 1`,
-		"2024-02-01 00:30:00.500000|2024-01-31 23:31:00.500000|2024-01-31 23:31:00.500000|2024-01-31 23:31:00.500000|"+
-			"2024-01-31 23:30:01.500000|2024-01-31 23:30:01.500000|2024-01-31 23:30:00.501000|2024-01-31 23:30:00.500001|"+
+		"2024-02-01 00:30:00.5|2024-01-31 23:31:00.5|2024-01-31 23:31:00.5|2024-01-31 23:31:00.5|"+
+			"2024-01-31 23:30:01.5|2024-01-31 23:30:01.5|2024-01-31 23:30:00.501|2024-01-31 23:30:00.500001|"+
 			"2024-01-31 23:30:00.500001")
 
 	// Columns named like date parts are still columns everywhere else,

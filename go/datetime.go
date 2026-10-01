@@ -408,182 +408,7 @@ func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
 	return x, nil
 }
 
-// ---- TO_CHAR / TO_DATE / TO_TIMESTAMP formats ----
-
-type fmtToken struct {
-	pat  string // pattern (empty for literal text)
-	text string // literal text
-	fm   bool   // FM: no padding
-}
-
-// Patterns, longest first so prefixes don't shadow them.
-var fmtPatterns = []string{
-	"HH24", "HH12", "IYYY", "YYYY", "MONTH", "Month", "month", "DDD", "DAY", "Day", "day",
-	"A.M.", "P.M.", "a.m.", "p.m.",
-	"MON", "Mon", "mon", "YYY", "HH", "MI", "MM", "MS", "US", "SS", "DD", "DY", "Dy", "dy",
-	"IW", "ID", "TZ", "tz", "AM", "PM", "am", "pm", "YY", "Q", "D", "Y",
-}
-
-func tokenizeFormat(f string) []fmtToken {
-	var out []fmtToken
-	fm := false
-	for i := 0; i < len(f); {
-		if strings.HasPrefix(strings.ToUpper(f[i:]), "FM") {
-			fm = true
-			i += 2
-			continue
-		}
-		if f[i] == '"' {
-			end := strings.IndexByte(f[i+1:], '"')
-			if end < 0 {
-				out = append(out, fmtToken{text: f[i+1:]})
-				break
-			}
-			out = append(out, fmtToken{text: f[i+1 : i+1+end]})
-			i += end + 2
-			continue
-		}
-		matched := false
-		for _, p := range fmtPatterns {
-			// Name patterns are case-sensitive (they select the output
-			// case); numeric ones are not.
-			if strings.HasPrefix(f[i:], p) || (isNumericPattern(p) && strings.HasPrefix(strings.ToUpper(f[i:]), p)) {
-				out = append(out, fmtToken{pat: p, fm: fm})
-				fm = false
-				i += len(p)
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			out = append(out, fmtToken{text: f[i : i+1]})
-			i++
-		}
-	}
-	return out
-}
-
-func isNumericPattern(p string) bool {
-	switch p {
-	case "HH24", "HH12", "IYYY", "YYYY", "DDD", "YYY", "HH", "MI", "MM", "MS", "US", "SS", "DD", "IW", "ID", "YY", "Q", "D", "Y":
-		return true
-	}
-	return false
-}
-
-func padName(s string, fm bool) string {
-	if fm {
-		return s
-	}
-	return fmt.Sprintf("%-9s", s)
-}
-
-// toChar formats a date/time value like Postgres TO_CHAR.
-func toChar(v Value, format string) (string, error) {
-	tm, err := toTime(v)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	num := func(n, width int, fm bool) {
-		if fm {
-			b.WriteString(strconv.Itoa(n))
-		} else {
-			fmt.Fprintf(&b, "%0*d", width, n)
-		}
-	}
-	h12 := tm.Hour() % 12
-	if h12 == 0 {
-		h12 = 12
-	}
-	isoY, isoW := tm.ISOWeek()
-	for _, t := range tokenizeFormat(format) {
-		if t.pat == "" {
-			b.WriteString(t.text)
-			continue
-		}
-		month, day := tm.Month().String(), tm.Weekday().String()
-		switch t.pat {
-		case "YYYY":
-			num(tm.Year(), 4, t.fm)
-		case "YYY":
-			num(tm.Year()%1000, 3, t.fm)
-		case "YY":
-			num(tm.Year()%100, 2, t.fm)
-		case "Y":
-			num(tm.Year()%10, 1, t.fm)
-		case "IYYY":
-			num(isoY, 4, t.fm)
-		case "MM":
-			num(int(tm.Month()), 2, t.fm)
-		case "MONTH":
-			b.WriteString(padName(strings.ToUpper(month), t.fm))
-		case "Month":
-			b.WriteString(padName(month, t.fm))
-		case "month":
-			b.WriteString(padName(strings.ToLower(month), t.fm))
-		case "MON":
-			b.WriteString(strings.ToUpper(month[:3]))
-		case "Mon":
-			b.WriteString(month[:3])
-		case "mon":
-			b.WriteString(strings.ToLower(month[:3]))
-		case "DD":
-			num(tm.Day(), 2, t.fm)
-		case "DDD":
-			num(tm.YearDay(), 3, t.fm)
-		case "D":
-			num(int(tm.Weekday())+1, 1, t.fm)
-		case "ID":
-			d := int(tm.Weekday())
-			if d == 0 {
-				d = 7
-			}
-			num(d, 1, t.fm)
-		case "DAY":
-			b.WriteString(padName(strings.ToUpper(day), t.fm))
-		case "Day":
-			b.WriteString(padName(day, t.fm))
-		case "day":
-			b.WriteString(padName(strings.ToLower(day), t.fm))
-		case "DY":
-			b.WriteString(strings.ToUpper(day[:3]))
-		case "Dy":
-			b.WriteString(day[:3])
-		case "dy":
-			b.WriteString(strings.ToLower(day[:3]))
-		case "IW":
-			num(isoW, 2, t.fm)
-		case "Q":
-			num((int(tm.Month())-1)/3+1, 1, t.fm)
-		case "HH24":
-			num(tm.Hour(), 2, t.fm)
-		case "HH12", "HH":
-			num(h12, 2, t.fm)
-		case "MI":
-			num(tm.Minute(), 2, t.fm)
-		case "SS":
-			num(tm.Second(), 2, t.fm)
-		case "MS":
-			num(tm.Nanosecond()/1_000_000, 3, t.fm)
-		case "US":
-			num(tm.Nanosecond()/1_000, 6, t.fm)
-		case "AM", "PM":
-			b.WriteString(map[bool]string{true: "PM", false: "AM"}[tm.Hour() >= 12])
-		case "am", "pm":
-			b.WriteString(map[bool]string{true: "pm", false: "am"}[tm.Hour() >= 12])
-		case "A.M.", "P.M.":
-			b.WriteString(map[bool]string{true: "P.M.", false: "A.M."}[tm.Hour() >= 12])
-		case "a.m.", "p.m.":
-			b.WriteString(map[bool]string{true: "p.m.", false: "a.m."}[tm.Hour() >= 12])
-		case "TZ":
-			b.WriteString("UTC")
-		case "tz":
-			b.WriteString("utc")
-		}
-	}
-	return b.String(), nil
-}
+// ---- TO_DATE / TO_TIMESTAMP formats (TO_CHAR is in tochar.go) ----
 
 var monthNames = map[string]time.Month{}
 
@@ -630,7 +455,7 @@ func parseWithFormat(s, format string) (time.Time, error) {
 	}
 	var err error
 	for _, t := range tokenizeFormat(format) {
-		if t.pat == "" {
+		if t.key == nil {
 			for _, r := range t.text {
 				if unicode.IsSpace(r) {
 					skipSpace()
@@ -648,7 +473,9 @@ func parseWithFormat(s, format string) (time.Time, error) {
 			}
 			continue
 		}
-		switch strings.ToUpper(t.pat) {
+		switch strings.ToUpper(t.key.id) {
+		case "FX":
+			// Fixed format: the input is read as flexibly as ever.
 		case "YYYY", "IYYY":
 			year, err = readNum(4)
 		case "YY":
@@ -709,7 +536,7 @@ func parseWithFormat(s, format string) (time.Time, error) {
 				i += 2
 			}
 		default:
-			return time.Time{}, fmt.Errorf("format pattern %q cannot be parsed", t.pat)
+			return time.Time{}, fmt.Errorf("format pattern %q cannot be parsed", t.key.name)
 		}
 		if err != nil {
 			return time.Time{}, err
@@ -760,6 +587,16 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 		return typeFloat64, true
 	case "TO_CHAR":
 		return typeString, true
+	case "TIMEZONE":
+		if len(args) == 0 {
+			return typeTimestamp, true
+		}
+		return timezoneType(args[len(args)-1]), true
+	case "CONVERT_TIMEZONE":
+		if len(args) == 0 {
+			return typeTimestamp, true
+		}
+		return convertTimezoneType(args[len(args)-1]), true
 	case "__INTERVAL", "AGE":
 		return typeInterval, true
 	case "DATE_PART":
@@ -960,8 +797,15 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		}
 		return done(fromTime(tm, t))
 	case "TO_CHAR":
+		if args[1].Text() == "" {
+			return done(nullValue(typeString), nil) // as in Postgres
+		}
 		s, err := toChar(args[0], args[1].Text())
 		return done(stringValue(s), err)
+	case "TIMEZONE":
+		return done(atTimeZone(f, args, t))
+	case "CONVERT_TIMEZONE":
+		return done(convertTimezone(f, args, t))
 	}
 	return Value{}, false, nil
 }

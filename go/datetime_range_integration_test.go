@@ -48,7 +48,7 @@ func TestDateRange(t *testing.T) {
 			(DATE '1970-01-01' - 2147483648) - DATE '1970-01-01',
 			(DATE '1970-01-01' + 2147483647) - (DATE '1970-01-01' - 2147483648),
 			CAST(DATE '1970-01-01' + 2147483647 AS VARCHAR), CAST(DATE '1970-01-01' - 2147483648 AS VARCHAR)`,
-		"2147483647|-2147483648|4294967295|5881580-07-11|-5877641-06-23")
+		"2147483647|-2147483648|4294967295|5881580-07-11|5877642-06-23 BC")
 	// A day past either end is out of range: the result must not wrap
 	// (2147483647 days after 2024-01-01 was -5877587-06-21), nor overflow
 	// int64 (9223372036854775807 days after it was 2023-12-31).
@@ -131,7 +131,7 @@ func TestDateRange(t *testing.T) {
 	if got, err := queryBoundDate64(h, 2147483647*dayMS); err != nil || got != "5881580-07-11" {
 		t.Errorf("date64 of the last date32 day: got %q, %v", got, err)
 	}
-	if got, err := queryBoundDate64(h, -2147483648*dayMS); err != nil || got != "-5877641-06-23" {
+	if got, err := queryBoundDate64(h, -2147483648*dayMS); err != nil || got != "5877642-06-23 BC" {
 		t.Errorf("date64 of the first date32 day: got %q, %v", got, err)
 	}
 	for _, ms := range []int64{2147483648 * dayMS, -2147483649 * dayMS} {
@@ -189,7 +189,7 @@ func TestIntervalArithmeticRange(t *testing.T) {
 			CAST(INTERVAL '-2000000 hours' - INTERVAL '562047 hours' AS VARCHAR),
 			CAST(INTERVAL '1000000 hours' * 2.5 AS VARCHAR),
 			CAST(TIMESTAMP '2024-03-31 00:00:00' - INTERVAL '1 month' AS VARCHAR)`,
-		"2316-04-11 23:00:00.000000|2316-04-11 23:00:00.000000|2562047:00:00|-2562047:00:00|2500000:00:00|2024-02-29 00:00:00.000000")
+		"2316-04-11 23:00:00|2316-04-11 23:00:00|2562047:00:00|-2562047:00:00|2500000:00:00|2024-02-29 00:00:00")
 
 	for sql, want := range map[string]string{
 		// Past int64 nanoseconds: was 2316-04-11 23:47:16.854775 (saturated).
@@ -217,5 +217,5 @@ func TestIntervalArithmeticRange(t *testing.T) {
 	h.expectRows(`SELECT CAST(TIME '10:00:00' + (INTERVAL '2562047 hours' + INTERVAL '47 minutes' + INTERVAL '16.854775 seconds') AS VARCHAR),
 			CAST(TIME '10:00:00' - INTERVAL '-9223372036.854775808 seconds' AS VARCHAR),
 			CAST(TIME '10:00:00' - INTERVAL '2562047 hours' AS VARCHAR)`,
-		"09:47:16.854775|09:47:16.854775|11:00:00.000000")
+		"09:47:16.854775|09:47:16.854775|11:00:00")
 }

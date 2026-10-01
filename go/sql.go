@@ -3220,7 +3220,7 @@ func (p *parser) parseAdditive() (Expr, error) {
 }
 
 func (p *parser) parseMultiplicative() (Expr, error) {
-	l, err := p.parseUnary()
+	l, err := p.parseAtTimeZone()
 	if err != nil {
 		return nil, err
 	}
@@ -3228,7 +3228,7 @@ func (p *parser) parseMultiplicative() (Expr, error) {
 		switch {
 		case p.isOp("*"), p.isOp("/"), p.isOp("%"):
 			op := p.next().text
-			r, err := p.parseUnary()
+			r, err := p.parseAtTimeZone()
 			if err != nil {
 				return nil, err
 			}
@@ -3243,6 +3243,37 @@ func (p *parser) parseMultiplicative() (Expr, error) {
 			return l, nil
 		}
 	}
+}
+
+// parseAtTimeZone parses `x AT TIME ZONE z`, which is TIMEZONE(z, x), and
+// `x AT LOCAL`, which is TIMEZONE(x). As in Postgres they bind tighter than
+// * and / and looser than unary minus and ::, left to right, and the zone
+// is a unary expression too: `x AT TIME ZONE 'UTC' AT TIME ZONE z` converts
+// twice, `x::timestamp AT TIME ZONE z` casts first, and
+// `x AT TIME ZONE 'a' || 'b'` is `(x AT TIME ZONE 'a') || 'b'`. AT is a
+// keyword only before TIME ZONE or LOCAL, so it can still be an alias.
+func (p *parser) parseAtTimeZone() (Expr, error) {
+	x, err := p.parseUnary()
+	if err != nil {
+		return nil, err
+	}
+	for p.isKeyword("AT") {
+		switch {
+		case p.isKeywordAt(1, "TIME") && p.isKeywordAt(2, "ZONE"):
+			p.pos += 3
+			z, err := p.parseUnary()
+			if err != nil {
+				return nil, err
+			}
+			x = &Func{Name: "TIMEZONE", Args: []Expr{z, x}}
+		case p.isKeywordAt(1, "LOCAL"):
+			p.pos += 2
+			x = &Func{Name: "TIMEZONE", Args: []Expr{x}}
+		default:
+			return x, nil
+		}
+	}
+	return x, nil
 }
 
 func (p *parser) parseUnary() (Expr, error) {
