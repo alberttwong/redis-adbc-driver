@@ -306,6 +306,9 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 			return nullValue(inferFuncType(f, argTypes(args))), nil
 		}
 	}
+	if v, ok, err := env.evalDateTimeFunc(f, args); ok {
+		return v, err
+	}
 	switch f.Name {
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
 		if err := need(1); err != nil {
@@ -561,6 +564,9 @@ func arithmeticType(op string, a, b ColType) (ColType, error) {
 }
 
 func inferFuncType(f *Func, args []ColType) ColType {
+	if t, ok := dateTimeFuncType(f, args); ok {
+		return t
+	}
 	switch f.Name {
 	case "COUNT", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LEN":
 		return typeInt64

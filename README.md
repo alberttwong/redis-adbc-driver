@@ -248,6 +248,11 @@ EXCEPT
 SELECT customer_id FROM sales WHERE product = 'gizmo' AND quantity = 20
 ORDER BY 1 LIMIT 5;
 
+-- Date/time functions (UTC): monthly totals for the first quarter
+SELECT TO_CHAR(DATE_TRUNC('month', ordered_at), 'YYYY-MM') AS month, COUNT(*) AS orders, SUM(quantity) AS units
+FROM sales WHERE EXTRACT(QUARTER FROM ordered_at) = 1
+GROUP BY month ORDER BY month;
+
 -- information_schema: which columns of sales are indexed?
 SELECT column_name, data_type, is_nullable, is_indexed
 FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position;
@@ -403,6 +408,24 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
+- Date/time functions, all in UTC (the current time is fixed once per
+  statement):
+  - `CURRENT_DATE`, `CURRENT_TIMESTAMP` / `NOW()`, `CURRENT_TIME`,
+    `LOCALTIMESTAMP`, `LOCALTIME`
+  - `EXTRACT(field FROM x)` / `DATE_PART('field', x)` for `year`, `isoyear`,
+    `quarter`, `month`, `week` (ISO), `day`, `dow` (0 = Sunday), `isodow`,
+    `doy`, `hour`, `minute`, `second`, `milliseconds`, `microseconds`, `epoch`,
+    `decade`, `century`, `millennium`; shortcuts `YEAR()`, `QUARTER()`,
+    `MONTH()`, `WEEK()`, `DAY()`, `DAYOFYEAR()`, `HOUR()`, `MINUTE()`,
+    `SECOND()`
+  - `DATE_TRUNC('unit', x)` (dates stay dates), `DATE_DIFF('unit', a, b)`
+    (unit boundaries crossed), `LAST_DAY(d)`
+  - `MAKE_DATE`, `MAKE_TIME`, `MAKE_TIMESTAMP`, `MAKE_TIMESTAMPTZ`,
+    `TO_TIMESTAMP(epoch_seconds)`, `EPOCH(x)`, `EPOCH_MS(x)`
+  - `TO_CHAR(x, format)`, `TO_DATE(text, format)`,
+    `TO_TIMESTAMP(text, format)` with Postgres patterns (`YYYY`, `MM`,
+    `Mon`/`Month`, `DD`, `Day`/`DY`, `HH24`/`HH12`, `MI`, `SS`, `MS`, `US`,
+    `AM`/`PM`, `Q`, `IW`, `"text"`, `FM`)
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW`), `columns`

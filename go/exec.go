@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 )
@@ -39,6 +40,7 @@ type executor struct {
 	scopes     []*scope
 	pendingSq  *Subquery
 	ctes       []map[string]*CTE
+	now        time.Time // CURRENT_TIMESTAMP etc., fixed per statement
 }
 
 // execResult is the outcome of one statement.
@@ -79,6 +81,9 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (execResult, error) {
 	e.cache = newExecCache()
 	e.params, e.paramTypes = params, paramTypes
+	if e.now.IsZero() {
+		e.now = time.Now().UTC()
+	}
 	switch st := ps.Stmt.(type) {
 	case *SelectStmt:
 		plan, err := e.planSelect(ctx, st, paramTypes)

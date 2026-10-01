@@ -856,3 +856,88 @@ func TestSQLSetOperations(t *testing.T) {
 	h.expectError(`SELECT id FROM it_customers UNION SELECT customer_id FROM it_orders ORDER BY id + 1`, "output column names or positions")
 	h.expectError(`SELECT id FROM it_customers ORDER BY id UNION SELECT 1`, "UNION")
 }
+
+func TestSQLDateTimeFunctions(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP TABLE IF EXISTS it_dt")
+	h.exec(`CREATE TABLE it_dt (id INTEGER, d DATE, ts TIMESTAMP(6), tz TIMESTAMP(3) WITH TIME ZONE, t TIME(6))`)
+	h.exec(`INSERT INTO it_dt VALUES
+		(1, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:45:30.123456', TIMESTAMP WITH TIME ZONE '2024-02-29 23:59:59.999+00', TIME '13:45:30.5'),
+		(2, DATE '1999-12-31', TIMESTAMP '2000-01-01 00:00:00', TIMESTAMP WITH TIME ZONE '1999-12-31 22:00:00-05', TIME '00:00:00'),
+		(3, NULL, NULL, NULL, NULL)`)
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_dt") })
+
+	// EXTRACT / DATE_PART.
+	h.expectRows(`SELECT EXTRACT(YEAR FROM ts), EXTRACT(QUARTER FROM ts), EXTRACT(MONTH FROM ts), EXTRACT(WEEK FROM ts),
+			EXTRACT(DAY FROM ts), EXTRACT(DOW FROM ts), EXTRACT(ISODOW FROM ts), EXTRACT(DOY FROM ts)
+		FROM it_dt WHERE id = 1`, "2024|1|2|9|29|4|4|60")
+	h.expectRows(`SELECT EXTRACT(HOUR FROM ts), EXTRACT(MINUTE FROM ts), EXTRACT(SECOND FROM ts),
+			EXTRACT(MILLISECONDS FROM ts), EXTRACT(MICROSECONDS FROM ts), EXTRACT(EPOCH FROM ts)
+		FROM it_dt WHERE id = 1`, "13|45|30.123456|30123.456|30123456|1.709214330123456e+09")
+	h.expectRows(`SELECT DATE_PART('decade', d), DATE_PART('century', d), DATE_PART('millennium', d), DATE_PART('isoyear', d)
+		FROM it_dt WHERE id = 1`, "202|21|3|2024")
+	h.expectRows(`SELECT EXTRACT(HOUR FROM t), EXTRACT(SECOND FROM t), EXTRACT(HOUR FROM tz) FROM it_dt ORDER BY id`,
+		"13|30.5|23", "0|0|3", "NULL|NULL|NULL") // row 2: 22:00-05 is 03:00 UTC
+	h.expectError(`SELECT EXTRACT(YEAR FROM t) FROM it_dt`, "not valid for TIME")
+	h.expectError(`SELECT DATE_PART('fortnight', ts) FROM it_dt`, "unknown date/time field")
+	h.expectRows(`SELECT YEAR(d), MONTH(d), DAY(d), HOUR(ts), MINUTE(ts), SECOND(ts), DAYOFYEAR(d), QUARTER(d), WEEK(d)
+		FROM it_dt WHERE id = 1`, "2024|2|29|13|45|30|60|1|9")
+
+	// DATE_TRUNC: dates stay dates, timestamps keep their type.
+	h.expectRows(`SELECT CAST(DATE_TRUNC('month', ts) AS VARCHAR), CAST(DATE_TRUNC('quarter', ts) AS VARCHAR),
+			CAST(DATE_TRUNC('hour', ts) AS VARCHAR), DATE_TRUNC('week', d), DATE_TRUNC('year', d),
+			CAST(DATE_TRUNC('day', tz) AS VARCHAR)
+		FROM it_dt WHERE id = 1`,
+		"2024-02-01 00:00:00.000000|2024-01-01 00:00:00.000000|2024-02-29 13:00:00.000000|2024-02-26|2024-01-01|2024-02-29 00:00:00.000+00")
+	h.expectRows(`SELECT DATE_TRUNC('year', ts) AS y, COUNT(*) FROM it_dt WHERE ts IS NOT NULL GROUP BY y ORDER BY y`,
+		"2000-01-01T00:00:00|1", "2024-01-01T00:00:00|1")
+
+	// DATE_DIFF counts unit boundaries crossed.
+	h.expectRows(`SELECT DATE_DIFF('day', DATE '2024-02-01', DATE '2024-03-01'),
+			DATE_DIFF('month', DATE '2024-01-31', DATE '2024-02-01'),
+			DATE_DIFF('year', DATE '2023-12-31', DATE '2024-01-01'),
+			DATE_DIFF('hour', TIMESTAMP '2024-01-01 01:59:00', TIMESTAMP '2024-01-01 02:01:00'),
+			DATE_DIFF('week', DATE '2024-02-25', DATE '2024-02-26'),
+			DATEDIFF('day', DATE '2024-03-01', DATE '2024-02-01')`,
+		"29|1|1|1|1|-29")
+
+	// Construction and conversion.
+	h.expectRows(`SELECT MAKE_DATE(2024, 2, 29), CAST(MAKE_TIMESTAMP(2024, 1, 2, 3, 4, 5.25) AS VARCHAR),
+			CAST(MAKE_TIME(13, 45, 30.5) AS VARCHAR), LAST_DAY(DATE '2024-02-10'), LAST_DAY(DATE '2023-02-10')`,
+		"2024-02-29|2024-01-02 03:04:05.250000|13:45:30.500000|2024-02-29|2023-02-28")
+	h.expectError(`SELECT MAKE_DATE(2023, 2, 29)`, "out of range")
+	h.expectRows(`SELECT CAST(TO_TIMESTAMP(0) AS VARCHAR), CAST(TO_TIMESTAMP(1700000000.5) AS VARCHAR)`,
+		"1970-01-01 00:00:00.000000+00|2023-11-14 22:13:20.500000+00")
+	h.expectRows(`SELECT CAST(TO_TIMESTAMP('2024-03-15 14:30', 'YYYY-MM-DD HH24:MI') AS VARCHAR),
+			TO_DATE('15 Mar 2024', 'DD Mon YYYY'), TO_DATE('March 5, 2024', 'Month DD, YYYY'),
+			CAST(TO_TIMESTAMP('03/15/2024 2:30 PM', 'MM/DD/YYYY HH12:MI AM') AS VARCHAR)`,
+		"2024-03-15 14:30:00.000000+00|2024-03-15|2024-03-05|2024-03-15 14:30:00.000000+00")
+	h.expectError(`SELECT TO_DATE('2024-02-30', 'YYYY-MM-DD')`, "out of range")
+	h.expectError(`SELECT TO_DATE('2024/02', 'YYYY-MM-DD')`, "does not match format")
+	h.expectError(`SELECT TO_DATE('2024-xx-01', 'YYYY-MM-DD')`, "expected digits")
+	h.expectRows(`SELECT EPOCH(ts), EPOCH_MS(ts) FROM it_dt WHERE id = 1`, "1.709214330123456e+09|1709214330123")
+
+	// TO_CHAR.
+	h.expectRows(`SELECT TO_CHAR(ts, 'YYYY-MM-DD HH24:MI:SS.MS'), TO_CHAR(ts, 'Mon DD YYYY HH12:MI AM'),
+			TO_CHAR(d, 'FMDay, FMMonth FMDD, YYYY'), TO_CHAR(d, '"Q"Q IYYY-"W"IW'), TO_CHAR(d, 'Day|DY|dy')
+		FROM it_dt WHERE id = 1`,
+		"2024-02-29 13:45:30.123|Feb 29 2024 01:45 PM|Thursday, February 29, 2024|Q1 2024-W09|Thursday |THU|thu")
+
+	// Current time: fixed within a statement, typed, and close to now.
+	h.expectRows(`SELECT CURRENT_DATE = CAST(CURRENT_TIMESTAMP AS DATE), CURRENT_TIMESTAMP = NOW(),
+			LOCALTIMESTAMP = CAST(NOW() AS TIMESTAMP)`, "true|true|true")
+	got, schema := h.query(`SELECT EPOCH(CURRENT_TIMESTAMP), CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP`)
+	var epoch float64
+	fmt.Sscan(strings.Split(got[0], "|")[0], &epoch)
+	if d := time.Since(time.Unix(int64(epoch), 0)); d < -time.Minute || d > time.Minute {
+		t.Errorf("CURRENT_TIMESTAMP is %v away from now", d)
+	}
+	if s := schema.String(); !strings.Contains(s, "date32") || !strings.Contains(s, "time64[us]") || !strings.Contains(s, "timestamp[us]") {
+		t.Errorf("current time types = %s", s)
+	}
+
+	// Constants built from functions still push down to the index.
+	h.expectRows(`SELECT id FROM it_dt WHERE ts >= DATE_TRUNC('year', TIMESTAMP '2024-06-01 00:00:00')`, "1")
+	h.expectRows(`SELECT id FROM it_dt WHERE d < CURRENT_DATE ORDER BY id`, "1", "2")
+	h.expectRows(`SELECT DATE_TRUNC('month', d), YEAR(ts), TO_CHAR(ts, 'YYYY') FROM it_dt WHERE id = 3`, "NULL|NULL|NULL")
+}
