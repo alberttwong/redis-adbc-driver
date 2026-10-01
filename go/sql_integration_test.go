@@ -2979,3 +2979,90 @@ func TestSQLDistinctOnInCorrelatedSubquery(t *testing.T) {
 	h.expectRows(`SELECT o.id FROM it_dson_o o
 		WHERE o.x IN (SELECT DISTINCT v FROM it_dson_i i WHERE i.k = o.k) ORDER BY o.id`, "1", "2", "3", "4")
 }
+
+// Comparisons with constants that don't fit the column type (1.5 for an
+// integer, 1.249 for NUMERIC(6,2), a timestamp with a time of day for a
+// DATE) must give the same answer whether the column is indexed (pushed
+// down) or NOINDEX (evaluated by the driver).
+func TestSQLInexactConstantPushdown(t *testing.T) {
+	h := newSQLHarness(t)
+	drop := func() { h.exec("DROP TABLE IF EXISTS it_inexact") }
+	drop()
+	t.Cleanup(drop)
+	types := []struct{ col, typ string }{
+		{"i", "INTEGER"}, {"b", "BIGINT"}, {"sm", "SMALLINT"}, {"f", "DOUBLE PRECISION"},
+		{"n", "NUMERIC(6,2)"}, {"d", "DATE"}, {"ts", "TIMESTAMP"}, {"s", "VARCHAR"},
+	}
+	var defs []string
+	for _, c := range types {
+		defs = append(defs, c.col+" "+c.typ, c.col+"_x "+c.typ+" NOINDEX")
+	}
+	h.exec("CREATE TABLE it_inexact (" + strings.Join(defs, ", ") + ")")
+	for _, r := range [][]string{
+		{"1", "1", "1", "1.0", "1.00", "DATE '2024-01-01'", "TIMESTAMP '2024-01-01 00:00:00'", "'1'"},
+		{"2", "2", "2", "1.5", "1.25", "DATE '2024-01-02'", "TIMESTAMP '2024-01-01 12:00:00'", "'01'"},
+		{"3", "3", "3", "2.0", "2.50", "DATE '2024-01-03'", "TIMESTAMP '2024-01-02 00:00:00'", "'a'"},
+		{"NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL"},
+	} {
+		var vals []string
+		for _, v := range r {
+			vals = append(vals, v, v)
+		}
+		h.exec("INSERT INTO it_inexact VALUES (" + strings.Join(vals, ", ") + ")")
+	}
+	consts := map[string][]string{
+		"i":  {"1.5", "1.4", "2.5", "2", "2.0", "-0.5", "CAST(1.5 AS REAL)"},
+		"b":  {"1.5", "2.5", "2.0", "CAST(1.5 AS DOUBLE PRECISION)"},
+		"sm": {"2.5", "1.5", "3"},
+		"f":  {"1.5", "1", "2", "1.25"},
+		"n":  {"1.25", "1.249", "1.251", "1.255", "2.5", "1", "CAST(1.25 AS DOUBLE PRECISION)"},
+		"d":  {"DATE '2024-01-02'", "TIMESTAMP '2024-01-02 00:00:00'", "TIMESTAMP '2024-01-02 12:00:00'", "TIMESTAMP '2024-01-01 23:59:59'"},
+		"ts": {"TIMESTAMP '2024-01-01 12:00:00'", "DATE '2024-01-02'", "TIMESTAMP '2024-01-01 12:00:00.000001'"},
+		"s":  {"'1'", "'01'", "'a'", "1"},
+	}
+	count := func(sql string) string {
+		st, err := h.conn.NewStatement(h.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close(h.ctx)
+		if err := st.SetSqlQuery(h.ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+		rdr, _, err := st.ExecuteQuery(h.ctx)
+		if err != nil {
+			return "error"
+		}
+		defer rdr.Release()
+		rdr.Next()
+		return rdr.RecordBatch().Column(0).ValueStr(0)
+	}
+	for _, c := range types {
+		for _, k := range consts[c.col] {
+			for _, op := range []string{"=", "<>", "<", "<=", ">", ">="} {
+				pushed := count(fmt.Sprintf("SELECT COUNT(*) FROM it_inexact WHERE %s %s %s", c.col, op, k))
+				exact := count(fmt.Sprintf("SELECT COUNT(*) FROM it_inexact WHERE %s_x %s %s", c.col, op, k))
+				if pushed != exact {
+					t.Errorf("%s %s %s: indexed column gives %s, NOINDEX column gives %s", c.col, op, k, pushed, exact)
+				}
+			}
+		}
+	}
+
+	// Exact constants are still answered by the index alone.
+	for _, q := range []string{
+		"SELECT i FROM it_inexact WHERE i = 2", "SELECT i FROM it_inexact WHERE i > 2.0",
+		"SELECT n FROM it_inexact WHERE n = 1.25", "SELECT s FROM it_inexact WHERE s = 'a'",
+		"SELECT d FROM it_inexact WHERE d >= TIMESTAMP '2024-01-02 00:00:00'",
+	} {
+		if query, residual, _ := h.planOf(q); query == "" || residual {
+			t.Errorf("%s: query %q, residual %v; want an index query only", q, query, residual)
+		}
+	}
+	// Inexact ones use the index too, with the predicate re-checked.
+	for _, q := range []string{"SELECT i FROM it_inexact WHERE i > 1.5", "SELECT n FROM it_inexact WHERE n = 1.249"} {
+		if query, residual, _ := h.planOf(q); query == "" || !residual {
+			t.Errorf("%s: query %q, residual %v; want an index query plus a residual", q, query, residual)
+		}
+	}
+}
