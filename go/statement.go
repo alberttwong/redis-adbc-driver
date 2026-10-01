@@ -277,19 +277,19 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 			return execResult{}, errorf(adbc.StatusInvalidArgument, "query has %d parameter(s) but %d are bound", ps.NumParams, len(paramTypes))
 		}
 		combined := execResult{affected: 0}
-		if _, ok := ps.Stmt.(*SelectStmt); ok {
+		if _, ok := ps.Stmt.(*SelectStmt); ok || hasReturning(ps.Stmt) {
 			// Establish the result schema even when no rows are bound.
 			exec.cache = newExecCache()
 			exec.paramTypes = paramTypes
 			if len(paramRows) > 0 {
 				exec.params = paramRows[0]
 			}
-			plan, err := exec.planSelect(ctx, ps.Stmt.(*SelectStmt), paramTypes)
+			cols, _, err := exec.resultColumns(ctx, ps.Stmt, paramTypes)
 			if err != nil {
 				return execResult{}, err
 			}
 			combined.isQuery = true
-			combined.cols = plan.columns()
+			combined.cols = cols
 		}
 		for _, row := range paramRows {
 			res, err := exec.execute(ctx, ps, row, paramTypes)
@@ -369,13 +369,12 @@ func (s *statementImpl) ExecuteSchema(ctx context.Context) (*arrow.Schema, error
 			paramTypes = append(paramTypes, t)
 		}
 	}
-	sel, ok := parsed[len(parsed)-1].Stmt.(*SelectStmt)
-	if !ok {
-		return arrow.NewSchema(nil, nil), nil
-	}
-	plan, err := s.executor().planSelect(ctx, sel, paramTypes)
+	cols, ok, err := s.executor().resultColumns(ctx, parsed[len(parsed)-1].Stmt, paramTypes)
 	if err != nil {
 		return nil, err
 	}
-	return resultSchema(plan.columns()), nil
+	if !ok {
+		return arrow.NewSchema(nil, nil), nil
+	}
+	return resultSchema(cols), nil
 }

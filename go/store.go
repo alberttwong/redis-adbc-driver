@@ -791,13 +791,31 @@ func (s *store) listTables(ctx context.Context, schema string) ([]string, error)
 // insertRows writes rows (values ordered like meta.Columns and already
 // coerced to the column types) as HASHes, returning the number written.
 func (s *store) insertRows(ctx context.Context, meta *tableMeta, rows [][]Value) (int64, error) {
+	a, err := s.allocRows(ctx, meta, rows)
+	if err != nil {
+		return 0, err
+	}
+	return s.writeRows(ctx, meta, a, rows)
+}
+
+// rowAlloc describes rows allocated by allocRows: their row ids are first,
+// first+1, …, and added holds the fields (name, value, …) of the missing
+// values they must be written with (see addedMissing).
+type rowAlloc struct {
+	first int64
+	added []any
+}
+
+// allocRows checks rows to be inserted against NOT NULL and allocates their
+// row ids. Ids allocated for rows that are then not written are not reused.
+func (s *store) allocRows(ctx context.Context, meta *tableMeta, rows [][]Value) (rowAlloc, error) {
 	if len(rows) == 0 {
-		return 0, nil
+		return rowAlloc{}, nil
 	}
 	for _, row := range rows {
 		for i, c := range meta.Columns {
 			if row[i].Null && !c.Nullable {
-				return 0, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
+				return rowAlloc{}, errorf(adbc.StatusIntegrity, "NULL value in column %q violates not-null constraint", c.Name)
 			}
 		}
 	}
@@ -808,28 +826,31 @@ func (s *store) insertRows(ctx context.Context, meta *tableMeta, rows [][]Value)
 	incr := tx.IncrBy(ctx, seqKey(meta.Schema, meta.Name), int64(len(rows)))
 	cur := tx.Get(ctx, metaKey(meta.Schema, meta.Name))
 	if _, err := tx.Exec(ctx); err != nil && !errors.Is(err, goredis.Nil) {
-		return 0, wrapRedis(err, "failed to allocate row ids")
+		return rowAlloc{}, wrapRedis(err, "failed to allocate row ids")
 	}
 	last, err := incr.Result()
 	if err != nil {
-		return 0, wrapRedis(err, "failed to allocate row ids")
+		return rowAlloc{}, wrapRedis(err, "failed to allocate row ids")
 	}
-	added := addedMissing(meta, cur.Val())
-	first := last - int64(len(rows)) + 1
+	return rowAlloc{first: last - int64(len(rows)) + 1, added: addedMissing(meta, cur.Val())}, nil
+}
+
+// writeRows writes rows allocated by allocRows as HASHes.
+func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows [][]Value) (int64, error) {
 	prefix := meta.prefix()
 	for start := 0; start < len(rows); start += pipelineChunk {
 		end := min(start+pipelineChunk, len(rows))
 		pipe := s.client.Pipeline()
 		for r := start; r < end; r++ {
-			id := strconv.FormatInt(first+int64(r), 10)
-			fields := make([]any, 0, 2+2*len(meta.Columns)+len(added))
+			id := strconv.FormatInt(a.first+int64(r), 10)
+			fields := make([]any, 0, 2+2*len(meta.Columns)+len(a.added))
 			fields = append(fields, rowIDField, id)
 			for i, c := range meta.Columns {
 				if v := rows[r][i]; !v.Null {
 					fields = append(fields, c.field(), encodeStored(v))
 				}
 			}
-			fields = append(fields, added...)
+			fields = append(fields, a.added...)
 			pipe.HSet(ctx, prefix+id, fields...)
 		}
 		if _, err := pipe.Exec(ctx); err != nil {

@@ -50,6 +50,9 @@ type scope struct {
 	// needs are this scope's columns read by correlated subqueries; the
 	// scope's query must fetch them even if it doesn't use them itself.
 	needs map[string]bool
+	// mergeReturning is set for the RETURNING list of a MERGE, the only
+	// place merge_action() may be called.
+	mergeReturning bool
 }
 
 // execCache holds per-statement results shared by nested executors.
@@ -137,6 +140,9 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 			// without OVER.
 			if windowOnlyFuncs[v.Name] {
 				err = errorf(adbc.StatusInvalidArgument, "window function %s requires an OVER clause", v.Name)
+			}
+			if v.Name == "MERGE_ACTION" {
+				err = e.checkMergeAction(v)
 			}
 		}
 	})
@@ -233,7 +239,12 @@ func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
 	if err != nil {
 		return err
 	}
-	if sq.Kind != SubqueryExists && len(plan.items) != 1 {
+	switch {
+	case sq.Width > 0:
+		if len(plan.items) != sq.Width {
+			return errorf(adbc.StatusInvalidArgument, "number of columns does not match number of values")
+		}
+	case sq.Kind != SubqueryExists && len(plan.items) != 1:
 		return errorf(adbc.StatusInvalidArgument, "subquery must return exactly one column, got %d", len(plan.items))
 	}
 	sq.plan = plan
@@ -484,4 +495,25 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 		set = env.exec.cachedInSet(sq, rows)
 	}
 	return set.eval(x, sq.Not), nil
+}
+
+// evalRowColumn evaluates one column of a subquery assigned to a column
+// list. Its rows are cached (or memoised per outer row), so the subquery
+// runs once for all the columns. No row sets the columns to NULL; more than
+// one is an error, as in Postgres.
+func (env *evalEnv) evalRowColumn(rc *RowColumn) (Value, error) {
+	if env.exec == nil {
+		return Value{}, fmt.Errorf("subqueries are not supported here")
+	}
+	rows, err := env.exec.subqueryRows(env.ctx, rc.Sub, env)
+	if err != nil {
+		return Value{}, err
+	}
+	switch len(rows) {
+	case 0:
+		return nullValue(rc.Sub.plan.items[rc.Index].typ), nil
+	case 1:
+		return rows[0][rc.Index], nil
+	}
+	return Value{}, fmt.Errorf("more than one row returned by a subquery used as an expression")
 }
