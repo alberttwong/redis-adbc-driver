@@ -37,6 +37,10 @@ type evalEnv struct {
 	// aggs holds the reduced value of each aggregate call when evaluating
 	// over a group (SELECT items, HAVING and ORDER BY of grouped queries).
 	aggs map[*Func]Value
+	// win holds the value of each window function call for every row of
+	// the window input; winRow is the current row's position in it.
+	win    map[*WindowFunc][]Value
+	winRow int
 }
 
 var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true}
@@ -80,6 +84,12 @@ func walkExpr(e Expr, fn func(Expr)) {
 	case *Subquery:
 		// The body is a separate scope; only the IN operand belongs here.
 		walkExpr(x.X, fn)
+	case *WindowFunc:
+		// The call itself is not visited as a *Func: SUM(x) OVER (…) is not
+		// an aggregate, but aggregates in its arguments (SUM(COUNT(*))) are.
+		for _, c := range x.children() {
+			walkExpr(c, fn)
+		}
 	}
 }
 
@@ -116,6 +126,10 @@ func walkOutsideAggregates(e Expr, fn func(Expr)) {
 		walkOutsideAggregates(x.Else, fn)
 	case *Subquery:
 		walkOutsideAggregates(x.X, fn)
+	case *WindowFunc:
+		for _, c := range x.children() {
+			walkOutsideAggregates(c, fn)
+		}
 	}
 }
 
@@ -235,6 +249,12 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		return env.evalCase(x)
 	case *Subquery:
 		return env.evalSubquery(x)
+	case *WindowFunc:
+		vals, ok := env.win[x]
+		if !ok {
+			return Value{}, fmt.Errorf("window function %s is not allowed here", x.Func.Name)
+		}
+		return vals[env.winRow], nil
 	}
 	return Value{}, fmt.Errorf("unsupported expression %T", e)
 }
@@ -708,6 +728,8 @@ func inferType(e Expr, cols map[string]ColType, params []ColType) (ColType, erro
 			return x.plan.items[0].typ, nil
 		}
 		return typeBool, nil
+	case *WindowFunc:
+		return windowType(x, cols, params)
 	case *Case:
 		results := make([]Expr, 0, len(x.Whens)+1)
 		for _, w := range x.Whens {

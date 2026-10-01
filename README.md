@@ -257,6 +257,25 @@ EXCEPT
 SELECT customer_id FROM sales WHERE product = 'gizmo' AND quantity = 20
 ORDER BY 1 LIMIT 5;
 
+-- Window functions run in the driver, after WHERE / GROUP BY / HAVING.
+-- Each customer's latest order (the dbt de-duplication idiom), and the same
+-- with QUALIFY: the earliest customer per country
+SELECT customer_id, order_id, ordered_at FROM (
+  SELECT customer_id, order_id, ordered_at,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at DESC) AS rn
+  FROM sales
+) AS latest WHERE rn = 1 ORDER BY customer_id LIMIT 5;
+SELECT name, country, signup_date FROM customers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY country ORDER BY signup_date) = 1 ORDER BY country;
+
+-- Ranks and running totals over grouped rows; LAG and a moving average
+SELECT country, SUM(quantity) AS units, RANK() OVER (ORDER BY SUM(quantity) DESC) AS rnk,
+       SUM(SUM(quantity)) OVER (ORDER BY SUM(quantity) DESC) AS running_units
+FROM sales GROUP BY country ORDER BY rnk;
+SELECT order_id, quantity, LAG(quantity) OVER w AS prev,
+       AVG(quantity) OVER (w ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg
+FROM sales WHERE customer_id = 7 WINDOW w AS (ORDER BY order_id) ORDER BY order_id LIMIT 5;
+
 -- Date/time functions (UTC): monthly totals for the first quarter
 SELECT TO_CHAR(DATE_TRUNC('month', ordered_at), 'YYYY-MM') AS month, COUNT(*) AS orders, SUM(quantity) AS units
 FROM sales WHERE EXTRACT(QUARTER FROM ordered_at) = 1
@@ -381,10 +400,11 @@ How SQL is executed:
 | Subqueries | Uncorrelated: run once per statement, results reused. Correlated: run per outer row with the outer values as constants (so they still use the index), memoised |
 | `UNION` / `INTERSECT` / `EXCEPT` | Each branch runs as its own query (using its own index); the driver combines, de-duplicates and sorts the results |
 | CTEs, derived tables | Run once; the outer query filters, sorts and groups them in memory |
+| Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row). A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
 | `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata), plus `FT.ALTER` for `ADD COLUMN` and a background `HDEL` pass for `DROP COLUMN` |
-| Views | Single-table views without GROUP BY/aggregates/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
+| Views | Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
@@ -488,7 +508,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   parenthesized: `INSERT INTO t (SELECT …)`)
 - `[WITH name [(cols)] AS (SELECT …), …] SELECT … FROM item {, item |
   [INNER | LEFT | RIGHT | FULL] [OUTER] JOIN item ON … | USING (…) | CROSS JOIN item}
-  [WHERE …] [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n] [OFFSET m]`,
+  [WHERE …] [GROUP BY …] [HAVING …] [WINDOW w AS (…), …] [QUALIFY …]
+  [ORDER BY …] [LIMIT n] [OFFSET m]`,
   where an item is a table, a CTE, or `(SELECT …)`, each with an optional
   alias (`t.col` qualifies a column),
   with `COUNT/SUM/AVG/MIN/MAX`, `CASE` (simple and searched), arithmetic,
@@ -506,6 +527,35 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   does (subqueries, CTEs, views, CTAS, `INSERT … SELECT`)
 - `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]`; NULLs sort last by default in
   both directions
+- Window functions, `fn(…) OVER ([PARTITION BY …] [ORDER BY …] [frame])`, in
+  the SELECT list, `ORDER BY` and `QUALIFY`. They see the rows after `WHERE`,
+  `GROUP BY` and `HAVING`, and work anywhere a query does (joins, subqueries,
+  CTEs, views, CTAS, `INSERT … SELECT`):
+  - Ranking: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`,
+    `NTILE(n)`
+  - Offset: `LAG` / `LEAD(x [, offset [, default]])`, `FIRST_VALUE(x)`,
+    `LAST_VALUE(x)`, `NTH_VALUE(x, n)`
+  - Aggregates: `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(x)`, also over grouped
+    results (`SUM(COUNT(*)) OVER (ORDER BY day)`); `DISTINCT` is not
+    supported (nor is it in PostgreSQL)
+  - Frames: `{ROWS | RANGE | GROUPS} {start | BETWEEN start AND end}` with
+    `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`,
+    `UNBOUNDED FOLLOWING`. `RANGE` offsets are numbers for a numeric `ORDER BY`
+    key and intervals for dates, timestamps and intervals. Without a frame,
+    the SQL default applies: with `ORDER BY`, from the start of the partition
+    to the current row's last peer (rows with equal keys); without `ORDER BY`,
+    the whole partition. `EXCLUDE` (other than `EXCLUDE NO OTHERS`) is not
+    supported
+  - Named windows: `WINDOW w AS (…)`, `OVER w`, `OVER (w ORDER BY … [frame])`
+  - `QUALIFY` filters on window results and may use output aliases
+    (`QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC) = 1`)
+  - Result types: `BIGINT` for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE` and
+    `COUNT`; `DOUBLE PRECISION` for `PERCENT_RANK`, `CUME_DIST` and `AVG`; the
+    argument's type for `MIN`, `MAX` and the offset functions; `SUM` as with
+    `GROUP BY`
+  - As in `ORDER BY`, NULLs sort last by default in either direction
+    (PostgreSQL puts them first for `DESC`). Rows that tie on the window's
+    `ORDER BY` keep their input order
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
   negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD`,
   `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
@@ -613,7 +663,7 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   deleted. `INSERT DEFAULT VALUES` inserts NULLs (column defaults aren't
   stored)
 - Not supported: `NATURAL JOIN`, `WITH RECURSIVE`, `LATERAL`, `ANY`/`ALL`
-  comparisons, window functions
+  comparisons
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
   [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)

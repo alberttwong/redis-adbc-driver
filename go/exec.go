@@ -493,7 +493,15 @@ type selectPlan struct {
 	extraNeed map[string]bool
 	// setop is set for UNION / INTERSECT / EXCEPT.
 	setop *setOpPlan
+	// windows are the window function calls (SELECT list, ORDER BY,
+	// QUALIFY); qualify is the QUALIFY predicate with aliases resolved.
+	windows []windowCall
+	qualify Expr
 }
+
+// windowed reports whether the query computes window functions (or
+// filters with QUALIFY) before its ORDER BY and LIMIT.
+func (p *selectPlan) windowed() bool { return len(p.windows) > 0 || p.qualify != nil }
 
 func (p *selectPlan) columns() []resultColumn {
 	cols := make([]resultColumn, len(p.items))
@@ -616,6 +624,9 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			if isAggregate(g) {
 				return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in GROUP BY")
 			}
+			if containsWindow(g) {
+				return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in GROUP BY")
+			}
 			sel.GroupBy[i] = g
 		}
 	}
@@ -631,11 +642,17 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if err := e.bind(ctx, having); err != nil {
 			return nil, err
 		}
+		if containsWindow(having) {
+			return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in HAVING")
+		}
 		plan.having = having
 	}
 	if sel.Where != nil {
 		if isAggregate(sel.Where) {
 			return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHERE")
+		}
+		if containsWindow(sel.Where) {
+			return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in WHERE; filter on them with QUALIFY or in an outer query")
 		}
 		if err := e.bind(ctx, sel.Where); err != nil {
 			return nil, err
@@ -673,6 +690,27 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			return nil, err
 		}
 		plan.order = append(plan.order, planOrder{expr: expr, desc: o.Desc, nullsFirst: o.Nulls == NullsFirst})
+	}
+	if sel.Qualify != nil {
+		// QUALIFY filters after window functions; like HAVING, it may use
+		// output aliases (QUALIFY rn = 1).
+		aliases := map[string]Expr{}
+		for i, it := range sel.Items {
+			if !it.Star && it.Alias != "" {
+				aliases[strings.ToLower(it.Alias)] = plan.items[itemStart[i]].expr
+			}
+		}
+		qualify := replaceAliases(sel.Qualify, aliases, plan.meta)
+		if err := e.bind(ctx, qualify); err != nil {
+			return nil, err
+		}
+		if isAggregate(qualify) {
+			plan.aggregate = true
+		}
+		plan.qualify = qualify
+	}
+	if err := e.planWindows(plan, types); err != nil {
+		return nil, err
 	}
 	return plan, nil
 }
@@ -727,6 +765,13 @@ func (e *executor) selectWithoutTable(ctx context.Context, plan *selectPlan, par
 		}
 		if b, valid := truthy(ok); !valid || !b {
 			return nil, nil
+		}
+	}
+	if plan.windowed() {
+		// Windows over the single row.
+		keep, err := e.applyWindows(env, plan, 1, func(int) {})
+		if err != nil || len(keep) == 0 {
+			return nil, err
 		}
 	}
 	row := make([]Value, len(plan.items))

@@ -79,6 +79,8 @@ func isConstant(e Expr) bool {
 			if f.correlated {
 				constant = false
 			}
+		case *WindowFunc:
+			constant = false
 		}
 	})
 	return constant
@@ -492,6 +494,9 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	for _, it := range plan.items {
 		columnRefs(it.expr, req.need)
 	}
+	if plan.qualify != nil {
+		columnRefs(plan.qualify, req.need)
+	}
 
 	// ORDER BY on indexed columns sorts inside the index; anything else is
 	// sorted by the driver after fetching.
@@ -522,7 +527,9 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 		indexSort = true
 	}
 	sel := plan.sel
-	pushLimit := wp.residual == nil && indexSort && wp.keys == nil && sel.Limit != nil
+	// With window functions, LIMIT applies once they are computed (and
+	// QUALIFY has filtered), so it never runs in the index.
+	pushLimit := !plan.windowed() && wp.residual == nil && indexSort && wp.keys == nil && sel.Limit != nil
 	if pushLimit {
 		off := int64(0)
 		if sel.Offset != nil {
@@ -536,10 +543,21 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 		return nil, err
 	}
 	env := e.newEnv(ctx, meta.types(), params)
+	// idx lists the rows to return, in order.
+	idx := make([]int, len(rows))
+	for i := range idx {
+		idx[i] = i
+	}
+	setRow := func(i int) { env.row, env.winRow = rows[i], i }
+	if plan.windowed() {
+		if idx, err = e.applyWindows(env, plan, len(rows), setRow); err != nil {
+			return nil, err
+		}
+	}
 	if !indexSort && len(plan.order) > 0 {
 		keys := make([][]Value, len(rows))
-		for i, r := range rows {
-			env.row = r
+		for _, i := range idx {
+			setRow(i)
 			for _, o := range plan.order {
 				k, err := env.eval(o.expr)
 				if err != nil {
@@ -548,23 +566,14 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 				keys[i] = append(keys[i], k)
 			}
 		}
-		idx := make([]int, len(rows))
-		for i := range idx {
-			idx[i] = i
-		}
 		sort.SliceStable(idx, func(a, b int) bool { return lessKeys(keys[idx[a]], keys[idx[b]], plan.order) })
-		sorted := make([]map[string]Value, len(rows))
-		for i, j := range idx {
-			sorted[i] = rows[j]
-		}
-		rows = sorted
 	}
 	if !pushLimit {
-		rows = applyLimit(rows, sel.Offset, sel.Limit)
+		idx = applyLimit(idx, sel.Offset, sel.Limit)
 	}
-	out := make([][]Value, 0, len(rows))
-	for _, r := range rows {
-		env.row = r
+	out := make([][]Value, 0, len(idx))
+	for _, i := range idx {
+		setRow(i)
 		row := make([]Value, len(plan.items))
 		for i, it := range plan.items {
 			v, err := env.eval(it.expr)
@@ -596,6 +605,9 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 	if plan.having != nil {
 		collectAggregates(plan.having, &aggs)
 	}
+	if plan.qualify != nil {
+		collectAggregates(plan.qualify, &aggs)
+	}
 	types := meta.types()
 	env := e.newEnv(ctx, types, params)
 
@@ -610,22 +622,39 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 		}
 	}
 
-	type outRow struct {
-		vals []Value
-		keys []Value
-	}
-	out := make([]outRow, 0, len(groups))
-	for _, g := range groups {
-		env.row, env.aggs = g.rep, g.results
-		if plan.having != nil {
+	kept := groups
+	if plan.having != nil {
+		kept = make([]aggGroup, 0, len(groups))
+		for _, g := range groups {
+			env.row, env.aggs = g.rep, g.results
 			keep, err := env.eval(plan.having)
 			if err != nil {
 				return nil, invalidArg(err)
 			}
-			if b, ok := truthy(keep); !ok || !b {
-				continue
+			if b, ok := truthy(keep); ok && b {
+				kept = append(kept, g)
 			}
 		}
+	}
+	// Window functions see one row per group, after HAVING.
+	idx := make([]int, len(kept))
+	for i := range idx {
+		idx[i] = i
+	}
+	setRow := func(i int) { env.row, env.aggs, env.winRow = kept[i].rep, kept[i].results, i }
+	if plan.windowed() {
+		if idx, err = e.applyWindows(env, plan, len(kept), setRow); err != nil {
+			return nil, err
+		}
+	}
+
+	type outRow struct {
+		vals []Value
+		keys []Value
+	}
+	out := make([]outRow, 0, len(idx))
+	for _, i := range idx {
+		setRow(i)
 		row := outRow{}
 		for _, it := range plan.items {
 			v, err := env.eval(it.expr)
@@ -714,6 +743,9 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 	}
 	if plan.having != nil {
 		collectOutside(plan.having)
+	}
+	if plan.qualify != nil {
+		collectOutside(plan.qualify)
 	}
 	for name := range outside {
 		if !groupNames[name] {
@@ -875,6 +907,9 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 	}
 	if plan.having != nil {
 		columnRefs(plan.having, req.need)
+	}
+	if plan.qualify != nil {
+		columnRefs(plan.qualify, req.need)
 	}
 	_, rows, err := e.scan(ctx, req, params)
 	if err != nil {

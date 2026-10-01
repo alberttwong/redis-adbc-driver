@@ -2053,3 +2053,544 @@ func TestSQLConcatNulls(t *testing.T) {
 	h.expectRows("SELECT data_type FROM information_schema.columns WHERE table_name = 'it_concat_out' AND column_name = 'label'", "VARCHAR")
 	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects a separator")
 }
+
+// setupWindows creates the window-function data set. By g, ordered by k
+// (NULLs last):
+//
+//	a: id1 k10 v5 | id2 k20 v3, id3 k20 vNULL (peers) | id4 k40 v8
+//	b: id6 k10 v2 | id7 k30 v2 | id5 kNULL v7
+//	c: id8 k5 v1
+func (h *sqlHarness) setupWindows() {
+	h.t.Helper()
+	h.exec("DROP TABLE IF EXISTS it_win")
+	h.exec(`CREATE TABLE it_win (id INTEGER NOT NULL, g VARCHAR, k INTEGER, v INTEGER, amt NUMERIC(8,2),
+		f DOUBLE PRECISION, d DATE)`)
+	h.exec(`INSERT INTO it_win VALUES
+		(1, 'a', 10, 5, 1.50, 0.5, DATE '2024-01-01'),
+		(2, 'a', 20, 3, 2.25, 1.25, DATE '2024-01-02'),
+		(3, 'a', 20, NULL, NULL, 2.0, DATE '2024-01-04'),
+		(4, 'a', 40, 8, 10.00, NULL, DATE '2024-01-08'),
+		(5, 'b', NULL, 7, 3.00, 4.0, DATE '2024-01-03'),
+		(6, 'b', 10, 2, 0.75, 0.25, DATE '2024-01-05'),
+		(7, 'b', 30, 2, 5.00, 8.0, NULL),
+		(8, 'c', 5, 1, 1.00, 1.0, DATE '2024-01-06')`)
+	h.t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_win") })
+}
+
+func TestSQLWindowRanking(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+
+	// Peers (k = 20 in a) share RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST;
+	// ROW_NUMBER breaks the tie with id. NULL k sorts last.
+	schema := h.expectRows(`SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY k, id) AS rn,
+			RANK() OVER w, DENSE_RANK() OVER w, PERCENT_RANK() OVER w, CUME_DIST() OVER w
+		FROM it_win WINDOW w AS (PARTITION BY g ORDER BY k) ORDER BY id`,
+		"1|1|1|1|0|0.25",
+		"2|2|2|2|0.3333333333333333|0.75",
+		"3|3|2|2|0.3333333333333333|0.75",
+		"4|4|4|3|1|1",
+		"5|3|3|3|1|1",
+		"6|1|1|1|0|0.3333333333333333",
+		"7|2|2|2|0.5|0.6666666666666666",
+		"8|1|1|1|0|1")
+	for i, want := range []arrow.Type{arrow.INT32, arrow.INT64, arrow.INT64, arrow.INT64, arrow.FLOAT64, arrow.FLOAT64} {
+		if got := schema.Field(i).Type.ID(); got != want {
+			t.Errorf("column %d type = %s, want %s", i, got, want)
+		}
+	}
+
+	// NULL ordering: last by default in both directions (as in this driver's
+	// ORDER BY; PostgreSQL puts them first for DESC), or as requested.
+	h.expectRows(`SELECT id, RANK() OVER (ORDER BY k DESC), RANK() OVER (ORDER BY k NULLS FIRST),
+			RANK() OVER (ORDER BY k DESC NULLS FIRST), RANK() OVER (ORDER BY k NULLS LAST)
+		FROM it_win ORDER BY id`,
+		"1|5|3|6|2", "2|3|5|4|4", "3|3|5|4|4", "4|1|8|2|7",
+		"5|8|1|1|8", "6|5|3|6|2", "7|2|7|3|6", "8|7|2|8|1")
+
+	// NTILE: the first buckets get the extra rows; more buckets than rows.
+	h.expectRows(`SELECT id, NTILE(3) OVER (ORDER BY id), NTILE(2) OVER (PARTITION BY g ORDER BY id),
+			NTILE(10) OVER (PARTITION BY g ORDER BY id), NTILE(NULL) OVER ()
+		FROM it_win ORDER BY id`,
+		"1|1|1|1|NULL", "2|1|1|2|NULL", "3|1|2|3|NULL", "4|2|2|4|NULL",
+		"5|2|1|1|NULL", "6|2|1|2|NULL", "7|3|2|3|NULL", "8|3|1|1|NULL")
+
+	// Without ORDER BY every row of a partition is a peer.
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (), RANK() OVER (), DENSE_RANK() OVER (PARTITION BY g),
+			PERCENT_RANK() OVER (PARTITION BY g), CUME_DIST() OVER (PARTITION BY g)
+		FROM it_win WHERE id <= 5 ORDER BY id`,
+		"1|1|1|1|0|1", "2|2|1|1|0|1", "3|3|1|1|0|1", "4|4|1|1|0|1", "5|5|1|1|0|1")
+
+	// Ranking by an expression and over strings.
+	h.expectRows(`SELECT g, id, DENSE_RANK() OVER (ORDER BY g DESC) FROM it_win WHERE id IN (1, 5, 6, 8) ORDER BY id`,
+		"a|1|3", "b|5|2", "b|6|2", "c|8|1")
+	h.expectRows(`SELECT id, RANK() OVER (PARTITION BY v IS NULL ORDER BY COALESCE(v, 0) * -1) FROM it_win WHERE g = 'a' ORDER BY id`,
+		"1|2", "2|3", "3|1", "4|1")
+}
+
+func TestSQLWindowOffsetFunctions(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+
+	// LAG / LEAD stay inside the partition. The default is used only when
+	// there is no such row (not when its value is NULL); a negative offset
+	// looks the other way; a NULL offset gives NULL.
+	h.expectRows(`SELECT id, LAG(v) OVER w, LEAD(v) OVER w, LAG(v, 2) OVER w, LEAD(v, 1, 0) OVER w,
+			LAG(v, -1) OVER w, LAG(v, NULL) OVER w
+		FROM it_win WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY id`,
+		"1|NULL|3|NULL|3|3|NULL",
+		"2|5|NULL|NULL|NULL|NULL|NULL",
+		"3|3|8|5|8|8|NULL",
+		"4|NULL|NULL|3|0|NULL|NULL",
+		"5|NULL|2|NULL|2|2|NULL",
+		"6|7|2|NULL|2|2|NULL",
+		"7|2|NULL|7|0|NULL|NULL",
+		"8|NULL|NULL|NULL|0|NULL|NULL")
+	schema := h.expectRows(`SELECT LAG(g, 1, 'none') OVER (ORDER BY id), LEAD(amt, 1, 0) OVER (ORDER BY id),
+			LAG(d) OVER (ORDER BY id) FROM it_win WHERE id IN (1, 2)`,
+		"none|2.25|NULL", "a|0.00|2024-01-01")
+	if s := schema.String(); !strings.Contains(s, "utf8") || !strings.Contains(s, "decimal(38, 2)") || !strings.Contains(s, "date32") {
+		t.Errorf("LAG/LEAD types = %s", s)
+	}
+
+	// FIRST_VALUE / LAST_VALUE / NTH_VALUE use the frame: by default it ends
+	// at the current row, so LAST_VALUE is the current row's value.
+	h.expectRows(`SELECT id, FIRST_VALUE(v) OVER w, LAST_VALUE(v) OVER w, NTH_VALUE(v, 2) OVER w,
+			LAST_VALUE(v) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+			NTH_VALUE(v, 3) OVER (w ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+		FROM it_win WINDOW w AS (PARTITION BY g ORDER BY k, id) ORDER BY id`,
+		"1|5|5|NULL|8|NULL",
+		"2|5|3|3|8|NULL",
+		"3|5|NULL|3|8|8",
+		"4|5|8|3|8|NULL",
+		"5|2|7|2|7|NULL",
+		"6|2|2|NULL|7|NULL",
+		"7|2|2|2|7|7",
+		"8|1|1|NULL|1|NULL")
+	// An empty frame gives NULL.
+	h.expectRows(`SELECT id, FIRST_VALUE(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING),
+			LAST_VALUE(id) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 5 FOLLOWING)
+		FROM it_win WHERE g = 'a' ORDER BY id`,
+		"1|NULL|4", "2|1|4", "3|1|4", "4|2|NULL")
+}
+
+func TestSQLWindowAggregates(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+
+	// Default frames. With ORDER BY: RANGE UNBOUNDED PRECEDING to CURRENT ROW,
+	// which includes the current row's peers (ids 2 and 3 both see 3 rows);
+	// a NULL key is a peer group of its own. Without ORDER BY: the partition.
+	h.expectRows(`SELECT id, COUNT(*) OVER w, COUNT(v) OVER w, SUM(v) OVER w, AVG(v) OVER w, MIN(v) OVER w,
+			MAX(v) OVER w, SUM(v) OVER (PARTITION BY g)
+		FROM it_win WINDOW w AS (PARTITION BY g ORDER BY k) ORDER BY id`,
+		"1|1|1|5|5|5|5|16",
+		"2|3|2|8|4|3|5|16",
+		"3|3|2|8|4|3|5|16",
+		"4|4|3|16|5.333333333333333|3|8|16",
+		"5|3|3|11|3.6666666666666665|2|7|11",
+		"6|1|1|2|2|2|2|11",
+		"7|2|2|4|2|2|2|11",
+		"8|1|1|1|1|1|1|1")
+
+	// ROWS frames with every kind of bound (v by id: 5 3 NULL 8 7 2 2 1).
+	h.expectRows(`SELECT id,
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING),
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING),
+			SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+		FROM it_win ORDER BY id`,
+		"1|5|8|28|NULL|11|28",
+		"2|8|8|23|5|15|28",
+		"3|8|11|20|8|17|28",
+		"4|16|15|20|3|11|28",
+		"5|23|17|12|8|5|28",
+		"6|25|11|5|15|3|28",
+		"7|27|5|3|9|1|28",
+		"8|28|3|1|4|NULL|28")
+	h.expectRows(`SELECT id,
+			COUNT(*) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING),
+			SUM(v) OVER (ORDER BY id ROWS 2 PRECEDING),
+			MIN(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+			MAX(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+			AVG(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING),
+			COUNT(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)
+		FROM it_win ORDER BY id`,
+		"1|0|5|3|5|4|1",
+		"2|1|8|3|5|3|2",
+		"3|2|8|3|5|8|2",
+		"4|2|11|7|8|7.5|3",
+		"5|2|15|2|8|4.5|4",
+		"6|2|17|2|8|2|5",
+		"7|2|11|1|7|1.5|6",
+		"8|2|5|1|2|1|7")
+
+	// RANGE frames with numeric offsets, ascending and descending. A NULL key
+	// is its own frame for offset bounds, and other rows' frames don't reach
+	// the NULLs (wherever NULLS FIRST / LAST puts them).
+	h.expectRows(`SELECT id,
+			SUM(v) OVER (PARTITION BY g ORDER BY k RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING),
+			COUNT(*) OVER (PARTITION BY g ORDER BY k RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),
+			SUM(v) OVER (PARTITION BY g ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND 15 PRECEDING),
+			SUM(v) OVER (PARTITION BY g ORDER BY k DESC RANGE BETWEEN 10 PRECEDING AND CURRENT ROW),
+			SUM(v) OVER (PARTITION BY g ORDER BY k NULLS FIRST RANGE BETWEEN 20 PRECEDING AND CURRENT ROW)
+		FROM it_win ORDER BY id`,
+		"1|8|4|NULL|8|5",
+		"2|8|3|NULL|3|8",
+		"3|8|3|NULL|3|8",
+		"4|8|1|8|8|11",
+		"5|7|1|11|7|7",
+		"6|2|3|NULL|2|2",
+		"7|2|2|2|2|4",
+		"8|1|1|NULL|1|1")
+	// RANGE over doubles (f sorted: 0.25 0.5 1.0 1.25 2.0 4.0 8.0 NULL).
+	h.expectRows(`SELECT id, COUNT(*) OVER (ORDER BY f RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) FROM it_win ORDER BY id`,
+		"1|3", "2|2", "3|1", "4|1", "5|1", "6|2", "7|1", "8|3")
+	// RANGE over dates with interval offsets.
+	h.expectRows(`SELECT id, COUNT(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2 days' PRECEDING AND CURRENT ROW),
+			SUM(v) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND INTERVAL '1 day' FOLLOWING)
+		FROM it_win ORDER BY id`,
+		"1|1|8", "2|2|10", "3|3|2", "4|2|8", "5|3|7", "6|3|3", "7|1|2", "8|3|1")
+
+	// GROUPS frames count peer groups: {8} {1,6} {2,3} {7} {4} {5}.
+	h.expectRows(`SELECT id,
+			SUM(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+			COUNT(*) OVER (ORDER BY k GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING),
+			SUM(v) OVER (ORDER BY k GROUPS 1 PRECEDING),
+			SUM(v) OVER (ORDER BY k GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING)
+		FROM it_win ORDER BY id`,
+		"1|11|5|8|1", "2|12|4|10|8", "3|12|4|10|8", "4|17|2|10|5",
+		"5|15|1|15|10", "6|11|5|8|1", "7|13|3|5|10", "8|8|5|1|NULL")
+
+	// Result types follow the aggregates': decimal SUM stays decimal, AVG and
+	// floating-point SUM are doubles, MIN / MAX keep the argument's type.
+	schema := h.expectRows(`SELECT id, SUM(amt) OVER (ORDER BY id),
+			AVG(amt) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),
+			SUM(f) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), MIN(d) OVER (), MAX(g) OVER (),
+			SUM(v) OVER (), COUNT(*) OVER ()
+		FROM it_win ORDER BY id`,
+		"1|1.50|1.5|1.75|2024-01-01|c|28|8",
+		"2|3.75|1.875|3.75|2024-01-01|c|28|8",
+		"3|3.75|2.25|3.25|2024-01-01|c|28|8",
+		"4|13.75|10|6|2024-01-01|c|28|8",
+		"5|16.75|6.5|4.25|2024-01-01|c|28|8",
+		"6|17.50|1.875|12.25|2024-01-01|c|28|8",
+		"7|22.50|2.875|9.25|2024-01-01|c|28|8",
+		"8|23.50|3|9|2024-01-01|c|28|8")
+	if s := schema.String(); !strings.Contains(s, "OVER (ORDER BY id): type=decimal(38, 2)") ||
+		!strings.Contains(s, "CURRENT ROW): type=float64") || !strings.Contains(s, "MIN(d) OVER (): type=date32") ||
+		!strings.Contains(s, "MAX(g) OVER (): type=utf8") || !strings.Contains(s, "SUM(v) OVER (): type=int64") ||
+		!strings.Contains(s, "COUNT(*) OVER (): type=int64") {
+		t.Errorf("window aggregate types = %s", s)
+	}
+
+	// Window calls inside expressions and scalar functions, and scalar
+	// functions in window arguments and keys.
+	h.expectRows(`SELECT id, ROUND(AVG(v) OVER (PARTITION BY g), 2), COALESCE(LAG(v) OVER (ORDER BY id), 0),
+			ROUND(100.0 * v / SUM(v) OVER (), 1), ROW_NUMBER() OVER (PARTITION BY UPPER(g) ORDER BY ABS(k - 20), id),
+			CASE WHEN ROW_NUMBER() OVER (PARTITION BY g ORDER BY id DESC) = 1 THEN 'latest' ELSE 'old' END,
+			SUM(v) OVER (PARTITION BY g) - v
+		FROM it_win ORDER BY id`,
+		"1|5.33|0|17.9|3|old|11",
+		"2|5.33|5|10.7|1|old|13",
+		"3|5.33|3|NULL|2|old|NULL",
+		"4|5.33|0|28.6|4|latest|8",
+		"5|3.67|8|25|3|old|4",
+		"6|3.67|7|7.1|1|old|9",
+		"7|3.67|2|7.1|2|latest|9",
+		"8|1|2|3.6|1|latest|0")
+
+	// Empty input, all-NULL partitions, and empty frames.
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (), SUM(v) OVER () FROM it_win WHERE id > 100`)
+	h.expectRows(`SELECT id, SUM(amt) OVER (PARTITION BY amt IS NULL), COUNT(amt) OVER (PARTITION BY amt IS NULL),
+			MAX(amt) OVER (PARTITION BY amt IS NULL)
+		FROM it_win WHERE id <= 4 ORDER BY id`,
+		"1|13.75|3|10.00", "2|13.75|3|10.00", "3|NULL|0|NULL", "4|13.75|3|10.00")
+	h.expectRows(`SELECT COUNT(*), SUM(COUNT(*)) OVER () FROM it_win WHERE id > 100`, "0|0")
+}
+
+func TestSQLWindowGrouped(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+
+	// Windows over GROUP BY see one row per group. COUNT and integer SUM are
+	// reduced by the index; the windows run on the groups.
+	h.expectRows(`SELECT g, COUNT(*) AS n, SUM(COUNT(*)) OVER (ORDER BY g) AS running,
+			RANK() OVER (ORDER BY SUM(v) DESC) AS r, SUM(v) AS total, LAG(g) OVER (ORDER BY g)
+		FROM it_win GROUP BY g ORDER BY g`,
+		"a|4|4|1|16|NULL", "b|3|7|2|11|a", "c|1|8|3|1|b")
+	// Decimal SUM (aggregated by the driver).
+	schema := h.expectRows(`SELECT g, SUM(amt), SUM(SUM(amt)) OVER (),
+			MAX(SUM(amt)) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+		FROM it_win GROUP BY g ORDER BY g`,
+		"a|13.75|23.50|13.75", "b|8.75|23.50|13.75", "c|1.00|23.50|8.75")
+	if dt := schema.Field(2).Type; dt.ID() != arrow.DECIMAL128 {
+		t.Errorf("SUM(SUM(amt)) OVER () type = %s, want decimal", dt)
+	}
+	// After HAVING; in ORDER BY; QUALIFY over aggregates.
+	h.expectRows(`SELECT g, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) FROM it_win
+		GROUP BY g HAVING COUNT(*) > 1 ORDER BY g`, "a|4|1", "b|3|2")
+	h.expectRows(`SELECT g FROM it_win GROUP BY g ORDER BY RANK() OVER (ORDER BY COUNT(*)), g`, "c", "b", "a")
+	h.expectRows(`SELECT g, SUM(v) AS total FROM it_win GROUP BY g
+		QUALIFY RANK() OVER (ORDER BY SUM(v) DESC) <= 2 ORDER BY total`, "b|11", "a|16")
+	// Grouped by an expression, partitioned by a grouped column.
+	h.expectRows(`SELECT g, v IS NULL AS missing, COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY g)
+		FROM it_win WHERE g IN ('a', 'b') GROUP BY g, v IS NULL ORDER BY g, missing`,
+		"a|false|3|4", "a|true|1|4", "b|false|3|3")
+}
+
+func TestSQLWindowQueries(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+	h.setupOrders()
+	h.exec("DROP TABLE IF EXISTS it_events")
+	h.exec("DROP TABLE IF EXISTS it_events_dedup")
+	h.exec("DROP TABLE IF EXISTS it_win_ins")
+	h.exec("DROP VIEW IF EXISTS it_events_ranked")
+	h.exec("DROP VIEW IF EXISTS it_events_latest")
+	t.Cleanup(func() {
+		h.exec("DROP VIEW IF EXISTS it_events_ranked")
+		h.exec("DROP VIEW IF EXISTS it_events_latest")
+		h.exec("DROP TABLE IF EXISTS it_events")
+		h.exec("DROP TABLE IF EXISTS it_events_dedup")
+		h.exec("DROP TABLE IF EXISTS it_win_ins")
+	})
+	h.exec(`CREATE TABLE it_events (k VARCHAR, ts TIMESTAMP, payload VARCHAR)`)
+	h.exec(`INSERT INTO it_events VALUES
+		('a', TIMESTAMP '2024-01-01 10:00:00', 'a1'),
+		('a', TIMESTAMP '2024-01-03 09:00:00', 'a3'),
+		('a', TIMESTAMP '2024-01-02 12:00:00', 'a2'),
+		('b', TIMESTAMP '2024-01-05 00:00:00', 'b1'),
+		('c', TIMESTAMP '2024-01-01 00:00:00', 'c1'),
+		('c', TIMESTAMP '2023-12-31 00:00:00', 'c0')`)
+
+	// The dbt de-duplication idiom: the latest row per key. As a derived
+	// table without an alias, with one, as a CTE, and with QUALIFY.
+	h.expectRows(`select * from (select *, row_number() over (partition by k order by ts desc) as rn from it_events)
+		where rn = 1 order by k`,
+		"a|2024-01-03T09:00:00|a3|1", "b|2024-01-05T00:00:00|b1|1", "c|2024-01-01T00:00:00|c1|1")
+	h.expectRows(`select deduped.k, deduped.payload from (
+			select k, payload, row_number() over (partition by k order by ts desc) as rn from it_events
+		) as deduped where deduped.rn = 1 order by deduped.k`,
+		"a|a3", "b|b1", "c|c1")
+	h.expectRows(`with ranked as (select k, payload, row_number() over (partition by k order by ts desc) as rn from it_events)
+		select k, payload from ranked where rn = 1 order by k`,
+		"a|a3", "b|b1", "c|c1")
+	h.expectRows(`select k, payload from it_events qualify row_number() over (partition by k order by ts desc) = 1 order by k`,
+		"a|a3", "b|b1", "c|c1")
+	h.expectRows(`select k, payload, row_number() over (partition by k order by ts desc) as rn from it_events
+		qualify rn > 1 order by k, rn`,
+		"a|a2|2", "a|a1|3", "c|c0|2")
+	// dbt table materialization (CTAS) of the de-duplicated rows.
+	if n := h.exec(`create table it_events_dedup as select * from (
+			select *, row_number() over (partition by k order by ts desc) as rn from it_events) x where rn = 1`); n != 3 {
+		t.Errorf("CTAS inserted %d rows, want 3", n)
+	}
+	h.expectRows(`SELECT k, payload, rn FROM it_events_dedup WHERE rn = 1 ORDER BY k`, "a|a3|1", "b|b1|1", "c|c1|1")
+	h.expectRows(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'it_events_dedup'
+		ORDER BY ordinal_position`,
+		"k|VARCHAR", "ts|TIMESTAMP(6)", "payload|VARCHAR", "rn|BIGINT")
+	// Snapshot-style validity ranges with LEAD.
+	h.expectRows(`SELECT payload, CAST(LEAD(ts) OVER (PARTITION BY k ORDER BY ts) AS VARCHAR) AS valid_to
+		FROM it_events WHERE k = 'a' ORDER BY ts`,
+		"a1|2024-01-02 12:00:00.000000", "a2|2024-01-03 09:00:00.000000", "a3|NULL")
+
+	// A view with a window function is computed before the outer filter:
+	// pushing `payload <> 'a3'` below the window would renumber the rows.
+	h.exec(`CREATE VIEW it_events_ranked AS
+		SELECT k, payload, row_number() over (partition by k order by ts desc) as rn FROM it_events`)
+	h.expectRows(`SELECT k, payload, rn FROM it_events_ranked WHERE payload <> 'a3' AND k = 'a' ORDER BY rn`,
+		"a|a2|2", "a|a1|3")
+	h.exec(`CREATE VIEW it_events_latest AS SELECT k, payload FROM it_events_ranked WHERE rn = 1`)
+	h.expectRows(`SELECT payload FROM it_events_latest ORDER BY k`, "a3", "b1", "c1")
+	h.expectRows(`SELECT data_type FROM information_schema.columns WHERE table_name = 'it_events_ranked' AND column_name = 'rn'`,
+		"BIGINT")
+
+	// LIMIT / OFFSET apply after the windows, also when the ORDER BY could be
+	// answered by the index.
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS rn FROM it_win ORDER BY id LIMIT 3`,
+		"1|8", "2|7", "3|6")
+	h.expectRows(`SELECT id, SUM(v) OVER () AS total, COUNT(*) OVER () FROM it_win ORDER BY id LIMIT 2 OFFSET 1`,
+		"2|28|8", "3|28|8")
+	h.expectRows(`SELECT id FROM it_win QUALIFY ROW_NUMBER() OVER (ORDER BY id) > 5 LIMIT 2`, "6", "7")
+	h.expectRows(`SELECT id, LAG(id) OVER (ORDER BY id) FROM it_win LIMIT 2 OFFSET 3`, "4|3", "5|4")
+	// WHERE runs first (in the index here).
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (ORDER BY id), COUNT(*) OVER () FROM it_win WHERE g = 'b' ORDER BY id`,
+		"5|1|3", "6|2|3", "7|3|3")
+
+	// ORDER BY a window function, its alias, or its position.
+	h.expectRows(`SELECT id, SUM(v) OVER (ORDER BY id) AS run FROM it_win ORDER BY run DESC, id LIMIT 3`,
+		"8|28", "7|27", "6|25")
+	h.expectRows(`SELECT id FROM it_win ORDER BY ROW_NUMBER() OVER (ORDER BY v DESC NULLS FIRST, id) LIMIT 3`, "3", "4", "5")
+	h.expectRows(`SELECT id, RANK() OVER (ORDER BY k) FROM it_win ORDER BY 2 DESC, 1 LIMIT 3`, "5|8", "4|7", "7|6")
+
+	// Named windows: OVER w, a window built on another, and OVER (w …).
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER w2, COUNT(*) OVER w,
+			SUM(v) OVER (w2 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), FIRST_VALUE(id) OVER (w ORDER BY v DESC)
+		FROM it_win WINDOW w AS (PARTITION BY g), w2 AS (w ORDER BY id) ORDER BY id`,
+		"1|1|4|5|4", "2|2|4|8|4", "3|3|4|3|4", "4|4|4|8|4",
+		"5|1|3|7|5", "6|2|3|9|5", "7|3|3|4|5", "8|1|1|1|8")
+	h.expectRows(`SELECT id, SUM(v) OVER w FROM it_win WHERE g = 'a' WINDOW w AS (ORDER BY id ROWS 1 PRECEDING) ORDER BY id`,
+		"1|5", "2|8", "3|3", "4|8")
+	h.expectRows(`SELECT id FROM it_win QUALIFY ROW_NUMBER() OVER w = 1 WINDOW w AS (PARTITION BY g ORDER BY id DESC) ORDER BY id`,
+		"4", "7", "8")
+
+	// Over joins, CTEs, derived tables and subqueries.
+	h.expectRows(`SELECT o.id, c.name, ROW_NUMBER() OVER (PARTITION BY c.country ORDER BY o.amount DESC) AS rn
+		FROM it_orders o JOIN it_customers c ON o.customer_id = c.id ORDER BY o.id`,
+		"1|Ada|2", "2|Ada|1", "3|Bo|2", "4|Bo|1", "5|Cy|3")
+	h.expectRows(`WITH t AS (SELECT g, v, SUM(v) OVER (PARTITION BY g) AS gs FROM it_win)
+		SELECT g, MAX(gs) FROM t GROUP BY g ORDER BY g`, "a|16", "b|11", "c|1")
+	h.expectRows(`SELECT (SELECT MAX(rn) FROM (SELECT ROW_NUMBER() OVER () AS rn FROM it_win) x)`, "8")
+	h.expectRows(`SELECT id FROM it_win WHERE id IN (SELECT id FROM it_win QUALIFY RANK() OVER (PARTITION BY g ORDER BY v DESC) = 1)
+		ORDER BY id`, "4", "5", "8")
+	// A correlated subquery's LIMIT also comes after its windows.
+	h.expectRows(`SELECT c.name, (SELECT SUM(o.qty) OVER () FROM it_orders o WHERE o.customer_id = c.id LIMIT 1)
+		FROM it_customers c ORDER BY c.id`, "Ada|4", "Bo|12", "Cy|1", "Di|NULL")
+	// A temporary table.
+	h.exec(`CREATE TEMP TABLE it_win_tmp AS SELECT id, g, v FROM it_win WHERE g <> 'c'`)
+	h.expectRows(`SELECT id, DENSE_RANK() OVER (PARTITION BY g ORDER BY v DESC) FROM it_win_tmp ORDER BY id`,
+		"1|2", "2|3", "3|4", "4|1", "5|1", "6|2", "7|2")
+	h.exec(`DROP TABLE it_win_tmp`)
+	// A temporary view with a window is computed, not expanded in place: the
+	// outer filter must not renumber the rows.
+	h.exec(`CREATE TEMP VIEW it_win_tv AS SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM it_win`)
+	h.expectRows(`SELECT id, rn FROM it_win_tv WHERE id > 2 AND g = 'a' ORDER BY id`, "3|3", "4|4")
+	h.exec(`DROP VIEW it_win_tv`)
+	// Set operation branches, and SELECT without FROM.
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM it_win WHERE g = 'c'
+		UNION ALL SELECT id, RANK() OVER (ORDER BY v) FROM it_win WHERE g = 'b' ORDER BY 1`,
+		"5|3", "6|1", "7|1", "8|1")
+	h.expectRows(`SELECT ROW_NUMBER() OVER (), COUNT(*) OVER (), SUM(5) OVER ()`, "1|1|5")
+	h.expectRows(`SELECT 1 AS x QUALIFY ROW_NUMBER() OVER () = 2`)
+
+	// CTAS keeps the window result types; INSERT … SELECT.
+	h.exec("DROP TABLE IF EXISTS it_win_ctas")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_win_ctas") })
+	h.exec(`CREATE TABLE it_win_ctas AS SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn,
+			PERCENT_RANK() OVER (ORDER BY id) AS pr, SUM(amt) OVER (PARTITION BY g) AS gsum,
+			LAG(v) OVER (ORDER BY id) AS prev_v, AVG(v) OVER () AS av
+		FROM it_win`)
+	h.expectRows(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'it_win_ctas'
+		ORDER BY ordinal_position`,
+		"id|INTEGER", "rn|BIGINT", "pr|DOUBLE PRECISION", "gsum|NUMERIC(38,2)", "prev_v|INTEGER", "av|DOUBLE PRECISION")
+	h.expectRows(`SELECT id, gsum, prev_v FROM it_win_ctas WHERE rn = 1 ORDER BY id`, "1|13.75|NULL", "5|8.75|8", "8|1.00|2")
+	h.exec(`CREATE TABLE it_win_ins (id INTEGER, rnk BIGINT)`)
+	if n := h.exec(`INSERT INTO it_win_ins SELECT id, RANK() OVER (ORDER BY k DESC) FROM it_win WHERE g = 'a'`); n != 4 {
+		t.Errorf("INSERT … SELECT inserted %d rows, want 4", n)
+	}
+	h.expectRows(`SELECT id, rnk FROM it_win_ins ORDER BY id`, "1|4", "2|2", "3|2", "4|1")
+
+	// A dbt incremental merge whose source keeps only the latest row per key.
+	h.exec(`INSERT INTO it_events VALUES ('a', TIMESTAMP '2024-01-04 00:00:00', 'a4'), ('d', TIMESTAMP '2024-01-01 00:00:00', 'd1')`)
+	h.expectAffected(`MERGE INTO it_events_dedup t USING (
+			SELECT k, ts, payload FROM it_events QUALIFY row_number() over (partition by k order by ts desc) = 1
+		) s ON t.k = s.k
+		WHEN MATCHED THEN UPDATE SET ts = s.ts, payload = s.payload
+		WHEN NOT MATCHED THEN INSERT (k, ts, payload, rn) VALUES (s.k, s.ts, s.payload, 1)`, 4)
+	h.expectRows(`SELECT k, payload, rn FROM it_events_dedup ORDER BY k`, "a|a4|1", "b|b1|1", "c|c1|1", "d|d1|1")
+}
+
+func TestSQLWindowErrors(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupWindows()
+
+	// Where window functions may not appear.
+	h.expectError(`SELECT id FROM it_win WHERE ROW_NUMBER() OVER () = 1`, "not allowed in WHERE")
+	h.expectError(`SELECT COUNT(*) FROM it_win GROUP BY ROW_NUMBER() OVER ()`, "not allowed in GROUP BY")
+	h.expectError(`SELECT ROW_NUMBER() OVER () AS rn, COUNT(*) FROM it_win GROUP BY rn`, "not allowed in GROUP BY")
+	h.expectError(`SELECT g FROM it_win GROUP BY g HAVING RANK() OVER (ORDER BY g) = 1`, "not allowed in HAVING")
+	h.expectError(`SELECT 1 FROM it_win a JOIN it_win b ON ROW_NUMBER() OVER () = b.id`, "not allowed in JOIN")
+	h.expectError(`SELECT SUM(ROW_NUMBER() OVER ()) FROM it_win`, "cannot contain window function calls")
+	h.expectError(`SELECT ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM it_win`, "cannot be nested")
+	h.expectError(`SELECT LAG(LEAD(v) OVER ()) OVER () FROM it_win`, "cannot be nested")
+	h.expectError(`UPDATE it_win SET v = ROW_NUMBER() OVER ()`, "only allowed in a SELECT list")
+	h.expectError(`DELETE FROM it_win WHERE ROW_NUMBER() OVER () = 1`, "only allowed in a SELECT list")
+	h.expectError(`INSERT INTO it_win (id) VALUES (ROW_NUMBER() OVER ())`, "only allowed in a SELECT list")
+	h.expectError(`UPDATE it_win t SET v = ROW_NUMBER() OVER () FROM it_win s WHERE s.id = t.id`, "only allowed in a SELECT list")
+	h.expectError(`DELETE FROM it_win t USING it_win s WHERE s.id = t.id AND RANK() OVER () = 1`, "only allowed in a SELECT list")
+	h.expectError(`MERGE INTO it_win t USING it_win s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = RANK() OVER ()`,
+		"only allowed in a SELECT list")
+	h.expectError(`MERGE INTO it_win t USING it_win s ON t.id = s.id WHEN MATCHED AND LAG(s.v) OVER () > 0 THEN DELETE`,
+		"only allowed in a SELECT list")
+	h.expectError(`MERGE INTO it_win t USING it_win s ON t.id = s.id AND ROW_NUMBER() OVER () = 1 WHEN MATCHED THEN DELETE`,
+		"not allowed in JOIN conditions")
+	h.expectRows(`SELECT COUNT(*), SUM(v) FROM it_win`, "8|28") // nothing was changed
+
+	// Functions and arguments.
+	h.expectError(`SELECT ROW_NUMBER() FROM it_win`, "requires an OVER clause")
+	h.expectError(`SELECT id FROM it_win ORDER BY RANK()`, "requires an OVER clause")
+	h.expectError(`SELECT LOWER(g) OVER () FROM it_win`, "not a window function")
+	h.expectError(`SELECT COUNT(DISTINCT g) OVER () FROM it_win`, "DISTINCT is not supported")
+	h.expectError(`SELECT ROW_NUMBER(id) OVER () FROM it_win`, "expects no arguments")
+	h.expectError(`SELECT NTILE() OVER () FROM it_win`, "expects one argument")
+	h.expectError(`SELECT NTILE(0) OVER () FROM it_win`, "greater than zero")
+	h.expectError(`SELECT NTH_VALUE(v, 0) OVER () FROM it_win`, "greater than zero")
+	h.expectError(`SELECT LAG(v, 'x') OVER () FROM it_win`, "must be an integer")
+	h.expectError(`SELECT SUM(*) OVER () FROM it_win`, "expects one argument")
+	h.expectError(`SELECT id, ROW_NUMBER() OVER (ORDER BY rn) AS rn FROM it_win`, "does not exist")
+
+	// Frames.
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM it_win`,
+		"frame start cannot be UNBOUNDED FOLLOWING")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM it_win`,
+		"frame end cannot be UNBOUNDED PRECEDING")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM it_win`,
+		"cannot have preceding rows")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS 1 FOLLOWING) FROM it_win`, "cannot have preceding rows")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM it_win`,
+		"frame starting offset must not be negative")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM it_win`,
+		"frame ending offset must not be null")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN v PRECEDING AND CURRENT ROW) FROM it_win`, "must be constants")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM it_win`, "must be integers")
+	h.expectError(`SELECT SUM(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM it_win`, "exactly one ORDER BY column")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY g RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM it_win`,
+		"not supported for ORDER BY type VARCHAR")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM it_win`,
+		"not supported for ORDER BY type DATE")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM it_win`,
+		"not supported for ORDER BY type INTEGER")
+	h.expectError(`SELECT SUM(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM it_win`, "GROUPS mode requires an ORDER BY")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM it_win`,
+		"EXCLUDE")
+	h.expectError(`SELECT SUM(v) OVER (ORDER BY id ROWS 1) FROM it_win`, "expected PRECEDING or FOLLOWING")
+
+	// Named windows.
+	h.expectError(`SELECT SUM(v) OVER w FROM it_win`, `window "w" does not exist`)
+	h.expectError(`SELECT SUM(v) OVER (w) FROM it_win WINDOW w2 AS ()`, `window "w" does not exist`)
+	h.expectError(`SELECT SUM(v) OVER (w ORDER BY v) FROM it_win WINDOW w AS (ORDER BY id)`, "cannot override ORDER BY")
+	h.expectError(`SELECT SUM(v) OVER (w PARTITION BY id) FROM it_win WINDOW w AS (PARTITION BY g)`, "cannot override PARTITION BY")
+	h.expectError(`SELECT SUM(v) OVER (w) FROM it_win WINDOW w AS (ORDER BY id ROWS 1 PRECEDING)`, "cannot copy window")
+	h.expectError(`SELECT 1 FROM it_win WINDOW w AS (), w AS ()`, "already defined")
+	h.expectError(`SELECT 1 FROM it_win UNION SELECT 2 ORDER BY ROW_NUMBER() OVER ()`, "output column names or positions")
+}
+
+// TestSQLWindowAcrossPages runs windows over rows read in several cursor
+// pages, partitioned and with LIMIT.
+func TestSQLWindowAcrossPages(t *testing.T) {
+	h := newSQLHarness(t)
+	const n = 2*cursorCount + 500
+	h.exec("DROP TABLE IF EXISTS it_win_pages")
+	t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_win_pages") })
+	h.exec("CREATE TABLE it_win_pages (id BIGINT, g INTEGER)")
+	var values []string
+	for i := 1; i <= n; i++ {
+		values = append(values, fmt.Sprintf("(%d, %d)", i, i%3))
+	}
+	h.exec("INSERT INTO it_win_pages VALUES " + strings.Join(values, ", "))
+
+	var inGroup [3]int
+	for i := 1; i <= n; i++ {
+		inGroup[i%3]++
+	}
+	h.expectRows(`SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC), SUM(id) OVER (ORDER BY id ROWS 2 PRECEDING),
+			COUNT(*) OVER (PARTITION BY g) FROM it_win_pages ORDER BY id LIMIT 3`,
+		fmt.Sprintf("1|%d|1|%d", n, inGroup[1]), fmt.Sprintf("2|%d|3|%d", n-1, inGroup[2]), fmt.Sprintf("3|%d|6|%d", n-2, inGroup[0]))
+	h.expectRows(`SELECT MAX(s), COUNT(*) FROM (SELECT SUM(id) OVER (ORDER BY id) AS s FROM it_win_pages) x`,
+		fmt.Sprintf("%d|%d", n*(n+1)/2, n))
+	h.expectRows(`SELECT id FROM it_win_pages QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY id DESC) = 1 ORDER BY id`,
+		fmt.Sprint(n-2), fmt.Sprint(n-1), fmt.Sprint(n))
+}
