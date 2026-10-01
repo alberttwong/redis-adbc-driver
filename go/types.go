@@ -84,6 +84,11 @@ type ColType struct {
 	TZ        string         // timestamp: "" (naive) or "UTC"
 	Precision int32          // decimal
 	Scale     int32          // decimal
+	// Strings: Length is the declared length of VARCHAR(n) / CHAR(n), 0
+	// without one, and Fixed marks the blank-padded CHAR types (see
+	// lengths.go).
+	Length int32
+	Fixed  bool
 }
 
 type colTypeJSON struct {
@@ -92,6 +97,8 @@ type colTypeJSON struct {
 	TZ        string `json:"tz,omitempty"`
 	Precision int32  `json:"precision,omitempty"`
 	Scale     int32  `json:"scale,omitempty"`
+	Length    int32  `json:"length,omitempty"`
+	Fixed     bool   `json:"fixed,omitempty"`
 }
 
 var unitNames = map[arrow.TimeUnit]string{
@@ -110,6 +117,10 @@ func (t ColType) MarshalJSON() ([]byte, error) {
 	if t.Kind == KindDecimal {
 		j.Precision = t.Precision
 		j.Scale = t.Scale
+	}
+	if t.Kind == KindString {
+		j.Length = t.Length
+		j.Fixed = t.Fixed
 	}
 	return json.Marshal(j)
 }
@@ -138,6 +149,8 @@ func (t *ColType) UnmarshalJSON(data []byte) error {
 	t.TZ = j.TZ
 	t.Precision = j.Precision
 	t.Scale = j.Scale
+	t.Length = j.Length
+	t.Fixed = j.Fixed
 	return nil
 }
 
@@ -250,6 +263,14 @@ func (t ColType) SQLName() string {
 	case KindDecimal:
 		return fmt.Sprintf("NUMERIC(%d,%d)", t.Precision, t.Scale)
 	case KindString:
+		switch {
+		case t.Fixed && t.Length > 0:
+			return fmt.Sprintf("CHAR(%d)", t.Length)
+		case t.Fixed:
+			return "BPCHAR"
+		case t.Length > 0:
+			return fmt.Sprintf("VARCHAR(%d)", t.Length)
+		}
 		return "VARCHAR"
 	case KindBinary:
 		return "VARBINARY"
@@ -361,7 +382,11 @@ func colTypeFromSQL(spec sqlTypeSpec) (ColType, error) {
 			return ColType{}, fmt.Errorf("invalid NUMERIC precision %d", p)
 		}
 		return decimalType(int32(p), int32(s)), nil
-	case "VARCHAR", "TEXT", "CHAR", "CHARACTER", "CHARACTER VARYING", "STRING", "NVARCHAR", "NCHAR", "CLOB":
+	case "VARCHAR", "CHARACTER VARYING", "NVARCHAR":
+		return stringTypeFromSQL(spec, false)
+	case "CHAR", "CHARACTER", "NCHAR", "BPCHAR":
+		return stringTypeFromSQL(spec, true)
+	case "TEXT", "STRING", "CLOB":
 		return typeString, nil
 	case "VARBINARY", "BLOB", "BYTEA", "BINARY", "BYTES", "BINARY VARYING":
 		return typeBinary, nil

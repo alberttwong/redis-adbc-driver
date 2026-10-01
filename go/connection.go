@@ -301,6 +301,11 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 					XdbcNullable:    &nullable,
 					XdbcIsNullable:  &isNullable,
 				}
+				if n := col.Type.Length; col.Type.Kind == KindString && n > 0 {
+					// Characters, and bytes at up to 4 per UTF-8 character.
+					size, octets := n, 4*n
+					ci.XdbcColumnSize, ci.XdbcCharOctetLength = &size, &octets
+				}
 				if col.Default != "" {
 					def := col.Default
 					ci.XdbcColumnDef = &def

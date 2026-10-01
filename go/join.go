@@ -372,6 +372,9 @@ func joinKey(v Value) (string, bool) {
 		// Shortest decimal form, matching how NUMERIC values render.
 		return "n" + strconv.FormatFloat(v.F, 'f', -1, 64), true
 	case k == KindString || k == KindBinary:
+		if v.T.Fixed {
+			return "s" + trimPadding(v.S), true // see lengths.go
+		}
 		return "s" + v.S, true
 	case k == KindInterval:
 		// Equal lengths are equal intervals ('1 day' = '24 hours').
@@ -727,8 +730,9 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 }
 
 // lookupColumn returns the column a join key expression reads unchanged: a
-// column reference, or a cast of one to the column's own type (dbt writes
-// `a.id::text = b.id::text` for text columns).
+// column reference, or a cast of one to the column's own type or of a
+// VARCHAR(n) column to text (dbt writes `a.id::text = b.id::text` for text
+// columns).
 func lookupColumn(view *tableMeta, x Expr) (columnMeta, bool) {
 	cast, isCast := x.(*Cast)
 	if isCast {
@@ -739,7 +743,7 @@ func lookupColumn(view *tableMeta, x Expr) (columnMeta, bool) {
 		return columnMeta{}, false
 	}
 	cm, ok := view.column(ref.Name)
-	if !ok || (isCast && cast.T != cm.Type) {
+	if !ok || (isCast && !sameText(cm.Type, cast.T)) {
 		return columnMeta{}, false
 	}
 	return cm, true
@@ -788,13 +792,24 @@ func mergeRows(a, b map[string]Value) map[string]Value {
 // joinRows combines left and right rows with a hash join on pairs (or a
 // nested loop when there are none), keeping pairs that also pass filters.
 func (e *executor) joinRows(env *evalEnv, kind string, left, right []map[string]Value, pairs []equiPair, filters []Expr) ([]map[string]Value, error) {
+	// A pair with a CHAR side compares strings without trailing spaces
+	// (lengths.go), so its keys drop them on both sides.
+	char := make([]bool, len(pairs))
+	for i, p := range pairs {
+		lt, _ := inferType(p.left, env.types, nil)
+		rt, _ := inferType(p.right, env.types, nil)
+		char[i] = lt.isChar() || rt.isChar()
+	}
 	keyOf := func(row map[string]Value, side func(equiPair) Expr) (string, bool, error) {
 		env.row = row
 		var b strings.Builder
-		for _, p := range pairs {
+		for i, p := range pairs {
 			v, err := env.eval(side(p))
 			if err != nil {
 				return "", false, invalidArg(err)
+			}
+			if char[i] && v.T.Kind == KindString && !v.Null {
+				v = Value{T: ColType{Kind: KindString, Fixed: true}, S: v.S}
 			}
 			k, ok := joinKey(v)
 			if !ok {

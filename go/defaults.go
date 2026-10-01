@@ -214,6 +214,9 @@ func (e *executor) checkDefault(ctx context.Context, def ColumnDef) (string, Val
 	if err != nil {
 		return "", Value{}, errorf(adbc.StatusInvalidArgument, "column %q: %v", def.Name, err)
 	}
+	if cv, err = fitLength(def.Type, cv); err != nil {
+		return "", Value{}, err
+	}
 	if cv.Null && !hasVolatile(def.Default) {
 		return "", cv, nil
 	}

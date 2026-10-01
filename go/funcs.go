@@ -546,6 +546,11 @@ func sigTypeName(t ColType) string {
 			return "timestamp with time zone"
 		}
 		return "timestamp"
+	case KindString:
+		if t.Fixed {
+			return "character"
+		}
+		return "varchar"
 	}
 	return strings.ToLower(t.SQLName())
 }

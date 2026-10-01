@@ -747,7 +747,8 @@ field, even if later rows have it.
     use subqueries, parameters, aggregates, `GROUPING` or window functions,
     its function calls are checked as in a query (`DEFAULT nosuchfunc(NULL)`
     is `function nosuchfunc(unknown) does not exist`), and it must convert
-    to the column's type (`INTEGER DEFAULT 'abc'` is an error then).
+    to the column's type and fit its length (`INTEGER DEFAULT 'abc'` and
+    `VARCHAR(3) DEFAULT 'abcd'` are errors then).
     `DEFAULT NULL` is the same as no default.
   - It is computed once per statement (or bulk ingest), so all the rows of
     a statement get the same `CURRENT_TIMESTAMP` / `NOW()` /
@@ -756,7 +757,65 @@ field, even if later rows have it.
   - `information_schema.columns.column_default` and `GetObjects`'
     `xdbc_column_def` show the default as written. `CREATE TABLE … AS`
     copies values, not defaults
-- Constraints, written as in Postgres. `NOT NULL` and `CHECK` are enforced;
+- String lengths, as in Postgres:
+  - **Types:** `VARCHAR(n)` (also `CHARACTER VARYING(n)`, `CHAR VARYING(n)`
+    and `NVARCHAR(n)`) holds at most `n` characters. `CHAR(n)` (also
+    `CHARACTER(n)`, `NCHAR(n)` and `BPCHAR(n)`) holds exactly `n`: shorter
+    values are padded with spaces. `CHAR` without a length is `CHAR(1)`, and
+    `BPCHAR` without one is blank-padded with no limit. `VARCHAR` without a
+    length, `VARCHAR(MAX)`, `TEXT`, `STRING` and `CLOB` have no limit.
+    Lengths count characters, not bytes (`'日本語'` fits `VARCHAR(3)`), and go
+    from 1 to 10485760.
+  - **Writes:** a value longer than its column's length is an error, `value
+    too long for type character varying(3)` (`character(3)` for `CHAR(3)`),
+    with ADBC status `InvalidData`, unless the characters beyond the length
+    are all spaces, which are cut (`'ab    '` is written to a `VARCHAR(3)` as
+    `'ab '`). Every write checks it: `INSERT … VALUES`, `INSERT … SELECT`,
+    `INSERT … DEFAULT VALUES`, `UPDATE` (also with `FROM`), both branches of
+    `MERGE`, and bulk ingest. It is checked where `NOT NULL` and `CHECK` are,
+    before them, so a statement with a failing row writes nothing (a bulk
+    ingest is checked one Arrow batch at a time). A column's `DEFAULT` is
+    checked when it is defined.
+  - **Casts:** `CAST(x AS VARCHAR(n))` and `x::char(n)` cut the text to `n`
+    characters (`CAST('abcdef' AS VARCHAR(3))` is `'abc'`), and `CHAR(n)`
+    pads it (`CAST('ab' AS CHAR(3))` is `'ab '`). Only an explicit cast
+    cuts; writing a longer value is an error.
+  - **`CHAR` values** are stored and returned padded, and their trailing
+    spaces don't count: `LENGTH` of `'ab '` in a `CHAR(3)` is 2, it equals
+    `'ab'`, and joins, `IN`, `GROUP BY`, `DISTINCT` and set operations treat
+    the two as the same value. Converting one to text (functions, `||`, a
+    `VARCHAR` column) drops the padding (`c || 'x'` is `'abx'`), but `LIKE`,
+    `ILIKE`, `~`, `~*` and `SIMILAR TO` see it (`c LIKE 'ab'` is false, `c
+    LIKE 'ab%'` true), as in Postgres. One difference: a comparison with a
+    `CHAR` value ignores trailing spaces on both sides, as Postgres does for
+    a literal (`c = 'ab '` is true), so a text column holding `'ab '` also
+    equals a `CHAR` holding `'ab'`; Postgres compares a `CHAR` with a text
+    column as text, which keeps them.
+  - **Result types** keep the length where Postgres does: a column, a cast,
+    a scalar subquery, and `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`
+    or a set operation whose inputs all have the same type. Function,
+    aggregate and window results have none, nor does a mix of lengths or a
+    string literal (`COALESCE(s, 'x')`). So `CREATE TABLE … AS` and views
+    keep the length of a column or cast they select, and a computed column
+    is `VARCHAR`.
+  - **Reading them back:** `GetObjects` reports the type as `VARCHAR(n)` /
+    `CHAR(n)` in `xdbc_type_name`, with `xdbc_column_size` `n` and
+    `xdbc_char_octet_length` `4n` (UTF-8); `information_schema.columns` has
+    `character_maximum_length` and `character_octet_length` (NULL and
+    1073741824 for a string without a length, as in Postgres) and the same
+    type in `data_type`.
+  - **Upgrading:** v0.0.7 and earlier didn't keep the length, so the tables
+    they created have none and aren't checked; their values stay as they
+    are. Only tables created and columns added from this version on are
+    checked. `CHAR` without a length was unbounded, and is now `CHAR(1)`.
+    Views, `CHECK`s and defaults that cast to `VARCHAR(n)` / `CHAR(n)` now
+    cut. Clients on v0.0.7 and earlier ignore the length (an optional part
+    of the column type in the metadata), so they don't check it, and a
+    change they make to a table's metadata (an `ALTER TABLE`, a `COMMENT
+    ON`, and some writes) removes it, so upgrade every client of a database
+    together.
+- Constraints, written as in Postgres. `NOT NULL`, `CHECK` and the lengths
+  of `VARCHAR(n)` / `CHAR(n)` (see String lengths above) are enforced;
   `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` are not:
   - **Accepted:** on a column (in `CREATE TABLE` and `ADD COLUMN`), any
     number of `NOT NULL`, `NULL`, `CHECK (expr)`, `DEFAULT expr`, `PRIMARY
@@ -1056,7 +1115,8 @@ field, even if later rows have it.
   for it instead, and `CAST(x AS type DEFAULT v ON CONVERSION ERROR)` returns
   `v` (converted to the type). The result has the target type. An error
   while computing `x`, and a cast between types that never convert (`DATE`
-  to `BOOLEAN`), are still errors
+  to `BOOLEAN`), are still errors. A cast to `VARCHAR(n)` or `CHAR(n)` cuts
+  the text to `n` characters, and `CHAR(n)` pads it (see String lengths)
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
   negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD` / `%`,
   `POWER` / `POW`, `SQRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`, `LOG10`,
@@ -1287,7 +1347,8 @@ field, even if later rows have it.
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`,
   each table's row `key_prefix` and `index_name`, NULL for views, and
-  `comment`), `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`, `numeric_precision`,
+  `comment`), `columns` (`ordinal_position`, `column_default`, `data_type`, `is_nullable`,
+  `character_maximum_length`, `character_octet_length`, `numeric_precision`,
   `numeric_scale`, `datetime_precision`, `is_indexed` and `comment`), `views`
   (`view_definition`), and `routines`, the driver's functions (see "Function
   calls" above). `comment` is the `COMMENT ON` text, NULL without
@@ -1366,8 +1427,9 @@ field, even if later rows have it.
   no array type), and the ordered-set aggregates and `MEDIAN` as window
   functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
-  NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
-  [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed).
+  NUMERIC(p,s), VARCHAR(n), CHAR(n), VARCHAR/TEXT, VARBINARY/BLOB, DATE,
+  TIME(p), TIMESTAMP(p) [WITH TIME ZONE], INTERVAL` (interval columns are
+  stored but not indexed; see String lengths for `VARCHAR(n)` / `CHAR(n)`).
   JSON documents are stored in `VARCHAR` columns (`NOINDEX` if they are
   never compared as a whole); `JSON` and `JSONB` are only cast targets
 
@@ -1377,7 +1439,7 @@ Tables can be qualified as `schema.table` or `redis.schema.table`, and
 Postgres. Schemas are key
 namespaces (default `public`). There are no transactions (autocommit
 only). `UPDATE`, `DELETE` and `MERGE` find their rows and compute and check
-every change first (new values and casts, `NOT NULL`, `CHECK`, MERGE's
+every change first (new values and casts, string lengths, `NOT NULL`, `CHECK`, MERGE's
 one-change-per-row rule, `RETURNING`), so such an error leaves the table untouched. Then
 they write, in pipelined batches of up to 1,000 rows (`MERGE`: updates, then
 deletes, then inserts). If a write fails part-way, for example because the

@@ -229,7 +229,7 @@ func subexprGroup(groups int, subexpr int64) (int, bool) {
 // regexpFunc evaluates the match operators, SIMILAR TO and the REGEXP_*
 // functions other than REGEXP_REPLACE. Arguments are non-NULL.
 func regexpFunc(f *Func, args []Value) (Value, error) {
-	s, pattern := args[0].Text(), args[1].Text()
+	s, pattern := args[0].padded(), args[1].Text()
 	switch f.Name {
 	case "~", "~*":
 		rs, err := compilePattern("", pattern, regexpFlags{dotNL: true, caseInsensitive: f.Name == "~*"})
