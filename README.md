@@ -859,6 +859,81 @@ field, even if later rows have it.
     on intervals
   - Intervals are returned as Arrow `month_day_nano_interval`; Arrow
     interval and duration values can be bound and ingested
+- JSON stored as text in `VARCHAR` columns (there is no JSON column type).
+  Documents are parsed by the driver in each call, on the rows the index
+  returns; nothing JSON-specific is pushed down. Semantics follow Postgres:
+  - Operators: `doc -> 'key'` and `doc -> n` (an array element; negative `n`
+    counts from the end) return JSON, `doc ->> …` returns text (a string's
+    value, NULL for JSON null); `doc #> '{a,0,b}'` and `#>>` follow a path
+    given as a text array. As in Postgres they share one precedence level
+    with `||`, left to right, below `+` / `-` and above comparisons:
+    `doc ->> 'a' || '!'` is `(doc ->> 'a') || '!'`, while `'x' || doc ->> 'a'`
+    applies `->>` to the concatenation
+  - `JSON_EXTRACT_PATH(doc, key, …)`, `JSON_EXTRACT_PATH_TEXT`,
+    `JSON_TYPEOF`, `JSON_ARRAY_LENGTH`; `x::json` / `CAST(x AS JSON)` checks
+    the text, `x::jsonb` normalizes it (both give `VARCHAR`)
+  - These read the json type: a value keeps its text from the document, so
+    numbers are never rounded (`'{"n": 1e400}' ->> 'n'` is `1e400`) and of
+    duplicate keys the last one wins. Malformed JSON is an error,
+    `invalid input syntax for type json: …` with Postgres's detail, and so
+    are `\u` escapes Postgres can't decode (code point 0, unpaired
+    surrogates). `doc IS JSON` guards against bad rows
+  - The `JSONB_` spellings (`JSONB_EXTRACT_PATH`, `JSONB_TYPEOF`,
+    `JSONB_BUILD_OBJECT`, `JSONB_AGG`, …), `::jsonb` and `RETURNING JSONB`
+    give jsonb's text: keys sorted (shorter first) without duplicates,
+    numbers as exact `NUMERIC` (`1e2` is `100`, `1.50` stays `1.50`), and
+    `{"a": 1}` spacing
+  - `x IS [NOT] JSON [VALUE | SCALAR | ARRAY | OBJECT]
+    [{WITH | WITHOUT} UNIQUE [KEYS]]` is false for malformed text and NULL
+    for NULL
+  - SQL/JSON query functions, as in Postgres 17 (documents are read as
+    jsonb): `JSON_VALUE(doc, path [RETURNING type] [behavior ON EMPTY]
+    [behavior ON ERROR])` with `ERROR`, `NULL` or `DEFAULT expr`;
+    `JSON_QUERY(doc, path [RETURNING type]
+    [{WITHOUT | WITH [CONDITIONAL | UNCONDITIONAL]} [ARRAY] WRAPPER]
+    [{KEEP | OMIT} QUOTES] …)`, which also allows `EMPTY [ARRAY]` and
+    `EMPTY OBJECT`; `JSON_EXISTS(doc, path [{TRUE | FALSE | UNKNOWN | ERROR}
+    ON ERROR])`. The defaults are `NULL ON EMPTY` and `NULL ON ERROR`
+    (`FALSE ON ERROR` for `JSON_EXISTS`). `ON ERROR` covers a malformed
+    document, a strict-mode path error, a result of the wrong shape (several
+    items, or an object for `JSON_VALUE`) and a failed conversion to the
+    `RETURNING` type; an invalid path is always an error
+  - Paths: `[lax | strict] $` followed by `.key`, `."key"`, `.*`, `[n]`,
+    `[last]`, `[last - n]`, `[a to b]`, lists like `[0, 2 to last]`, and
+    `[*]`. Lax mode (the default) applies `.key` to each element of an
+    array, treats a non-array as an array of one for `[n]`, and skips
+    missing keys and out-of-range subscripts; strict mode makes them errors.
+    Filters (`?(…)`), item methods (`.size()`, …), arithmetic, `.**` and
+    `PASSING` variables are not supported
+  - Constructors: `JSON_BUILD_OBJECT(k, v, …)`, `JSON_BUILD_ARRAY(…)`,
+    `JSON_OBJECT(k VALUE v | k : v, … [{NULL | ABSENT} ON NULL]
+    [{WITH | WITHOUT} UNIQUE [KEYS]] [RETURNING JSON | JSONB | VARCHAR])`
+    (and Postgres's `JSON_OBJECT('{k,v,…}')` / `JSON_OBJECT(keys, values)`
+    over text arrays), `JSON_ARRAY(v, … [{ABSENT | NULL} ON NULL]
+    [RETURNING …])`, `TO_JSON(x)`. Values are encoded as Postgres's
+    `to_json` does: numbers and booleans as such, NULL as `null`, strings
+    escaped, dates and timestamps as ISO 8601 strings
+    (`"2024-01-15T10:30:00+00:00"`), binary values as `"\\x…"`, and with
+    Postgres's spacing (`{"a" : 1}`, `[1, 2]`)
+  - Aggregates, computed by the driver: `JSON_AGG(x [ORDER BY …])` and
+    `JSON_OBJECT_AGG(k, v [ORDER BY …])`, also with `DISTINCT` (whose values
+    come out sorted). NULL values are `null`, a NULL key is an error, and no
+    rows give NULL. `ORDER BY` puts NULLs last by default in either
+    direction, like the driver's `ORDER BY` (Postgres puts them first for
+    `DESC`). They are not available as window functions
+  - Results are `VARCHAR`. An argument is embedded as JSON when it is itself
+    JSON: a JSON function, `->`, `#>` or `::json`. Any other text becomes a
+    JSON string, including JSON read back from a table, view or subquery, so
+    write `col::json` to embed it
+  - Differences from Postgres: doubles keep the driver's text form (`1e+06`
+    where Postgres writes `1000000`), and the SQL/JSON functions apply
+    `ON ERROR` to a malformed document too (Postgres raises the error when
+    it converts the text to jsonb)
+  - Not supported: the other jsonb operators (`@>`, `?`, `||` on jsonb,
+    `-`), set-returning functions (`JSON_EACH`, `JSON_ARRAY_ELEMENTS`,
+    `JSON_TABLE`), `JSONB_SET` and the other modification functions,
+    `JSON_ARRAY(SELECT …)`, and a JSON column type (a RedisJSON-backed one
+    is possible future work)
 - `SELECT` without `FROM` for literal expressions
 - `information_schema` (read-only, built from the driver's metadata when
   queried): `schemata`, `tables` (`BASE TABLE` / `VIEW` / `LOCAL TEMPORARY`),
@@ -937,7 +1012,9 @@ field, even if later rows have it.
   the ordered-set aggregates and `MEDIAN` as window functions
 - Types: `BOOLEAN, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
   NUMERIC(p,s), VARCHAR/TEXT, VARBINARY/BLOB, DATE, TIME(p), TIMESTAMP(p)
-  [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed)
+  [WITH TIME ZONE], INTERVAL` (interval columns are stored but not indexed).
+  JSON documents are stored in `VARCHAR` columns (`NOINDEX` if they are
+  never compared as a whole); `JSON` and `JSONB` are only cast targets
 
 Tables can be qualified as `schema.table` or `redis.schema.table`, and
 `pg_temp.table` is the connection's temporary table. Schemas are key

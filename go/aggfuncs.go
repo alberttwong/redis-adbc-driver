@@ -123,6 +123,11 @@ func checkAggregate(f *Func, over bool) error {
 		if f.Star || n < 1 || n > 2 {
 			return fail("LISTAGG expects one or two arguments")
 		}
+	case jsonAggregates[f.Name]:
+		// Checked like the other JSON functions (json.go).
+		if err := checkJSONArity(f); err != nil {
+			return fail("%v", err)
+		}
 	case f.Star || n != 1:
 		return fail("%s expects one argument", f.Name)
 	case f.Name == "MEDIAN" && f.Distinct:
@@ -252,7 +257,7 @@ func aggregateType(f *Func, cols map[string]ColType, params []ColType, over bool
 
 // usesOrder reports whether an aggregate's result depends on its ORDER BY.
 func usesOrder(f *Func) bool {
-	return f.Name == "STRING_AGG" || f.Name == "LISTAGG" || orderedSetFuncs[f.Name]
+	return f.Name == "STRING_AGG" || f.Name == "LISTAGG" || orderedSetFuncs[f.Name] || jsonAggregates[f.Name]
 }
 
 // aggInput evaluates the input of an aggregate call for the row in env into
@@ -303,6 +308,8 @@ func newAggState(f *Func) aggState {
 		return &statAgg{name: f.Name, acc: newStatAcc(true, false)}
 	case orderedSetFuncs[f.Name] || f.Name == "MEDIAN":
 		return &orderedSetAgg{fn: f}
+	case jsonAggregates[f.Name]:
+		return &jsonAgg{fn: f}
 	}
 	return nil
 }

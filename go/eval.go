@@ -48,7 +48,8 @@ type evalEnv struct {
 var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "MIN": true, "MAX": true, "AVG": true,
 	"STRING_AGG": true, "LISTAGG": true, "BOOL_OR": true, "BOOL_AND": true, "EVERY": true, "ANY_VALUE": true,
 	"STDDEV": true, "STDDEV_SAMP": true, "STDDEV_POP": true, "VARIANCE": true, "VAR_SAMP": true, "VAR_POP": true,
-	"PERCENTILE_CONT": true, "PERCENTILE_DISC": true, "MODE": true, "MEDIAN": true}
+	"PERCENTILE_CONT": true, "PERCENTILE_DISC": true, "MODE": true, "MEDIAN": true,
+	"JSON_AGG": true, "JSONB_AGG": true, "JSON_OBJECT_AGG": true, "JSONB_OBJECT_AGG": true}
 
 func isAggregate(e Expr) bool {
 	found := false
@@ -351,6 +352,9 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 	}
 	if f.Name == "IIF" {
 		return env.evalIIF(f)
+	}
+	if jsonFuncs[f.Name] {
+		return env.evalJSONFunc(f)
 	}
 	args := make([]Value, len(f.Args))
 	for i, a := range f.Args {
@@ -663,6 +667,9 @@ func inferFuncType(f *Func, args []ColType) ColType {
 		return t
 	}
 	if t, ok := scalarFuncType(f, args); ok {
+		return t
+	}
+	if t, ok := jsonFuncType(f); ok {
 		return t
 	}
 	switch f.Name {

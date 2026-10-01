@@ -79,7 +79,7 @@ func hasVolatile(e Expr) bool {
 func checkArity(f *Func) error {
 	a, ok := scalarArity[f.Name]
 	if !ok {
-		return nil
+		return checkJSONArity(f)
 	}
 	n := len(f.Args)
 	switch {
