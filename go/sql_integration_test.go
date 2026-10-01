@@ -2300,7 +2300,7 @@ func TestSQLConcatNulls(t *testing.T) {
 	h.exec("CREATE TABLE it_concat_out AS SELECT id, CONCAT_WS('-', id, first, last) AS label FROM it_concat")
 	h.expectRows("SELECT label FROM it_concat_out ORDER BY id", "1-Ada-Lovelace", "2-Bo", "3")
 	h.expectRows("SELECT data_type FROM information_schema.columns WHERE table_name = 'it_concat_out' AND column_name = 'label'", "VARCHAR")
-	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects a separator")
+	h.expectError("SELECT CONCAT_WS() FROM it_concat", "CONCAT_WS expects at least 1 argument(s)")
 }
 
 // setupWindows creates the window-function data set. By g, ordered by k

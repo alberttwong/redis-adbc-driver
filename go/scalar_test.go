@@ -407,6 +407,14 @@ func TestScalarErrors(t *testing.T) {
 		{"IIF(TRUE, 1)", "IIF expects 3 argument(s)"},
 		{"LEFT('abc')", "LEFT expects 2 argument(s)"},
 		{"MD5(DISTINCT 'a')", "MD5 does not accept * or DISTINCT"},
+		{"NOSUCHFUNC(1)", "unsupported function NOSUCHFUNC"},
+		{"UPPER('a', 'b')", "UPPER expects 1 argument(s)"},
+		{"UPPER(NULL, NULL)", "UPPER expects 1 argument(s)"},
+		{"LOWER(DISTINCT 'a')", "LOWER does not accept * or DISTINCT"},
+		{"COALESCE()", "COALESCE expects at least 1 argument(s)"},
+		{"DATE_TRUNC('day')", "DATE_TRUNC expects 2 argument(s)"},
+		{"MAKE_DATE(2024, 1)", "MAKE_DATE expects 3 argument(s)"},
+		{"NOW(1, 2)", "NOW expects 0 or 1 arguments"},
 	} {
 		if _, _, err := evalTestExpr(t, c.expr); err == nil || !strings.Contains(err.Error(), c.err) {
 			t.Errorf("%s: error %v, want one containing %q", c.expr, err, c.err)

@@ -75,28 +75,6 @@ func hasVolatile(e Expr) bool {
 	return found
 }
 
-// checkArity validates the argument count of a scalar function.
-func checkArity(f *Func) error {
-	a, ok := scalarArity[f.Name]
-	if !ok {
-		return checkJSONArity(f)
-	}
-	n := len(f.Args)
-	switch {
-	case f.Star || f.Distinct:
-		return fmt.Errorf("%s does not accept * or DISTINCT", f.Name)
-	case a[1] < 0 && n < a[0]:
-		return fmt.Errorf("%s expects at least %d argument(s)", f.Name, a[0])
-	case a[0] == a[1] && n != a[0]:
-		return fmt.Errorf("%s expects %d argument(s)", f.Name, a[0])
-	case a[1] > a[0]+1 && (n < a[0] || n > a[1]):
-		return fmt.Errorf("%s expects %d to %d arguments", f.Name, a[0], a[1])
-	case n < a[0] || (a[1] >= 0 && n > a[1]):
-		return fmt.Errorf("%s expects %d or %d arguments", f.Name, a[0], a[1])
-	}
-	return nil
-}
-
 // maxStringLen bounds the results of LPAD, RPAD (characters) and REPEAT
 // (bytes).
 const maxStringLen = 64 << 20

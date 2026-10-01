@@ -191,6 +191,9 @@ func (e *executor) checkDefault(ctx context.Context, def ColumnDef) (string, Val
 		case *Func:
 			if aggregateFuncs[v.Name] {
 				err = errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in DEFAULT expressions")
+			} else {
+				// Also the calls a CASE branch or IIF doesn't evaluate.
+				err = checkCall(v)
 			}
 		}
 	})

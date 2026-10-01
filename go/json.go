@@ -82,7 +82,8 @@ var jsonArity = map[string][2]int{
 }
 
 // checkJSONArity validates a call of a JSON function by name (the others are
-// built by the parser); it accepts any other function.
+// built by the parser); it accepts any other function (checkArity resolves
+// the names).
 func checkJSONArity(f *Func) error {
 	a, ok := jsonArity[f.Name]
 	if !ok {

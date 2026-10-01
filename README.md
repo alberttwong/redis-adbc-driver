@@ -752,9 +752,10 @@ field, even if later rows have it.
     `cannot use subquery in check constraint`, `cannot use parameter in
     check constraint`, `aggregate functions are not allowed in check
     constraints`, `window functions are not allowed in check constraints`
-    and `argument of CHECK must be type boolean, not type integer`. A
-    function the driver doesn't know is only reported when a row is
-    written.
+    and `argument of CHECK must be type boolean, not type integer`. An
+    unknown function or a wrong argument count is also an error then
+    (`unsupported function NOSUCHFUNC`, `UPPER expects 1 argument(s)`), as
+    in a `DEFAULT`.
   - **Names:** `CONSTRAINT name` is used as written. Without one, the name
     is Postgres's: `<table>_<column>_check` if the expression reads exactly
     one column (`t_amount_check`, also for a table constraint such as
@@ -818,10 +819,15 @@ field, even if later rows have it.
   1`); `WITH TIES` is not supported, and a query has at most one `LIMIT` or
   `FETCH` (Postgres's "multiple LIMIT clauses not allowed")
 - A query that can't return rows (`WHERE false`, `LIMIT 0`, …; see "How SQL
-  is executed") reads none. Errors the driver raises only when it computes
-  a value on a row (division by zero, a failed cast, an unknown function or
-  a wrong argument count for most functions) are then not raised, as on an
-  empty table: `SELECT 1/0 FROM t WHERE false` returns no rows
+  is executed") reads none. Errors that depend on a row's values (division
+  by zero, a failed cast) are then not raised, as on an empty table: `SELECT
+  1/0 FROM t WHERE false` returns no rows
+- Function calls are resolved when a statement is planned, or when `CREATE
+  VIEW`, a `CHECK` or a `DEFAULT` defines them: an unknown function
+  (`unsupported function NOSUCHFUNC`) or a wrong number of arguments (`UPPER
+  expects 1 argument(s)`) is an error whether or not any row is read, also
+  in a `CASE` branch that is never taken. The types of a function's
+  arguments are still only checked on rows (`ROUND(true)`)
 - `GROUP BY` items are expressions, output positions or aliases, and also
   (as in Postgres) `ROLLUP (…)`, `CUBE (…)`, `GROUPING SETS (…)` and `()`:
   - `ROLLUP (a, b)` is the grouping sets `(a, b), (a), ()`, and `CUBE (a, b)`

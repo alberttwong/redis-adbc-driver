@@ -56,12 +56,15 @@ var statFuncs = map[string]bool{
 	"STDDEV": true, "STDDEV_SAMP": true, "STDDEV_POP": true, "VARIANCE": true, "VAR_SAMP": true, "VAR_POP": true,
 }
 
-// checkCall checks the modifiers of a function call without OVER: only
-// aggregates take ORDER BY, WITHIN GROUP and FILTER, and only window
-// functions take IGNORE NULLS / RESPECT NULLS.
+// checkCall resolves a function call without OVER (functions.go) and checks
+// its modifiers: only aggregates take ORDER BY, WITHIN GROUP and FILTER,
+// and only window functions take IGNORE NULLS / RESPECT NULLS.
 func checkCall(f *Func) error {
 	if aggregateFuncs[f.Name] {
 		return checkAggregate(f, false)
+	}
+	if err := checkArity(f); err != nil {
+		return invalidArg(err)
 	}
 	fail := func(what string) error {
 		return errorf(adbc.StatusInvalidArgument, "%s specified, but %s is not an aggregate function", what, f.Name)
