@@ -990,6 +990,9 @@ func (e *executor) selectWithoutTable(ctx context.Context, plan *selectPlan, par
 
 // ---- aggregates ----
 
+// accumulator reduces one aggregate call over a group: COUNT, SUM, AVG, MIN
+// and MAX here, the other aggregates in ext (aggfuncs.go). addRow applies
+// FILTER and DISTINCT.
 type accumulator struct {
 	fn       *Func
 	count    int64
@@ -1001,6 +1004,12 @@ type accumulator struct {
 	has      bool
 	overflow bool
 	distinct map[string]bool
+	ext      aggState
+	in       []Value // input buffer (aggInput)
+}
+
+func newAccumulator(f *Func) *accumulator {
+	return &accumulator{fn: f, ext: newAggState(f)}
 }
 
 func (a *accumulator) add(v Value) {
@@ -1010,16 +1019,6 @@ func (a *accumulator) add(v Value) {
 	}
 	if v.Null {
 		return
-	}
-	if a.fn.Distinct {
-		key := v.T.Kind.String() + "\x00" + v.Text()
-		if a.distinct == nil {
-			a.distinct = map[string]bool{}
-		}
-		if a.distinct[key] {
-			return
-		}
-		a.distinct[key] = true
 	}
 	a.count++
 	switch a.fn.Name {
@@ -1054,7 +1053,12 @@ func (a *accumulator) add(v Value) {
 	}
 }
 
-func (a *accumulator) result(t ColType) (Value, error) {
+// result returns the aggregate's value; env is at the group's
+// representative row (for the direct arguments of ordered-set aggregates).
+func (a *accumulator) result(env *evalEnv, t ColType) (Value, error) {
+	if a.ext != nil {
+		return a.ext.result(env, t)
+	}
 	switch a.fn.Name {
 	case "COUNT":
 		return intValue(typeInt64, a.count), nil

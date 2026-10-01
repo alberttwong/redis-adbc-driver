@@ -776,6 +776,16 @@ func pushableKind(k Kind, mode string) bool {
 	return mode == PushdownAll && k.indexedAsNumeric()
 }
 
+// indexReducers maps the aggregates the index can compute to their
+// FT.AGGREGATE reducers. COUNT(x) sums exists(@x) flags instead, and AVG
+// divides a SUM by that count. The reducers for other aggregates are
+// approximate (STDDEV, QUANTILE) or don't skip missing values (FIRST_VALUE),
+// so those run in the driver.
+var indexReducers = map[string]string{
+	"COUNT": "COUNT", "SUM": "SUM", "AVG": "SUM", "MIN": "MIN", "MAX": "MAX",
+	"BOOL_OR": "MAX", "BOOL_AND": "MIN", "EVERY": "MIN",
+}
+
 // indexAggregate computes GROUP BY / aggregates with FT.AGGREGATE over the
 // SORTABLE index fields. ok is false when the query cannot be answered
 // exactly by the index; the caller then aggregates in the driver.
@@ -834,13 +844,17 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 	nonNull := map[string]string{} // column -> alias of exists() flag
 	argCol := make([]columnMeta, len(aggs))
 	for i, f := range aggs {
+		if f.Filter != nil {
+			// FILTER is evaluated by the driver.
+			return nil, false, nil
+		}
 		if f.Star {
 			if f.Name != "COUNT" {
 				return nil, false, nil
 			}
 			continue
 		}
-		if f.Distinct || len(f.Args) != 1 {
+		if _, ok := indexReducers[f.Name]; !ok || f.Distinct || len(f.Args) != 1 {
 			return nil, false, nil
 		}
 		c, ok := f.Args[0].(*ColumnRef)
@@ -852,6 +866,9 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 			return nil, false, nil
 		}
 		if f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown) {
+			return nil, false, nil
+		}
+		if (f.Name == "BOOL_OR" || f.Name == "BOOL_AND" || f.Name == "EVERY") && col.Type.Kind != KindBool {
 			return nil, false, nil
 		}
 		argCol[i] = col
@@ -874,11 +891,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		if f.Star || f.Name == "COUNT" {
 			continue
 		}
-		op := f.Name
-		if op == "AVG" {
-			op = "SUM"
-		}
-		steps = append(steps, "REDUCE", op, 1, "@"+argCol[i].field(), "AS", fmt.Sprintf("__a%d", i))
+		steps = append(steps, "REDUCE", indexReducers[f.Name], 1, "@"+argCol[i].field(), "AS", fmt.Sprintf("__a%d", i))
 	}
 	raw, err := e.store.aggregate(ctx, &aggRequest{index: meta.index(), query: wp.query, groupBy: steps})
 	if err != nil {
@@ -951,7 +964,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 					return nil, false, nil
 				}
 				g.results[f] = floatValue(typeFloat64, sum/nn)
-			default: // MIN, MAX
+			default: // MIN, MAX, and BOOL_OR / BOOL_AND as MAX / MIN of 0 and 1
 				v, err := decodeStored(s, argCol[i].Type)
 				if err != nil {
 					return nil, false, nil
@@ -993,6 +1006,12 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 	}
 	types := meta.types()
 	env := e.newEnv(ctx, types, params)
+	aggTypes := make([]ColType, len(aggs))
+	for i, f := range aggs {
+		if aggTypes[i], err = inferType(f, types, nil); err != nil {
+			return nil, invalidArg(err)
+		}
+	}
 	type group struct {
 		rep  map[string]Value
 		accs []*accumulator
@@ -1002,7 +1021,7 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 	newGroup := func(rep map[string]Value) *group {
 		g := &group{rep: rep}
 		for _, f := range aggs {
-			g.accs = append(g.accs, &accumulator{fn: f})
+			g.accs = append(g.accs, newAccumulator(f))
 		}
 		return g
 	}
@@ -1030,30 +1049,19 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 			groups[key.String()] = g
 			order = append(order, key.String())
 		}
-		for i, f := range aggs {
-			var v Value
-			if !f.Star {
-				if len(f.Args) != 1 {
-					return nil, errorf(adbc.StatusInvalidArgument, "%s expects one argument", f.Name)
-				}
-				v, err = env.eval(f.Args[0])
-				if err != nil {
-					return nil, invalidArg(err)
-				}
+		for _, acc := range g.accs {
+			if err := acc.addRow(env); err != nil {
+				return nil, invalidArg(err)
 			}
-			g.accs[i].add(v)
 		}
 	}
 	out := make([]aggGroup, 0, len(order))
 	for _, k := range order {
 		g := groups[k]
+		env.row = g.rep
 		results := map[*Func]Value{}
 		for i, f := range aggs {
-			t, err := inferType(f, types, nil)
-			if err != nil {
-				return nil, invalidArg(err)
-			}
-			v, err := g.accs[i].result(t)
+			v, err := g.accs[i].result(env, aggTypes[i])
 			if err != nil {
 				return nil, invalidArg(err)
 			}
