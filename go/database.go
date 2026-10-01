@@ -67,6 +67,10 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		_ = client.Close()
 		return nil, errorf(adbc.StatusNotImplemented, "the Redis server does not provide the search (RediSearch) module: %v", err)
 	}
+	if err := st.refuseFlex(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 	if err := st.migrateLegacyMetadata(ctx); err != nil {
 		_ = client.Close()
 		return nil, err
@@ -101,6 +105,24 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		WithTableTypeLister(conn).
 		WithDbObjectsEnumerator(conn).
 		Connection(), nil
+}
+
+// flexProbeIndex is an index name the driver never creates.
+const flexProbeIndex = "adbc:{meta}:probe"
+
+// refuseFlex fails on Redis Flex (RAM + flash) databases, before anything
+// is written. Search on Flex has no FT.AGGREGATE and no NUMERIC fields (the
+// Redis Cloud Pro Preview, and Redis Software 8.2 with Search 8.6, which
+// also lacks SORTABLE), and every table needs them. Asking for a missing
+// index tells Flex apart: other servers answer "No such index", so a Flex
+// release that adds FT.AGGREGATE passes.
+func (s *store) refuseFlex(ctx context.Context) error {
+	err := s.searchDo(ctx, flexProbeIndex, "FT.AGGREGATE", flexProbeIndex, "*", "LIMIT", 0, 0).Err()
+	if err != nil && strings.Contains(err.Error(), "not supported in Redis Flex") {
+		return errorf(adbc.StatusNotImplemented, "Redis Flex databases are not supported: their search has no "+
+			"FT.AGGREGATE and no NUMERIC or SORTABLE fields, which the driver needs (%v)", err)
+	}
+	return nil
 }
 
 // connect opens a single-endpoint or OSS Cluster API client, depending on
