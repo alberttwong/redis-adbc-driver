@@ -497,6 +497,11 @@ type selectPlan struct {
 	// QUALIFY); qualify is the QUALIFY predicate with aliases resolved.
 	windows []windowCall
 	qualify Expr
+	// distinct removes duplicate output rows (SELECT DISTINCT). With
+	// distinctOn, rows are kept per DISTINCT ON key instead: the first row
+	// of each key in ORDER BY order (see runDistinct).
+	distinct   bool
+	distinctOn []planItem
 }
 
 // windowed reports whether the query computes window functions (or
@@ -524,6 +529,16 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	defer pop()
 	if sel.SetOp != nil {
 		return e.planSetOp(ctx, sel, plan)
+	}
+	if g, ok := distinctAsGroupBy(sel); ok {
+		// SELECT DISTINCT over plain expressions is GROUP BY those
+		// expressions, which the index can often compute (FT.AGGREGATE
+		// GROUPBY) instead of the driver reading every row. If that plan
+		// doesn't work out, plan the DISTINCT itself: its errors are the
+		// ones to report.
+		if gp, err := e.planSelect(ctx, g, paramTypes); err == nil && checkDistinctOrder(gp) == nil {
+			return gp, nil
+		}
 	}
 	var types map[string]ColType
 	var rels []relation
@@ -561,9 +576,13 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		itemStart[i] = len(plan.items)
 		if it.Star {
 			if plan.meta == nil {
-				return nil, errorf(adbc.StatusInvalidArgument, "SELECT * requires a FROM clause")
+				return nil, errorf(adbc.StatusInvalidArgument, "SELECT %s requires a FROM clause", it.Text)
 			}
-			for _, c := range plan.meta.Columns {
+			cols, err := starColumns(plan.meta, rels, jp != nil, it.StarOf)
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range cols {
 				plan.items = append(plan.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.field(), typ: c.Type})
 			}
 			continue
@@ -712,7 +731,165 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	if err := e.planWindows(plan, types); err != nil {
 		return nil, err
 	}
+	if sel.Distinct {
+		if err := e.planDistinct(ctx, plan, itemStart, types); err != nil {
+			return nil, err
+		}
+	}
 	return plan, nil
+}
+
+// starColumns returns the columns `*` or `rel.*` expands to. In a join, a
+// qualified star picks one item's columns (named alias.column in the joined
+// relation); otherwise the qualifier must name the one FROM item.
+func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) ([]columnMeta, error) {
+	if len(qual) == 0 {
+		return meta.Columns, nil
+	}
+	name := qual[len(qual)-1]
+	for _, r := range rels {
+		if !strings.EqualFold(r.name, name) {
+			continue
+		}
+		// schema.table.* (and catalog.schema.table.*) must match the table
+		// itself, not an alias.
+		if len(qual) >= 2 && (r.meta == nil || !strings.EqualFold(r.meta.Schema, qual[len(qual)-2]) ||
+			!strings.EqualFold(r.meta.Name, name)) {
+			continue
+		}
+		if len(qual) == 3 && !strings.EqualFold(qual[0], catalogName) {
+			continue
+		}
+		if !joined {
+			return meta.Columns, nil
+		}
+		var cols []columnMeta
+		for _, c := range meta.Columns {
+			if strings.HasPrefix(c.Name, r.prefix) {
+				cols = append(cols, c)
+			}
+		}
+		return cols, nil
+	}
+	return nil, errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", strings.Join(qual, "."))
+}
+
+// distinctAsGroupBy rewrites SELECT DISTINCT over plain expressions (no
+// aggregates, windows, stars, subqueries or RANDOM()) as GROUP BY them.
+func distinctAsGroupBy(sel *SelectStmt) (*SelectStmt, bool) {
+	if !sel.Distinct || len(sel.DistinctOn) > 0 || len(sel.GroupBy) > 0 || sel.Having != nil ||
+		len(sel.Windows) > 0 || sel.Qualify != nil {
+		return nil, false
+	}
+	g := *sel
+	g.Distinct, g.With, g.GroupBy = false, nil, nil
+	for _, it := range sel.Items {
+		if it.Star || isAggregate(it.Expr) || containsWindow(it.Expr) || hasVolatile(it.Expr) || hasSubquery(it.Expr) {
+			return nil, false
+		}
+		g.GroupBy = append(g.GroupBy, it.Expr)
+	}
+	for _, o := range sel.OrderBy {
+		if containsWindow(o.Expr) {
+			return nil, false
+		}
+	}
+	return &g, true
+}
+
+func hasSubquery(e Expr) bool {
+	found := false
+	walkExpr(e, func(x Expr) {
+		if _, ok := x.(*Subquery); ok {
+			found = true
+		}
+	})
+	return found
+}
+
+// checkDistinctOrder enforces Postgres's rule that with SELECT DISTINCT
+// every ORDER BY expression appears in the select list (the duplicates
+// removed would otherwise make the order ambiguous).
+func checkDistinctOrder(plan *selectPlan) error {
+	for _, o := range plan.order {
+		found := false
+		for _, it := range plan.items {
+			if exprEqual(it.expr, o.expr) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errorf(adbc.StatusInvalidArgument, "for SELECT DISTINCT, ORDER BY expressions must appear in select list")
+		}
+	}
+	return nil
+}
+
+// planDistinct plans SELECT DISTINCT and DISTINCT ON (…). DISTINCT ON
+// expressions may be output positions or aliases, like ORDER BY, and must
+// match the leading ORDER BY expressions (as in Postgres), so the row kept
+// for each key is the first in ORDER BY order.
+func (e *executor) planDistinct(ctx context.Context, plan *selectPlan, itemStart []int, types map[string]ColType) error {
+	sel := plan.sel
+	plan.distinct = true
+	if len(sel.DistinctOn) == 0 {
+		return checkDistinctOrder(plan)
+	}
+	for _, x := range sel.DistinctOn {
+		expr := x
+		if lit, ok := x.(*Literal); ok && lit.V.T.Kind.isInteger() && !lit.V.Null {
+			n := int(lit.V.I)
+			if n < 1 || n > len(plan.items) {
+				return errorf(adbc.StatusInvalidArgument, "DISTINCT ON position %d is out of range", n)
+			}
+			expr = plan.items[n-1].expr
+		} else if c, ok := x.(*ColumnRef); ok && c.Qualifier == "" {
+			for i, it := range sel.Items {
+				if !it.Star && it.Alias != "" && strings.EqualFold(it.Alias, c.Name) {
+					expr = plan.items[itemStart[i]].expr
+					break
+				}
+			}
+		}
+		if expr == x {
+			if containsWindow(x) {
+				return errorf(adbc.StatusInvalidArgument, "window functions are not allowed in DISTINCT ON")
+			}
+			if err := e.bind(ctx, x); err != nil {
+				return err
+			}
+			if isAggregate(x) {
+				plan.aggregate = true
+			}
+		}
+		t, err := inferType(expr, types, e.paramTypes)
+		if err != nil {
+			return invalidArg(err)
+		}
+		plan.distinctOn = append(plan.distinctOn, planItem{expr: expr, name: "__distinct_on", typ: t})
+	}
+	matched := make([]bool, len(plan.distinctOn))
+	left := len(plan.distinctOn)
+	for _, o := range plan.order {
+		if left == 0 {
+			break
+		}
+		found := false
+		for i, d := range plan.distinctOn {
+			if exprEqual(d.expr, o.expr) {
+				found = true
+				if !matched[i] {
+					matched[i] = true
+					left--
+				}
+			}
+		}
+		if !found {
+			return errorf(adbc.StatusInvalidArgument, "SELECT DISTINCT ON expressions must match initial ORDER BY expressions")
+		}
+	}
+	return nil
 }
 
 func applyLimit[T any](rows []T, offset, limit *int64) []T {

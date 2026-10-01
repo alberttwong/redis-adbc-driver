@@ -31,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -473,6 +474,9 @@ func (e *executor) scanMem(ctx context.Context, req scanRequest, params []Value)
 // ---- SELECT ----
 
 func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	if plan.distinct {
+		return e.runDistinct(ctx, plan, params)
+	}
 	if plan.setop != nil {
 		return e.runSetOp(ctx, plan, params)
 	}
@@ -585,6 +589,40 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// runDistinct runs a SELECT DISTINCT without its LIMIT / OFFSET (so they
+// never run in the index), removes duplicate rows (NULLs are equal, as in
+// set operations), then applies them. For DISTINCT ON the keys are
+// computed as hidden trailing columns and the first row of each key (in
+// ORDER BY order) is kept.
+func (e *executor) runDistinct(ctx context.Context, plan *selectPlan, params []Value) ([][]Value, error) {
+	inner := *plan
+	sel := *plan.sel
+	sel.Limit, sel.Offset = nil, nil
+	inner.sel, inner.distinct, inner.distinctOn = &sel, false, nil
+	n := len(plan.items)
+	if len(plan.distinctOn) > 0 {
+		inner.items = append(slices.Clip(plan.items), plan.distinctOn...)
+	}
+	rows, err := e.runSelect(ctx, &inner, params)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	out := make([][]Value, 0, len(rows))
+	for _, r := range rows {
+		key := rowKey(r[n:])
+		if len(plan.distinctOn) == 0 {
+			key = rowKey(r)
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r[:n])
+	}
+	return applyLimit(out, plan.sel.Offset, plan.sel.Limit), nil
 }
 
 // ---- aggregates ----

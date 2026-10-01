@@ -367,7 +367,7 @@ func isSimpleView(plan *selectPlan) bool {
 	sel := plan.sel
 	// Outer filters can't be pushed below window functions: they would
 	// change the rows the windows see.
-	return plan.meta != nil && !plan.meta.isMem && !plan.aggregate && !plan.windowed() &&
+	return plan.meta != nil && !plan.meta.isMem && !plan.aggregate && !plan.windowed() && !plan.distinct &&
 		len(sel.Joins) == 0 && sel.Limit == nil && sel.Offset == nil
 }
 
