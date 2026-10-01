@@ -106,7 +106,7 @@ func valueAt(arr arrow.Array, i int) (Value, error) {
 	case *array.Date32:
 		return intValue(ct, int64(a.Value(i))), nil
 	case *array.Date64:
-		return intValue(ct, floorDiv(int64(a.Value(i)), 86_400_000)), nil
+		return dateValue(floorDiv(int64(a.Value(i)), 86_400_000))
 	case *array.Time32:
 		return intValue(ct, int64(a.Value(i))), nil
 	case *array.Time64:

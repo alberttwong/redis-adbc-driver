@@ -847,6 +847,14 @@ field, even if later rows have it.
   - Months follow the calendar and clamp to the end of the month
     (`TIMESTAMP '2024-01-31' + INTERVAL '1 month'` is Feb 29). Comparisons
     treat a month as 30 days, so `INTERVAL '1 day' = INTERVAL '24 hours'`
+  - A result outside its type's range is an error, as in Postgres, rather
+    than wrapping. A `DATE` is an Arrow `date32` (-5877641-06-23 to
+    5881580-07-11): past it, `date ± integer`, `MAKE_DATE`, `DATEADD`, the
+    other date functions and casts to `DATE` give "date out of range". A
+    timestamp past the range of its unit (microseconds: about ±292,000 years
+    from 1970) is "timestamp out of range". An interval's time part is
+    nanoseconds in 64 bits (about ±2,562,047 hours); past that, and for a
+    months or days count beyond 32 bits, it is "interval out of range"
   - `AGE(a, b)` / `AGE(x)` (years, months, days and time), and `EXTRACT`
     on intervals
   - Intervals are returned as Arrow `month_day_nano_interval`; Arrow
