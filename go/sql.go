@@ -2000,6 +2000,18 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				return &Func{Name: "DATE_PART", Args: []Expr{&Literal{V: stringValue(strings.ToLower(ft.text))}, x}}, nil
 			}
+		case "SUBSTRING", "POSITION", "TRIM":
+			// SUBSTRING(s FROM a FOR b), POSITION(a IN b), TRIM(BOTH x FROM s)
+			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
+				p.pos += 2
+				switch upper {
+				case "SUBSTRING":
+					return p.parseSubstring()
+				case "POSITION":
+					return p.parsePosition()
+				}
+				return p.parseTrim()
+			}
 		case "EXISTS":
 			if p.peekAt(1).kind == tokOp && p.peekAt(1).text == "(" {
 				p.pos += 2
@@ -2092,6 +2104,129 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return p.parseColumnRef(t.text)
 	}
 	return nil, syntaxErr("unexpected end of input")
+}
+
+// finishCall parses the remaining `, arg … )` of a function call whose first
+// argument has been parsed.
+func (p *parser) finishCall(name string, first Expr) (Expr, error) {
+	f := &Func{Name: name, Args: []Expr{first}}
+	for p.acceptOp(",") {
+		a, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		f.Args = append(f.Args, a)
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// parseSubstring parses what follows `SUBSTRING(`: either an argument list
+// or the SQL-standard `s FROM start [FOR count]` / `s FOR count`.
+func (p *parser) parseSubstring() (Expr, error) {
+	s, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.isKeyword("FROM") && !p.isKeyword("FOR") {
+		return p.finishCall("SUBSTRING", s)
+	}
+	var start Expr = &Literal{V: intValue(typeInt64, 1)}
+	if p.acceptKeyword("FROM") {
+		if start, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	f := &Func{Name: "SUBSTRING", Args: []Expr{s, start}}
+	if p.acceptKeyword("FOR") {
+		count, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		f.Args = append(f.Args, count)
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// parsePosition parses what follows `POSITION(`: `sub IN s` (or `sub, s`).
+// The operands cannot contain comparisons, so that IN is not read as the
+// IN operator.
+func (p *parser) parsePosition() (Expr, error) {
+	sub, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptKeyword("IN") {
+		return p.finishCall("POSITION", sub)
+	}
+	s, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return &Func{Name: "POSITION", Args: []Expr{sub, s}}, nil
+}
+
+// parseTrim parses what follows `TRIM(`:
+//
+//	[BOTH | LEADING | TRAILING] [chars] FROM s
+//	s [, chars]
+//
+// into BTRIM / LTRIM / RTRIM(s [, chars]).
+func (p *parser) parseTrim() (Expr, error) {
+	name := "BTRIM"
+	if p.isKeyword("BOTH") || p.isKeyword("LEADING") || p.isKeyword("TRAILING") {
+		// A column of that name is followed by an operator, `,` or `)`.
+		if next := p.peekAt(1); next.kind != tokOp || next.text == "(" {
+			switch strings.ToUpper(p.next().text) {
+			case "LEADING":
+				name = "LTRIM"
+			case "TRAILING":
+				name = "RTRIM"
+			}
+		}
+	}
+	var s, chars Expr
+	var err error
+	if p.acceptKeyword("FROM") {
+		if s, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	} else {
+		x, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case p.acceptKeyword("FROM"):
+			chars = x
+			if s, err = p.parseExpr(); err != nil {
+				return nil, err
+			}
+		case p.acceptOp(","):
+			s = x
+			if chars, err = p.parseExpr(); err != nil {
+				return nil, err
+			}
+		default:
+			s = x
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	f := &Func{Name: name, Args: []Expr{s}}
+	if chars != nil {
+		f.Args = append(f.Args, chars)
+	}
+	return f, nil
 }
 
 // parseColumnRef parses the rest of [schema.][table.]column after its first
