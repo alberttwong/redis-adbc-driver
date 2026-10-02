@@ -21,6 +21,7 @@ package redis
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,6 +74,27 @@ func runScalarCases(t *testing.T, cases []scalarCase) {
 		}
 		if got != c.want || (c.typ != "" && typ != c.typ) {
 			t.Errorf("%s = %q (%s), want %q (%s)", c.expr, got, typ, c.want, c.typ)
+		}
+	}
+}
+
+// runScalarCasesULP is runScalarCases for DOUBLE results, which may be 1 ulp
+// from the value wanted (the next double either way).
+func runScalarCasesULP(t *testing.T, cases []scalarCase) {
+	t.Helper()
+	for _, c := range cases {
+		got, typ, err := evalTestExpr(t, c.expr)
+		if err != nil {
+			t.Errorf("%s: %v", c.expr, err)
+			continue
+		}
+		g, gerr := strconv.ParseFloat(got, 64)
+		w, werr := strconv.ParseFloat(c.want, 64)
+		if werr != nil {
+			t.Fatalf("%s: want %q: %v", c.expr, c.want, werr)
+		}
+		if gerr != nil || (g != w && math.Nextafter(w, g) != g) || typ != c.typ {
+			t.Errorf("%s = %q (%s), want %q (%s) within 1 ulp", c.expr, got, typ, c.want, c.typ)
 		}
 	}
 }
@@ -190,30 +212,35 @@ func TestScalarMath(t *testing.T) {
 // RADIANS and DEGREES. The values are Postgres's: the examples of its
 // documentation (sin(1), cot(0.5), degrees(0.5), …) and the exact results
 // its degree functions guarantee at 0, 30, 45, 60 and 90 degrees. The
-// radian functions are Go's math package, which can differ from the C
-// library Postgres uses in the last bit: Go's tan(1) is 1.557407724654902,
-// glibc's 1.5574077246549023.
+// radian functions are Go's math package, which can differ in the last bit
+// from the C library Postgres uses (Go's tan(1) is 1.557407724654902,
+// glibc's 1.5574077246549023) and between processors, as Go fuses
+// multiply-adds on arm64 but not on amd64: tan(π/4) is 0.9999999999999998
+// on arm64, 1 on amd64 and 0.9999999999999999 in glibc. So their inexact
+// results are compared to Postgres's within 1 ulp.
 func TestScalarTrigonometry(t *testing.T) {
 	const d = "DOUBLE PRECISION"
-	runScalarCases(t, []scalarCase{
-		{"PI()", "3.141592653589793", d},
+	runScalarCasesULP(t, []scalarCase{
 		{"SIN(1)", "0.8414709848078965", d},
 		{"SIN(1.0)", "0.8414709848078965", d}, // a NUMERIC argument
 		{"SIN('1')", "0.8414709848078965", d},
 		{"COS(1)", "0.5403023058681398", d},
-		{"TAN(1)", "1.557407724654902", d},
+		{"TAN(1)", "1.5574077246549023", d},
 		{"COT(0.5)", "1.830487721712452", d},
 		{"ASIN(1)", "1.5707963267948966", d},
-		{"ACOS(1)", "0", d},
 		{"ATAN(1)", "0.7853981633974483", d},
 		{"ATAN2(1, 0)", "1.5707963267948966", d},
+		{"TAN(PI() / 4)", "0.9999999999999999", d},
+		{"COT(PI() / 4)", "1.0000000000000002", d},
+	})
+	runScalarCases(t, []scalarCase{
+		{"PI()", "3.141592653589793", d},
+		{"ACOS(1)", "0", d},
 		{"SIN(PI() / 2)", "1", d},
 		{"COS(PI())", "-1", d},
 		{"SIN(0)", "0", d},
 		{"COS(0)", "1", d},
 		{"TAN(0)", "0", d},
-		{"TAN(PI() / 4)", "0.9999999999999998", d},
-		{"COT(PI() / 4)", "1.0000000000000002", d},
 		{"COT(0)", "Infinity", d}, // not an overflow, as in Postgres
 		{"ACOS(-1) = PI()", "true", "BOOLEAN"},
 		{"ASIN(-1) = -PI() / 2", "true", "BOOLEAN"},
