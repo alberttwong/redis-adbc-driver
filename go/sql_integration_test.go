@@ -2186,7 +2186,7 @@ func TestSQLUpdateFromDeleteUsing(t *testing.T) {
 	h.expectError(`UPDATE it_orders SET qty = 1 FROM it_orders`, "specified more than once")
 	h.expectError(`UPDATE it_orders o SET c.qty = 1 FROM it_customers c`, "is not in the table being updated")
 	h.expectError(`UPDATE it_orders o SET qty = id FROM it_customers c WHERE c.id = o.customer_id`, "ambiguous")
-	h.expectError(`UPDATE it_orders o SET qty = 1 FROM it_customers c WHERE COUNT(*) > 1`, "aggregates are not allowed")
+	h.expectError(`UPDATE it_orders o SET qty = 1 FROM it_customers c WHERE COUNT(*) > 1`, "aggregate functions are not allowed in WHERE")
 	h.expectError(`DELETE FROM it_orders o USING it_customers c WHERE c.nope = o.id`, "does not exist")
 	h.expectRows(`SELECT COUNT(*) FROM it_orders`, "6")
 }

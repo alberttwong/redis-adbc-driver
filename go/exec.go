@@ -486,7 +486,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 			return 0, errorf(adbc.StatusInvalidArgument, "INSERT has %d target columns but %d values", len(targets), len(exprs))
 		}
 		for _, expr := range exprs {
-			if _, err := e.bindIn(ctx, expr, nil, ""); err != nil {
+			if _, err := e.bindIn(ctx, expr, nil, "", "VALUES"); err != nil {
 				return 0, err
 			}
 		}
@@ -648,6 +648,10 @@ type selectPlan struct {
 	// grouping is set for a query with grouping sets (or GROUPING()): it
 	// runs over the combined groups of its sets (see grouping.go).
 	grouping *groupingPlan
+	// outerAggs are the aggregates of this query that its subqueries hold
+	// (see bindAggregate). It computes them with its own, into hidden
+	// columns of its groups, which the subqueries read.
+	outerAggs []*outerAggregate
 	// noRows is set when the query returns no rows whatever the tables
 	// hold (LIMIT 0, or a HAVING or QUALIFY that is never true); it then
 	// reads nothing (see empty.go).
@@ -730,7 +734,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			rels = []relation{rel}
 		}
 	}
-	sc := e.pushScope(rels)
+	sc := e.pushScope(rels, "")
 	defer func() {
 		plan.extraNeed = sc.needs
 		e.popScope()
@@ -790,6 +794,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	}
 	if len(sel.GroupBy) > 0 {
 		plan.aggregate = true
+		sc.aggClause = "GROUP BY"
 		aliases := map[string]Expr{}
 		for i, it := range sel.Items {
 			if !it.Star && it.Alias != "" {
@@ -810,15 +815,13 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			if err := e.bind(ctx, g); err != nil {
 				return nil, err
 			}
-			if isAggregate(g) {
-				return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in GROUP BY")
-			}
 			if containsWindow(g) {
 				return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in GROUP BY")
 			}
 			sel.GroupBy[i] = g
 		}
 	}
+	sc.aggClause = ""
 	if sel.Having != nil {
 		plan.aggregate = true
 		aliases := map[string]Expr{}
@@ -837,14 +840,13 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		plan.having = having
 	}
 	if sel.Where != nil {
-		if isAggregate(sel.Where) {
-			return nil, errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHERE")
-		}
 		if containsWindow(sel.Where) {
 			return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in WHERE; filter on them with QUALIFY or in an outer query")
 		}
 		restore := e.planningOnly(noInput)
+		sc.aggClause = "WHERE"
 		err := e.bind(ctx, sel.Where)
+		sc.aggClause = ""
 		restore()
 		if err != nil {
 			return nil, err
@@ -917,6 +919,10 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		if err := e.planDistinct(ctx, plan, itemStart, types); err != nil {
 			return nil, err
 		}
+	}
+	// The aggregates its subqueries hold make it an aggregate query.
+	if plan.outerAggs = sc.outerAggs; len(plan.outerAggs) > 0 {
+		plan.aggregate = true
 	}
 	if sel.GroupingSets != nil || usesGrouping(sel) {
 		return e.planGroupingSets(plan, types)
@@ -1247,6 +1253,25 @@ func (a *accumulator) result(env *evalEnv, t ColType) (Value, error) {
 	}
 }
 
+// aggregateCalls returns the aggregate calls a grouped query computes: those
+// of its SELECT list, ORDER BY, HAVING and QUALIFY, and those its subqueries
+// hold.
+func (p *selectPlan) aggregateCalls() []*Func {
+	var aggs []*Func
+	for _, it := range p.items {
+		collectAggregates(it.expr, &aggs)
+	}
+	for _, o := range p.order {
+		collectAggregates(o.expr, &aggs)
+	}
+	collectAggregates(p.having, &aggs)
+	collectAggregates(p.qualify, &aggs)
+	for _, a := range p.outerAggs {
+		aggs = append(aggs, a.fn)
+	}
+	return aggs
+}
+
 func collectAggregates(e Expr, out *[]*Func) {
 	walkExpr(e, func(x Expr) {
 		if f, ok := x.(*Func); ok && aggregateFuncs[f.Name] && !slices.Contains(*out, f) {
@@ -1291,7 +1316,7 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 	}
 	need := map[string]bool{}
 	for _, s := range st.Sets {
-		needs, err := e.bindIn(ctx, s.Expr, meta, st.Alias)
+		needs, err := e.bindIn(ctx, s.Expr, meta, st.Alias, "UPDATE")
 		if err != nil {
 			return 0, err
 		}

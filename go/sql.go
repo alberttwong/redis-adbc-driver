@@ -49,6 +49,10 @@ type ColumnRef struct {
 	// join conditions): the row-key prefix of the join item they read,
 	// which they bind to instead of by name, since two items may share it.
 	item string
+	// outerAgg is set for the reference that replaced an aggregate of an
+	// enclosing query in a subquery (see bindAggregate): Name is then the
+	// hidden column that query computes it into, Outer levels up.
+	outerAgg *outerAggregate
 }
 
 // Subquery is a SELECT used as an expression: a scalar subquery

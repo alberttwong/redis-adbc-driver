@@ -372,68 +372,27 @@ func (p *selectPlan) columnName(name string) string {
 // BY expression by itself is grouped there (a larger expression isn't
 // matched inside a subquery), and so are the references of the subqueries
 // nested in it. The callers don't look inside aggregate calls, which see
-// every row.
+// every row, and the subquery may read the aggregates of the query it holds
+// (outerAggs), computed per group.
 func (p *selectPlan) ungroupedSubquery(sq *Subquery) error {
 	for _, ref := range sq.outerRefs {
-		if ref.up != 0 || groupedColumn(p.sel.GroupBy, ref.name) {
+		if ref.up != 0 || groupedColumn(p.sel.GroupBy, ref.name) || p.outerAggregate(ref.name) {
 			continue
-		}
-		if outerAggregated(sq)[ref.name] {
-			return errorf(adbc.StatusNotImplemented, "outer-level aggregate of column %q in a subquery is not supported", p.columnName(ref.name))
 		}
 		return errorf(adbc.StatusInvalidArgument, "subquery uses ungrouped column %q from outer query", p.columnName(ref.name))
 	}
 	return nil
 }
 
-// outerAggregated returns the columns of the enclosing query read by the
-// subquery's outer-level aggregates. In Postgres an aggregate call whose
-// arguments read only an enclosing query's columns, like MAX(g.id) in
-// (SELECT MAX(g.id) FROM x), belongs to that query and is computed over its
-// groups; the driver would compute it over the subquery's rows.
-func outerAggregated(sq *Subquery) map[string]bool {
-	p := sq.plan
-	if p == nil {
-		return nil
+// outerAggregate reports whether a name is the hidden column of one of the
+// aggregates the query's subqueries hold.
+func (p *selectPlan) outerAggregate(name string) bool {
+	for _, a := range p.outerAggs {
+		if a.name == name {
+			return true
+		}
 	}
-	if p.grouping != nil {
-		p = p.grouping.base
-	}
-	exprs := []Expr{p.having, p.qualify}
-	for _, it := range p.items {
-		exprs = append(exprs, it.expr)
-	}
-	for _, o := range p.order {
-		exprs = append(exprs, o.expr)
-	}
-	cols := map[string]bool{}
-	for _, e := range exprs {
-		walkExpr(e, func(x Expr) {
-			f, ok := x.(*Func)
-			if !ok || !aggregateFuncs[f.Name] {
-				return
-			}
-			// The call's level is the innermost one its columns are of.
-			level := -1
-			var outer []string
-			walkExpr(f, func(y Expr) {
-				if c, ok := y.(*ColumnRef); ok {
-					if level < 0 || c.Outer < level {
-						level = c.Outer
-					}
-					if c.Outer == 1 {
-						outer = append(outer, c.Name)
-					}
-				}
-			})
-			if level == 1 {
-				for _, name := range outer {
-					cols[name] = true
-				}
-			}
-		})
-	}
-	return cols
+	return false
 }
 
 // checkGroupedSubqueries applies Postgres's grouping rule to the subqueries
@@ -555,6 +514,11 @@ func (e *executor) planGroupingSets(plan *selectPlan, types map[string]ColType) 
 	}
 	if r.err != nil {
 		return nil, r.err
+	}
+	// The aggregates its subqueries hold are columns of the combined groups,
+	// under the names the subqueries read.
+	for _, a := range plan.outerAggs {
+		gp.aggs = append(gp.aggs, groupingAgg{fn: a.fn, name: a.name})
 	}
 
 	meta := &tableMeta{Name: "grouping sets", isMem: true}

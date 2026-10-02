@@ -290,7 +290,7 @@ func (e *executor) bindCheck(ctx context.Context, meta *tableMeta, x Expr) error
 	scopes, sq := e.scopes, e.pendingSq
 	e.scopes, e.pendingSq = nil, nil
 	defer func() { e.scopes, e.pendingSq = scopes, sq }()
-	_, err := e.bindIn(ctx, x, meta, "")
+	_, err := e.bindIn(ctx, x, meta, "", "check constraints")
 	return err
 }
 

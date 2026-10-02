@@ -1403,12 +1403,24 @@ field, even if later rows have it.
     outer query`, for example in `select v from g group by v having exists
     (select 1 from g x where x.id > g.id)`. Up to v0.0.8 the subquery read
     one row of each group (#112).
-  - **Not supported:** an aggregate of only the outer query's columns, such
-    as `max(g.id)` in `(select max(g.id) from x)`. Postgres computes it over
-    the outer query's group, and it makes a query without `GROUP BY` an
-    aggregate one. Over an ungrouped column it is `outer-level aggregate of
-    column "g.id" in a subquery is not supported`. Otherwise the driver
-    computes it over the subquery's rows.
+  - **Aggregates of the outer query:** as in Postgres, an aggregate belongs
+    to the innermost query whose columns its arguments, `ORDER BY` and
+    `FILTER` read. `max(g.id)` in `(select max(g.id) from x where x.id = 1)`
+    is the outer query's: it is computed over each of its groups, and is a
+    constant in the subquery (also in its `WHERE`). It makes a query without
+    `GROUP BY` an aggregate one, which returns one row. `sum(g.v + x.id)`
+    reads the subquery's columns too, so it is the subquery's. Up to v0.0.9
+    such aggregates were computed over the subquery's rows, or rejected as
+    not supported (#120).
+  - **Where an aggregate may be** is decided at its own level, also for one
+    in a subquery: `select id from g where (select max(g.id)) > 1` gives
+    Postgres's `aggregate functions are not allowed in WHERE`. These errors
+    (in `WHERE`, `GROUP BY`, `JOIN` conditions, `UPDATE`, `VALUES`,
+    `RETURNING`, `FILTER`, MERGE `WHEN` conditions, …) have Postgres's text;
+    up to v0.0.9 some said `aggregates are not allowed in …`.
+  - **Not supported:** such an aggregate with a subquery in its arguments,
+    as in `(select max((select g.id)) from x)`. It is `outer-level aggregate
+    with a subquery in its arguments is not supported`.
   - **Repeated subqueries:** a subquery in `GROUP BY` counts as grouped
     where it is the same item, by position or alias (`group by 1`), not
     where it is written again (Postgres accepts both).

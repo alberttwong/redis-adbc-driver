@@ -63,7 +63,7 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 	if len(list) == 0 {
 		return nil, nil
 	}
-	sc := e.pushScope(rels)
+	sc := e.pushScope(rels, "RETURNING")
 	sc.mergeReturning = merge
 	defer e.popScope()
 	joined := rels[0].prefix != ""
@@ -79,9 +79,6 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 				ret.items = append(ret.items, planItem{expr: &ColumnRef{Name: c.Name}, name: c.outputName(), typ: c.Type})
 			}
 			continue
-		}
-		if isAggregate(it.Expr) {
-			return nil, errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in RETURNING")
 		}
 		if containsWindow(it.Expr) {
 			return nil, errorf(adbc.StatusInvalidArgument, "window functions are not allowed in RETURNING")

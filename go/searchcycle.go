@@ -138,7 +138,7 @@ func (e *executor) newTracer(ctx context.Context, def *CTE, rc *recursionCheck, 
 			env := e.newEnv(ctx, nil, e.params)
 			vals := make([]Value, 2)
 			for i, x := range []Expr{c.To, c.Default} {
-				if _, err := e.bindIn(ctx, x, nil, ""); err != nil {
+				if _, err := e.bindIn(ctx, x, nil, "", ""); err != nil {
 					return nil, err
 				}
 				if vals[i], err = env.eval(x); err != nil {

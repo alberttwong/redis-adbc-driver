@@ -32,7 +32,9 @@ package redis
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 )
@@ -62,6 +64,17 @@ type scope struct {
 	// mergeReturning is set for the RETURNING list of a MERGE, the only
 	// place merge_action() may be called.
 	mergeReturning bool
+	// aggClause names the clause being bound, for Postgres's error for an
+	// aggregate of this scope's level in it (`aggregate functions are not
+	// allowed in WHERE`); it is empty where one may be: a SELECT's list,
+	// HAVING, ORDER BY, QUALIFY, WINDOW and DISTINCT ON. inAggregate counts
+	// the aggregate calls of this level whose arguments are being bound: an
+	// aggregate of this level in them is nested.
+	aggClause   string
+	inAggregate int
+	// outerAggs are the aggregates of this scope's level that its
+	// subqueries hold (see bindAggregate).
+	outerAggs []*outerAggregate
 }
 
 // execCache holds per-statement results shared by nested executors.
@@ -119,8 +132,10 @@ func (e *executor) newEnv(ctx context.Context, types map[string]ColType, params 
 	return &evalEnv{ctx: ctx, exec: e, outer: e.outer, types: types, params: params}
 }
 
-func (e *executor) pushScope(rels []relation) *scope {
-	sc := &scope{rels: rels, sq: e.pendingSq, needs: map[string]bool{}}
+// pushScope pushes the scope of a query or statement over rels; aggClause
+// is that of the clause bound first (see scope.aggClause).
+func (e *executor) pushScope(rels []relation, aggClause string) *scope {
+	sc := &scope{rels: rels, sq: e.pendingSq, needs: map[string]bool{}, aggClause: aggClause}
 	e.pendingSq = nil
 	e.scopes = append(e.scopes, sc)
 	return sc
@@ -137,14 +152,15 @@ func tableRel(meta *tableMeta, alias string) relation {
 }
 
 // bindIn binds an expression in a new scope over one table read under alias
-// ("" for none); meta may be nil for expressions without a FROM. It returns
-// the columns of that table read by correlated subqueries.
-func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, alias string) (map[string]bool, error) {
+// ("" for none); meta may be nil for expressions without a FROM. clause
+// names the clause for the error of an aggregate in it ("" for none). It
+// returns the columns of that table read by correlated subqueries.
+func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, alias, clause string) (map[string]bool, error) {
 	var rels []relation
 	if meta != nil {
 		rels = []relation{tableRel(meta, alias)}
 	}
-	sc := e.pushScope(rels)
+	sc := e.pushScope(rels, clause)
 	defer e.popScope()
 	if err := e.bind(ctx, expr); err != nil {
 		return nil, err
@@ -159,13 +175,17 @@ func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, alias
 // plans its subqueries.
 func (e *executor) bind(ctx context.Context, expr Expr) error {
 	var err error
-	walkExpr(expr, func(x Expr) {
+	walkExprPruned(expr, func(x Expr) bool {
 		if err != nil {
-			return
+			return false
 		}
 		switch v := x.(type) {
 		case *ColumnRef:
-			err = e.resolveColumn(v)
+			if v.outerAgg != nil {
+				err = e.bindOuterAggregate(ctx, v)
+			} else {
+				err = e.resolveColumn(v)
+			}
 		case *Binary:
 			if _, ok := v.L.(*RowExpr); ok {
 				err = e.rowOperatorError(ctx, v)
@@ -190,6 +210,11 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 		case *Func:
 			// A window call's own *Func is not visited, so this is a call
 			// without OVER.
+			if aggregateFuncs[v.Name] {
+				// It binds its arguments itself.
+				err = e.bindAggregate(ctx, v)
+				return false
+			}
 			err = e.bindCall(ctx, v, nil)
 			if err == nil && v.Name == "MERGE_ACTION" {
 				err = e.checkMergeAction(v)
@@ -197,8 +222,222 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 		case *WindowFunc:
 			err = e.bindCall(ctx, v.Func, v)
 		}
+		return err == nil
 	})
 	return err
+}
+
+// ---- aggregates of enclosing queries ----
+//
+// As in Postgres (check_agg_arguments), an aggregate call belongs to the
+// innermost query whose columns its arguments, ORDER BY and FILTER read (for
+// an ordered-set aggregate, its WITHIN GROUP value and FILTER), or to its own
+// query if they read none. In `SELECT v, (SELECT SUM(g.v) FROM g x WHERE x.id
+// = 1) FROM g GROUP BY v`, SUM(g.v) is the outer query's: it adds g.v over
+// each group of g, and makes a query without GROUP BY an aggregate one. Where
+// the call may be is decided at that level: `SELECT id FROM g WHERE (SELECT
+// MAX(g.id)) > 1` has an aggregate in its WHERE.
+//
+// Such a call is moved to its query while the subquery is bound: the query
+// computes it with its own aggregates, into a hidden column of its groups,
+// and the call becomes COALESCE(ref), which is ref, a reference to that
+// column. For the subquery that is an outer column like any other, constant
+// while it runs and part of its memo key.
+
+// outerAggregate is an aggregate call that a subquery holds, of an enclosing
+// query's level: fn is bound in that query's scope, which computes it into
+// its hidden column name.
+type outerAggregate struct {
+	fn   *Func
+	name string
+	typ  ColType
+}
+
+// outerAggregates numbers the hidden columns. It is never reset: a cached
+// statement planned again keeps the names it has, and new ones stay apart.
+var outerAggregates atomic.Int64
+
+// bindAggregate binds an aggregate call without OVER, in its query's scope.
+func (e *executor) bindAggregate(ctx context.Context, f *Func) error {
+	level, direct, known := e.aggregateLevel(f)
+	if known && level > 0 {
+		if direct >= 0 && direct < level {
+			return errorf(adbc.StatusInvalidArgument, "outer-level aggregate cannot contain a lower-level variable in its direct arguments")
+		}
+		return e.hoistAggregate(ctx, f, level)
+	}
+	var sc *scope
+	if n := len(e.scopes); n > 0 {
+		sc = e.scopes[n-1]
+		sc.inAggregate++
+	}
+	err := e.bindAggregateParts(ctx, f, sc)
+	if sc != nil {
+		sc.inAggregate--
+	}
+	if err != nil {
+		return err
+	}
+	if !known && boundLevel(f) > 0 {
+		// Its columns are found only now, in a subquery: they are an
+		// enclosing query's, where binding it again would plan that subquery
+		// at another level.
+		return errorf(adbc.StatusNotImplemented, "outer-level aggregate with a subquery in its arguments is not supported")
+	}
+	if err := resolveCall(f, false); err != nil {
+		return err
+	}
+	switch {
+	case sc == nil:
+	case sc.aggClause != "":
+		return errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in %s", sc.aggClause)
+	case sc.inAggregate > 0:
+		return errorf(adbc.StatusInvalidArgument, "aggregate function calls cannot be nested")
+	}
+	return nil
+}
+
+// bindAggregateParts binds the arguments, ORDER BY and FILTER of an aggregate
+// call of the scope sc (nil without one).
+func (e *executor) bindAggregateParts(ctx context.Context, f *Func, sc *scope) error {
+	for _, a := range f.Args {
+		if err := e.bind(ctx, a); err != nil {
+			return err
+		}
+	}
+	for _, o := range f.OrderBy {
+		if err := e.bind(ctx, o.Expr); err != nil {
+			return err
+		}
+	}
+	if f.Filter == nil {
+		return nil
+	}
+	if sc != nil {
+		saved := sc.aggClause
+		sc.aggClause = "FILTER"
+		defer func() { sc.aggClause = saved }()
+	}
+	return e.bind(ctx, f.Filter)
+}
+
+// aggregateParts are the expressions that decide an aggregate call's level:
+// its arguments (for an ordered-set aggregate, its WITHIN GROUP value
+// instead), ORDER BY and FILTER.
+func aggregateParts(f *Func) []Expr {
+	parts := callArgs(f, nil)
+	if orderedSetFuncs[f.Name] {
+		parts = parts[len(f.Args):]
+	}
+	return parts
+}
+
+// aggregateLevel returns the level of an aggregate call before it is bound:
+// how many queries up its columns' innermost query is. direct is the lowest
+// level of an ordered-set aggregate's direct arguments (-1 without columns).
+// known is false if a column doesn't resolve, or if the call has a
+// subquery, whose columns are found only when it is planned.
+func (e *executor) aggregateLevel(f *Func) (level, direct int, known bool) {
+	known = true
+	lowest := func(exprs []Expr) int {
+		low := -1
+		for _, x := range exprs {
+			walkExpr(x, func(n Expr) {
+				d := 0
+				switch v := n.(type) {
+				case *ColumnRef:
+					if v.outerAgg != nil {
+						d = v.Outer
+					} else if depth, _, err := e.findColumn(v); err == nil {
+						d = depth
+					} else {
+						known = false
+					}
+				case *Subquery:
+					known = false
+					return
+				default:
+					return
+				}
+				if low < 0 || d < low {
+					low = d
+				}
+			})
+		}
+		return low
+	}
+	direct = -1
+	if orderedSetFuncs[f.Name] {
+		direct = lowest(f.Args)
+	}
+	return max(lowest(aggregateParts(f)), 0), direct, known
+}
+
+// boundLevel returns the level of a bound aggregate call: the lowest of its
+// columns' and its subqueries' outer references.
+func boundLevel(f *Func) int {
+	low := -1
+	lower := func(d int) {
+		if low < 0 || d < low {
+			low = d
+		}
+	}
+	for _, x := range aggregateParts(f) {
+		walkExpr(x, func(n Expr) {
+			switch v := n.(type) {
+			case *ColumnRef:
+				lower(v.Outer)
+			case *Subquery:
+				for _, r := range v.outerRefs {
+					lower(r.up)
+				}
+			}
+		})
+	}
+	return max(low, 0)
+}
+
+// hoistAggregate moves an aggregate call of the query level levels up to it.
+func (e *executor) hoistAggregate(ctx context.Context, f *Func, level int) error {
+	fn := *f
+	h := &outerAggregate{fn: &fn, name: hiddenColumn("outeragg", int(outerAggregates.Add(1)))}
+	ref := &ColumnRef{Name: h.name, Outer: level, outerAgg: h}
+	if err := e.bindOuterAggregate(ctx, ref); err != nil {
+		return err
+	}
+	*f = Func{Name: "COALESCE", Args: []Expr{ref}}
+	return nil
+}
+
+// bindOuterAggregate binds the reference to an aggregate of the query
+// ref.Outer levels up, whenever its subquery is planned: it binds the
+// aggregate in that query's scope, where it must be allowed, and makes it
+// one of the query's aggregates.
+func (e *executor) bindOuterAggregate(ctx context.Context, ref *ColumnRef) error {
+	h := ref.outerAgg
+	top := len(e.scopes) - 1
+	if ref.Outer < 1 || ref.Outer > top {
+		return errorf(adbc.StatusInternal, "aggregate of an enclosing query has no scope")
+	}
+	sc := e.scopes[top-ref.Outer]
+	saved := e.scopes
+	e.scopes = slices.Clip(e.scopes[:top-ref.Outer+1])
+	err := e.bind(ctx, h.fn)
+	if err == nil {
+		if h.typ, err = inferType(h.fn, e.scopeTypes(), e.paramTypes); err != nil {
+			err = invalidArg(err)
+		}
+	}
+	e.scopes = saved
+	if err != nil {
+		return err
+	}
+	ref.OuterType = h.typ
+	if !slices.Contains(sc.outerAggs, h) {
+		sc.outerAggs = append(sc.outerAggs, h)
+	}
+	e.correlate(h.name, ref.Outer)
+	return nil
 }
 
 // bindCall resolves a call while it is bound (resolveCall in funcs.go); w is
@@ -248,9 +487,29 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 		c.written = c.Name
 	}
 	c.Name = c.written
-	q := c.qual()
-	if err := q.checkCatalog(c.written); err != nil {
+	depth, col, err := e.findColumn(c)
+	if err != nil {
 		return err
+	}
+	c.Name, c.Outer, c.OuterType = col.Name, depth, col.Type
+	if depth > 0 {
+		e.scopes[len(e.scopes)-1-depth].needs[col.Name] = true
+		e.correlate(col.Name, depth)
+	}
+	return nil
+}
+
+// findColumn finds the column a reference names, as resolveColumn binds it,
+// without binding it: depth is the number of scopes up from the innermost
+// one, and col.Name the column's name there.
+func (e *executor) findColumn(c *ColumnRef) (int, columnMeta, error) {
+	ref := *c
+	if ref.written != "" {
+		ref.Name = ref.written
+	}
+	q := ref.qual()
+	if err := q.checkCatalog(ref.Name); err != nil {
+		return 0, columnMeta{}, err
 	}
 	top := len(e.scopes) - 1
 	for depth := 0; depth <= top; depth++ {
@@ -259,17 +518,17 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 		var matchRel relation
 		found, named := 0, 0
 		for _, rel := range sc.rels {
-			if c.Qualifier != "" {
+			if ref.Qualifier != "" {
 				if !e.names(q, rel) {
 					continue
 				}
 				if named++; named > 1 {
 					// Two tables t of different schemas.
-					return errorf(adbc.StatusInvalidArgument, "table reference %q is ambiguous", c.Qualifier)
+					return 0, columnMeta{}, errorf(adbc.StatusInvalidArgument, "table reference %q is ambiguous", ref.Qualifier)
 				}
 			}
-			col, ok := rel.meta.column(c.Name)
-			if !ok || (rel.prefix != "" && col.Name == rowIDField) || (c.Qualifier == "" && rel.hidden[col.Name]) {
+			col, ok := rel.meta.column(ref.Name)
+			if !ok || (rel.prefix != "" && col.Name == rowIDField) || (ref.Qualifier == "" && rel.hidden[col.Name]) {
 				continue
 			}
 			found++
@@ -278,43 +537,43 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 			}
 		}
 		if found > 1 {
-			return errorf(adbc.StatusInvalidArgument, "column reference %q is ambiguous; qualify it with a table alias", c.Name)
+			return 0, columnMeta{}, errorf(adbc.StatusInvalidArgument, "column reference %q is ambiguous; qualify it with a table alias", ref.Name)
 		}
 		if found == 1 {
-			col := match
-			col.Name = matchRel.prefix + col.Name
-			c.Name = col.Name
-			c.Outer = depth
-			c.OuterType = col.Type
-			if depth > 0 {
-				sc.needs[col.Name] = true
-				for k := 0; k < depth; k++ {
-					sq := e.scopes[top-k].sq
-					if sq == nil {
-						continue
-					}
-					sq.correlated = true
-					sq.outerUses++
-					ref := outerRef{name: col.Name, up: depth - k - 1}
-					if !containsRef(sq.outerRefs, ref) {
-						sq.outerRefs = append(sq.outerRefs, ref)
-					}
-				}
-			}
-			return nil
+			match.Name = matchRel.prefix + match.Name
+			return depth, match, nil
 		}
 		if named > 0 {
 			// The item visible as the qualifier here has no such column.
-			return noSuchColumn(c, sc)
+			return 0, columnMeta{}, noSuchColumn(&ref, sc)
 		}
 	}
-	if c.Qualifier != "" {
-		return e.missingFromEntry(q)
+	if ref.Qualifier != "" {
+		return 0, columnMeta{}, e.missingFromEntry(q)
 	}
 	if top < 0 {
-		return noSuchColumn(c, nil)
+		return 0, columnMeta{}, noSuchColumn(&ref, nil)
 	}
-	return noSuchColumn(c, e.scopes[top])
+	return 0, columnMeta{}, noSuchColumn(&ref, e.scopes[top])
+}
+
+// correlate marks the subqueries whose bodies are the scopes from the
+// innermost one up to the one depth levels up (not included) as reading its
+// column name.
+func (e *executor) correlate(name string, depth int) {
+	top := len(e.scopes) - 1
+	for k := 0; k < depth; k++ {
+		sq := e.scopes[top-k].sq
+		if sq == nil {
+			continue
+		}
+		sq.correlated = true
+		sq.outerUses++
+		ref := outerRef{name: name, up: depth - k - 1}
+		if !containsRef(sq.outerRefs, ref) {
+			sq.outerRefs = append(sq.outerRefs, ref)
+		}
+	}
 }
 
 // qualName is the qualifier of a column reference or of rel.*: a FROM
@@ -466,7 +725,9 @@ func (e *executor) planSubquery(ctx context.Context, sq *Subquery) error {
 		one := int64(1)
 		sq.Select.Limit = &one
 	}
-	sq.outerUses, sq.semi = 0, nil
+	// Planned again (a shared node, a cached statement), it finds its outer
+	// references again.
+	sq.outerUses, sq.semi, sq.outerRefs, sq.correlated = 0, nil, nil, false
 	e.pendingSq = sq
 	plan, err := e.planSelect(ctx, sq.Select, e.paramTypes)
 	e.pendingSq = nil

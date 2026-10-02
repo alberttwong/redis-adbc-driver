@@ -259,11 +259,8 @@ func (e *executor) bindJoin(ctx context.Context, sel *SelectStmt, jp *joinPlan) 
 			it.on = nil
 			continue
 		}
-		if err := e.bind(ctx, cond); err != nil {
+		if err := e.bindClause(ctx, cond, "JOIN conditions"); err != nil {
 			return err
-		}
-		if isAggregate(cond) {
-			return errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in JOIN conditions")
 		}
 		if containsWindow(cond) {
 			return errorf(adbc.StatusInvalidArgument, "window functions are not allowed in JOIN conditions")

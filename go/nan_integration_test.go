@@ -128,11 +128,7 @@ func (h *sqlHarness) indexAggIn(mode, sql string) bool {
 	if err != nil {
 		h.t.Fatalf("%s: %v", sql, err)
 	}
-	var aggs []*Func
-	for _, it := range plan.items {
-		collectAggregates(it.expr, &aggs)
-	}
-	_, ok, err := e.indexAggregate(h.ctx, plan, wp, aggs)
+	_, ok, err := e.indexAggregate(h.ctx, plan, wp, plan.aggregateCalls())
 	if err != nil {
 		h.t.Fatalf("%s: %v", sql, err)
 	}
