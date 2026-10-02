@@ -598,7 +598,9 @@ type DropSchemaStmt struct {
 // TruncateStmt is TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY].
 type TruncateStmt struct {
 	Tables []TableName
-	// RestartIdentity restarts the row id sequence (__rowid) at 1.
+	// RestartIdentity restarts the row id sequence (__rowid) at 1. Either
+	// way the tables move to new keys (see truncateTables), so new rows
+	// can't take the keys of rows that another statement is still writing.
 	RestartIdentity bool
 }
 

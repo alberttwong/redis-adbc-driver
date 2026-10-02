@@ -304,6 +304,10 @@ func cloneMeta(m *tableMeta) *tableMeta {
 	return &c
 }
 
+// testHookAltered, when set by a test, runs once alterTable has changed the
+// index (step 3), before it commits.
+var testHookAltered func(meta *tableMeta)
+
 // alterTable runs the actions of an ALTER TABLE other than RENAME, one or
 // several, as one change of the table's metadata:
 //
@@ -318,7 +322,9 @@ func cloneMeta(m *tableMeta) *tableMeta {
 //  4. Commit: in one WATCH/MULTI on the metadata (and on the row id counter
 //     if a column gets a missing value), the actions are applied again to
 //     the metadata as it is then, and the result written if they did the
-//     same as planned; otherwise the statement fails ("try again").
+//     same as planned, and the table still has the index of step 3 (TRUNCATE
+//     moves a table to a new one); otherwise the statement fails ("try
+//     again").
 //  5. The fields of dropped columns are removed from the rows in the
 //     background, as for a single DROP COLUMN.
 //
@@ -368,10 +374,17 @@ func (e *executor) alterTable(ctx context.Context, meta *tableMeta, cmds []Alter
 			return wrapRedis(err, "failed to add "+what+" to the search index")
 		}
 	}
+	if testHookAltered != nil {
+		testHookAltered(meta)
+	}
 	// The rows that exist when a column with a missing value is added, those
 	// with ids up to the last one allocated, read it (see defaults.go).
 	withMissing := slices.ContainsFunc(res.added, func(c addedColumn) bool { return c.missing })
 	err = e.store.updateTableTx(ctx, meta.Schema, meta.Name, withMissing, func(m *tableMeta, lastRowID int64) error {
+		// TRUNCATE moves a table to a new index (truncateTables).
+		if m.index() != meta.index() || m.prefix() != meta.prefix() {
+			return errorf(adbc.StatusIO, "table %q changed concurrently; try again", m.Name)
+		}
 		cur := cloneMeta(m)
 		again, err := e.applyAlter(ctx, m, cmds, taken)
 		if err != nil {

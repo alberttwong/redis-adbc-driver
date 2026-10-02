@@ -1522,12 +1522,27 @@ func TestSQLTruncate(t *testing.T) {
 	h.exec("INSERT INTO it_trunc2 VALUES ('p'), ('q')")
 	h.exec("CREATE VIEW it_trunc_v AS SELECT id FROM it_trunc")
 
+	// The table moves to a new key prefix and index, and the old ones are
+	// released, as by DROP TABLE.
+	n := h.namesN(raw, "public", "it_trunc", "it_trunc")
+	prefix, index := h.tableNames(raw, "public", "it_trunc")
+	prefix2, index2 := h.tableNames(raw, "public", "it_trunc2")
 	h.exec("TRUNCATE TABLE it_trunc")
 	h.expectRows("SELECT COUNT(*) FROM it_trunc", "0")
+	if m := h.namesN(raw, "public", "it_trunc", "it_trunc"); m <= n {
+		t.Errorf("names of N = %d after TRUNCATE, want more than %d", m, n)
+	}
+	h.expectReleased(raw, prefix, index)
+	if gen, err := raw.HGet(h.ctx, releasedKey, prefix).Int64(); err != nil || gen != 1 {
+		t.Errorf("released count of %q = %d (%v), want 1", prefix, gen, err)
+	}
 	if n := h.prefixKeyCount(raw, h.tablePrefix(raw, "public", "it_trunc")); n != 0 {
-		t.Errorf("%d row keys left after TRUNCATE", n)
+		t.Errorf("%d row keys under the new prefix after TRUNCATE", n)
 	}
 	h.expectRows("SELECT COUNT(*) FROM it_trunc2", "2")
+	if p, i := h.tableNames(raw, "public", "it_trunc2"); p != prefix2 || i != index2 {
+		t.Errorf("it_trunc2 has the names %q, %q, want %q, %q", p, i, prefix2, index2)
+	}
 	h.expectRows(`SELECT column_name, data_type, is_indexed FROM information_schema.columns
 		WHERE table_name = 'it_trunc' ORDER BY ordinal_position`,
 		"id|BIGINT|YES", "label|VARCHAR|YES", "note|VARCHAR|NO", "qty|INTEGER|YES")
@@ -1539,11 +1554,22 @@ func TestSQLTruncate(t *testing.T) {
 	h.expectRows("SELECT __rowid, id FROM it_trunc ORDER BY id", "5|5", "6|6")
 	h.expectRows("SELECT id FROM it_trunc_v ORDER BY id", "5", "6")
 
-	// RESTART IDENTITY, several tables at once, and no TABLE keyword.
-	h.exec("TRUNCATE it_trunc, it_trunc2 RESTART IDENTITY CASCADE")
+	// RESTART IDENTITY, several tables at once (one of them named twice),
+	// and no TABLE keyword.
+	prefix, index = h.tableNames(raw, "public", "it_trunc")
+	h.exec("TRUNCATE it_trunc, it_trunc2, public.it_trunc RESTART IDENTITY CASCADE")
 	h.expectRows("SELECT COUNT(*) FROM it_trunc2", "0")
+	h.expectReleased(raw, prefix, index)
+	h.expectReleased(raw, prefix2, index2)
 	h.exec("INSERT INTO it_trunc (id) VALUES (7)")
 	h.expectRows("SELECT __rowid, id FROM it_trunc", "1|7")
+	h.exec("INSERT INTO it_trunc2 VALUES ('r')")
+	h.expectRows("SELECT __rowid, k FROM it_trunc2", "1|r")
+
+	// CONTINUE IDENTITY, and RESTRICT.
+	h.exec("TRUNCATE it_trunc CONTINUE IDENTITY RESTRICT")
+	h.exec("INSERT INTO it_trunc (id) VALUES (8)")
+	h.expectRows("SELECT __rowid, id FROM it_trunc", "2|8")
 
 	// A bad name anywhere in the list leaves every table untouched.
 	h.expectError("TRUNCATE it_trunc, it_trunc_missing", "does not exist")

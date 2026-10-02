@@ -245,11 +245,11 @@ func (e *executor) runSession(st Stmt) (execResult, error) {
 
 // ---- DDL ----
 
-// runTruncate empties each table. Every name is resolved first, so a missing
-// table or a view in the list leaves all of them untouched.
+// runTruncate empties the tables, all of them or none (truncateTables). A
+// table named twice is emptied once.
 func (e *executor) runTruncate(ctx context.Context, st *TruncateStmt) error {
-	type target struct{ schema, name string }
-	var targets []target
+	var metas []*tableMeta
+	seen := map[string]bool{}
 	for _, t := range st.Tables {
 		schema, name, err := e.resolveTable(t)
 		if err != nil {
@@ -263,17 +263,16 @@ func (e *executor) runTruncate(ctx context.Context, st *TruncateStmt) error {
 		} else if isView {
 			return errorf(adbc.StatusInvalidArgument, "cannot truncate %q.%q: it is a view", displaySchema(schema), name)
 		}
-		if _, err := e.store.getTable(ctx, schema, name); err != nil {
+		meta, err := e.store.getTable(ctx, schema, name)
+		if err != nil {
 			return err
 		}
-		targets = append(targets, target{schema, name})
-	}
-	for _, t := range targets {
-		if err := e.store.truncateTable(ctx, t.schema, t.name, st.RestartIdentity); err != nil {
-			return err
+		if key := metaKey(schema, name); !seen[key] {
+			seen[key] = true
+			metas = append(metas, meta)
 		}
 	}
-	return nil
+	return e.store.truncateTables(ctx, metas, st.RestartIdentity)
 }
 
 func (e *executor) runCreateTable(ctx context.Context, st *CreateTableStmt) error {

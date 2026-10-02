@@ -278,8 +278,11 @@ func TestSQLTempTables(t *testing.T) {
 	h.expectError(`ALTER TABLE it_tmp RENAME TO public.it_tmp`, "another schema")
 	h.expectRows(`SELECT id, tag FROM it_tmp WHERE tag = 'c'`, "3|c")
 
-	// TRUNCATE keeps the table and its index.
+	// TRUNCATE keeps the table, and moves it to new keys.
 	h.exec(`TRUNCATE TABLE it_tmp_ctas`)
+	if n := h.namesN(raw, schema, "it_tmp_ctas", "it_tmp_ctas"); n != 2 {
+		t.Errorf("the truncated temporary table has the names of N = %d, want 2", n)
+	}
 	h.expectRows(`SELECT COUNT(*) FROM it_tmp_ctas`, "0")
 	h.exec(`INSERT INTO it_tmp_ctas VALUES (5, 1.25)`)
 	h.expectRows(`SELECT customer_id, total FROM it_tmp_ctas WHERE customer_id = 5`, "5|1.25")
