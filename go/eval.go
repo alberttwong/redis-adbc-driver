@@ -200,7 +200,7 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		c, err := castValue(v, x.T)
+		c, err := castValue(v, x.T, env.zone())
 		if err != nil && x.OnError != nil && castable(v.T, x.T) {
 			// TRY_CAST and DEFAULT … ON CONVERSION ERROR: a value that
 			// cannot be converted gives the fallback, but types that never
@@ -209,7 +209,7 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return castValue(d, x.T)
+			return castValue(d, x.T, env.zone())
 		}
 		return c, err
 	case *IsNull:
@@ -280,7 +280,7 @@ func (env *evalEnv) eval(e Expr) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return binaryOp(x.Op, l, r)
+		return binaryOp(x.Op, l, r, env.zone())
 	case *RowExpr:
 		return Value{}, errRowValue()
 	case *Func:
@@ -316,22 +316,51 @@ func (env *evalEnv) evalCase(c *Case) (Value, error) {
 			return Value{}, err
 		}
 		if c.Operand != nil {
-			if v, err = binaryOp("=", operand, v); err != nil {
+			if v, err = binaryOp("=", operand, v, env.zone()); err != nil {
 				return Value{}, err
 			}
 		}
 		if b, ok := truthy(v); ok && b {
-			return env.eval(w.Then)
+			return env.branchValue(c, w.Then)
 		}
 	}
 	if c.Else != nil {
-		return env.eval(c.Else)
+		return env.branchValue(c, c.Else)
 	}
 	return nullValue(typeNull), nil
 }
 
-// concatValues joins the text of the non-NULL values with sep.
-func concatValues(sep string, args []Value) Value {
+// branchValue evaluates the chosen branch of a CASE or IIF (e). A date or
+// timestamp is converted to the result's type when that is another date
+// or timestamp type: a TIMESTAMP or DATE branch of a TIMESTAMP WITH TIME
+// ZONE result is read as a local time in the session time zone, as
+// Postgres converts a CASE's branches, so that sorting, grouping and text
+// see the result's values. (Other types keep their branch's value, which
+// the result's type holds.)
+func (env *evalEnv) branchValue(e, branch Expr) (Value, error) {
+	v, err := env.eval(branch)
+	if err != nil || v.Null || (v.T.Kind != KindTimestamp && v.T.Kind != KindDate) || env.exec == nil {
+		return v, err
+	}
+	ex := env.exec
+	ex.ensureCache()
+	t, ok := ex.cache.branchTypes[e]
+	if !ok {
+		t, _ = inferType(e, env.types, ex.paramTypes) // the zero type on error
+		ex.cache.branchTypes[e] = t
+	}
+	if t.Kind != KindTimestamp || (v.T.Kind == KindTimestamp && v.T.TZ == t.TZ) {
+		return v, nil
+	}
+	if v.T.Kind == KindTimestamp && unitsPerSecond[v.T.Unit] > unitsPerSecond[t.Unit] {
+		t.Unit = v.T.Unit
+	}
+	return coerceIn(v, t, env.zone())
+}
+
+// concatValues joins the text of the non-NULL values with sep, in the
+// session time zone z.
+func concatValues(sep string, args []Value, z tzZone) Value {
 	var b strings.Builder
 	first := true
 	for _, a := range args {
@@ -341,7 +370,7 @@ func concatValues(sep string, args []Value) Value {
 		if !first {
 			b.WriteString(sep)
 		}
-		b.WriteString(a.Text())
+		b.WriteString(a.textIn(z))
 		first = false
 	}
 	return stringValue(b.String())
@@ -400,21 +429,21 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		t := unifiedType(f, argTypes(args))
 		for _, a := range args {
 			if !a.Null {
-				return Coerce(a, t)
+				return coerceIn(a, t, env.zone())
 			}
 		}
 		return nullValue(t), nil
 	case implConditional:
-		return evalConditional(f, args)
+		return evalConditional(f, args, env.zone())
 	case implConcat:
 		// NULL arguments are skipped, as in Postgres (|| propagates NULL).
 		if f.Name == "CONCAT" {
-			return concatValues("", args), nil
+			return concatValues("", args, env.zone()), nil
 		}
 		if args[0].Null {
 			return nullValue(typeString), nil
 		}
-		return concatValues(args[0].Text(), args[1:]), nil
+		return concatValues(args[0].textIn(env.zone()), args[1:], env.zone()), nil
 	}
 	for _, a := range args {
 		if a.Null {
@@ -428,7 +457,7 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 		}
 		return Value{}, fmt.Errorf("unsupported function %s", f.Name)
 	case implScalar:
-		return scalarFunc(f, args)
+		return scalarFunc(f, args, env.zone())
 	}
 	switch f.Name {
 	case "FROM_HEX", "UNHEX", "DECODE_HEX":
@@ -440,14 +469,14 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 	case "TO_HEX", "HEX":
 		return stringValue(hex.EncodeToString([]byte(args[0].S))), nil
 	case "LOWER", "LCASE":
-		return stringValue(strings.ToLower(args[0].Text())), nil
+		return stringValue(strings.ToLower(args[0].textIn(env.zone()))), nil
 	case "UPPER", "UCASE":
-		return stringValue(strings.ToUpper(args[0].Text())), nil
+		return stringValue(strings.ToUpper(args[0].textIn(env.zone()))), nil
 	case "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LEN":
 		if args[0].T.Kind == KindBinary {
 			return intValue(typeInt64, int64(len(args[0].S))), nil
 		}
-		return intValue(typeInt64, int64(utf8.RuneCountInString(args[0].Text()))), nil
+		return intValue(typeInt64, int64(utf8.RuneCountInString(args[0].textIn(env.zone())))), nil
 	case "LIKE", "ILIKE":
 		esc := ""
 		if len(args) == 3 {
@@ -456,7 +485,7 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 				return Value{}, fmt.Errorf("ESCAPE must be a single character")
 			}
 		}
-		s, pat := args[0].padded(), args[1].Text()
+		s, pat := args[0].paddedIn(env.zone()), args[1].textIn(env.zone())
 		if f.Name == "ILIKE" {
 			s, pat, esc = strings.ToLower(s), strings.ToLower(pat), strings.ToLower(esc)
 		}
@@ -489,11 +518,14 @@ var keepsLength = map[string]bool{"COALESCE": true, "IFNULL": true, "NVL": true,
 	"GREATEST": true, "LEAST": true, "IIF": true}
 
 // padded is the text of a value, with a CHAR value's padding.
-func (v Value) padded() string {
+func (v Value) padded() string { return v.paddedIn(utcZone) }
+
+// paddedIn is padded in the session time zone z.
+func (v Value) paddedIn(z tzZone) string {
 	if v.T.Kind == KindString {
 		return v.S
 	}
-	return v.Text()
+	return v.textIn(z)
 }
 
 func argTypes(args []Value) []ColType {
@@ -532,15 +564,16 @@ func isComparison(op string) bool {
 	return false
 }
 
-func binaryOp(op string, l, r Value) (Value, error) {
+// binaryOp evaluates an operator in the session time zone z.
+func binaryOp(op string, l, r Value, z tzZone) (Value, error) {
 	if isDistinctOp(op) {
-		return distinctFrom(op, l, r)
+		return distinctFrom(op, l, r, z)
 	}
 	if isComparison(op) {
 		if l.Null || r.Null {
 			return nullValue(typeBool), nil
 		}
-		c, ok := compareValues(l, r)
+		c, ok := compareIn(l, r, z)
 		if !ok {
 			return Value{}, fmt.Errorf("cannot compare %s with %s", l.T.Kind, r.T.Kind)
 		}
@@ -563,7 +596,7 @@ func binaryOp(op string, l, r Value) (Value, error) {
 		if l.Null || r.Null {
 			return nullValue(typeString), nil
 		}
-		return stringValue(l.Text() + r.Text()), nil
+		return stringValue(l.textIn(z) + r.textIn(z)), nil
 	}
 	if rt, ok, err := temporalType(op, l.T, r.T); ok {
 		if err != nil {
@@ -572,7 +605,7 @@ func binaryOp(op string, l, r Value) (Value, error) {
 		if l.Null || r.Null {
 			return nullValue(rt), nil
 		}
-		return temporalOp(op, l, r, rt)
+		return temporalOp(op, l, r, rt, z)
 	}
 	rt, err := arithmeticType(op, l.T, r.T)
 	if err != nil {
@@ -853,11 +886,17 @@ func commonType(a, b ColType) ColType {
 			t.Scale = max(a.Scale, b.Scale)
 		}
 		return t
-	case a.Kind == KindTimestamp && b.Kind == KindTimestamp:
+	case a.Kind == KindTimestamp && b.Kind == KindTimestamp, a.Kind == KindTime && b.Kind == KindTime:
+		// The finer unit, so that no value is rounded; with a time zone if
+		// either has one, as in Postgres.
+		t := a
 		if unitsPerSecond[b.Unit] > unitsPerSecond[a.Unit] {
-			return b
+			t.Unit = b.Unit
 		}
-		return a
+		if b.TZ != "" {
+			t.TZ = b.TZ
+		}
+		return t
 	case a.Kind == KindDate && b.Kind == KindTimestamp:
 		return b
 	case a.Kind == KindTimestamp && b.Kind == KindDate:

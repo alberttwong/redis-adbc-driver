@@ -79,6 +79,14 @@ const (
 	// client waits to send each command, in the same format. It follows the
 	// read timeout unless it is set here or in the URI (write_timeout).
 	OptionStringWriteTimeout = "adbc.redis.write_timeout"
+	// OptionStringTimeZone (database or connection) is the session time
+	// zone, as SET TIME ZONE takes it: an IANA zone name, a POSIX-style or
+	// numeric offset, or INTERVAL '…'. It is where timestamps with time zone
+	// are shown and read as local times (UTC by default), and what RESET
+	// timezone goes back to. The connection option overrides the database's
+	// and replaces a SET's value; reading it gives the current value, as
+	// SHOW timezone does.
+	OptionStringTimeZone = "adbc.redis.time_zone"
 
 	PushdownExact = "exact"
 	PushdownAll   = "all"

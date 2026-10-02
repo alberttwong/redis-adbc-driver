@@ -129,7 +129,7 @@ func (env *evalEnv) buildInList(or *Binary) *inList {
 			l.types = append(l.types, val.T)
 		}
 	}
-	l.set = &inSet{rows: rows}
+	l.set = &inSet{rows: rows, zone: env.zone()}
 	// The chain's inner OR nodes are only reached through this one.
 	for node, _ := or.L.(*Binary); node != nil && node.Op == "OR"; node, _ = node.L.(*Binary) {
 		env.exec.cache.inLists[node] = nil
@@ -171,7 +171,7 @@ func compareNeverFails(a, b ColType) bool {
 		return true
 	case ak == KindDate && bk == KindDate:
 		return true
-	case (ak == KindTime || ak == KindTimestamp) && ak == bk && a.Unit == b.Unit:
+	case (ak == KindTime || ak == KindTimestamp) && ak == bk && a.Unit == b.Unit && a.TZ == b.TZ:
 		return true
 	}
 	return false

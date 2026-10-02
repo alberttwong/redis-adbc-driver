@@ -693,13 +693,14 @@ type windowSet struct {
 	okeys      []Value
 	no         int // number of ORDER BY keys
 	order      []planOrder
+	zone       tzZone // the session time zone, for RANGE offsets
 }
 
 func (ws *windowSet) okey(row int) []Value { return ws.okeys[row*ws.no : (row+1)*ws.no] }
 
 func computeWindowGroup(env *evalEnv, g *windowGroup, n int, setRow func(int)) error {
 	np, no := len(g.spec.PartitionBy), len(g.spec.OrderBy)
-	ws := &windowSet{no: no, okeys: make([]Value, n*no), order: make([]planOrder, no)}
+	ws := &windowSet{no: no, okeys: make([]Value, n*no), order: make([]planOrder, no), zone: env.zone()}
 	for i, o := range g.spec.OrderBy {
 		ws.order[i] = planOrder{desc: o.Desc, nullsFirst: o.Nulls == NullsFirst}
 	}
@@ -888,7 +889,7 @@ func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, keep []
 	case !star:
 		in = args[0]
 	}
-	agg := newFrameAgg(f, star, c.typ, in)
+	agg := newFrameAgg(f, star, c.typ, in, env.zone())
 	if len(args) > 1 {
 		agg.sep = args[1] // STRING_AGG / LISTAGG
 	}
@@ -1114,7 +1115,7 @@ func (ws *windowSet) lagLead(c windowCall, args [][]Value, vals []Value) error {
 				v = args[2][row]
 			}
 			if !v.Null && v.T != c.typ {
-				cv, err := Coerce(v, c.typ)
+				cv, err := coerceIn(v, c.typ, ws.zone)
 				if err != nil {
 					return err
 				}
@@ -1292,7 +1293,7 @@ func (ws *windowSet) rangeBound(off Value, i, ps, pe int, following, start bool)
 	if cur.T.Kind == KindTime {
 		target, err = timeOffset(cur, off, toward)
 	} else {
-		target, err = binaryOp(op, cur, off)
+		target, err = binaryOp(op, cur, off, ws.zone)
 	}
 	beyond := 0 // the target overflowed: it is beyond every key
 	if err != nil {
@@ -1345,6 +1346,7 @@ type frameAgg struct {
 	typ  ColType
 	in   []Value // argument of each row
 	sep  []Value // STRING_AGG / LISTAGG: separator of each row
+	zone tzZone  // STRING_AGG / LISTAGG: the session time zone of the text
 	// count of non-NULL arguments (rows, for COUNT(*)) in the frame.
 	count int64
 	trues int64     // BOOL_OR / BOOL_AND: true arguments
@@ -1360,8 +1362,8 @@ type dequeEntry struct {
 	v        Value
 }
 
-func newFrameAgg(f *Func, star bool, typ ColType, in []Value) *frameAgg {
-	a := &frameAgg{name: f.Name, star: star, typ: typ, in: in}
+func newFrameAgg(f *Func, star bool, typ ColType, in []Value, z tzZone) *frameAgg {
+	a := &frameAgg{name: f.Name, star: star, typ: typ, in: in, zone: z}
 	switch {
 	case statFuncs[f.Name]:
 		a.sum = &exactSum{squares: true}
@@ -1459,9 +1461,9 @@ func (a *frameAgg) result() (Value, error) {
 		var b strings.Builder
 		for k, e := range a.deque[a.head:] {
 			if k > 0 && a.sep != nil && !a.sep[e.row].Null {
-				b.WriteString(a.sep[e.row].Text())
+				b.WriteString(a.sep[e.row].textIn(a.zone))
 			}
-			b.WriteString(e.v.Text())
+			b.WriteString(e.v.textIn(a.zone))
 		}
 		return stringValue(b.String()), nil
 	case "BOOL_OR", "BOOL_AND", "EVERY":

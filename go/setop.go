@@ -153,7 +153,7 @@ func (e *executor) runSetOp(ctx context.Context, plan *selectPlan, params []Valu
 		}
 		for _, row := range rows {
 			for i := range row {
-				if row[i], err = Coerce(row[i], plan.items[i].typ); err != nil {
+				if row[i], err = coerceIn(row[i], plan.items[i].typ, e.zone()); err != nil {
 					return nil, invalidArg(err)
 				}
 			}

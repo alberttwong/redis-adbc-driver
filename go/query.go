@@ -166,6 +166,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		return wp, nil
 	}
 	env := e.newEnv(ctx, nil, params)
+	zone := e.zone()
 	parts := conjuncts(where, nil)
 	var residual []Expr
 	addResidual := func(e Expr) { residual = append(residual, e) }
@@ -237,7 +238,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		// column's missing value.
 		push := func(term string, recheck bool) {
 			term, widened := widenMissing(term, col, func(m Value) bool {
-				r, err := binaryOp(op, m, cv)
+				r, err := binaryOp(op, m, cv, zone)
 				b, ok := truthy(r)
 				return err != nil || (ok && b)
 			})
@@ -248,9 +249,30 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 		}
 		ct := col.Type
 		field := "@" + col.field()
+		if lo, hi, ok, err := localBounds(cv, ct, zone); ok {
+			// A TIMESTAMP or DATE column compared with a timestamp with
+			// time zone: every local time that can read as the constant,
+			// re-checked on the rows.
+			if err != nil {
+				addResidual(c)
+				continue
+			}
+			switch op {
+			case "=":
+			case ">", ">=":
+				hi = "+inf"
+			default:
+				lo = "-inf"
+			}
+			push(fmt.Sprintf("%s:[%s %s]", field, lo, hi), true)
+			continue
+		}
 		switch {
 		case ct.Kind.indexedAsNumeric():
-			v, err := Coerce(cv, ct)
+			// The constant as a stored value: an instant for a timestamp
+			// with time zone (text, a TIMESTAMP or a DATE are local times
+			// in the session time zone), rounded to the column's precision.
+			v, err := coerceIn(cv, ct, zone)
 			if err != nil || (ct.Kind == KindBool && op != "=") {
 				addResidual(c)
 				continue
@@ -269,7 +291,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			// value lies strictly between the two, so inclusive bounds at
 			// the rounded value still cover every match, and the residual
 			// makes the comparison exact.
-			if cmp, ok := compareValues(v, cv); !ok || cmp != 0 {
+			if cmp, ok := compareIn(v, cv, zone); !ok || cmp != 0 {
 				exact = false
 			}
 			lo, hi := "-inf", "+inf"
@@ -290,7 +312,7 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 			}
 			push(fmt.Sprintf("%s:[%s %s]", field, lo, hi), !exact)
 		case ct.Kind == KindString && op == "=":
-			v, err := Coerce(cv, ct)
+			v, err := coerceIn(cv, ct, zone)
 			if err != nil {
 				addResidual(c)
 				continue
@@ -1250,7 +1272,7 @@ func (e *executor) unionTerm(ctx context.Context, c Expr, meta *tableMeta, env *
 	if !ok || !cm.Indexed || !simpleName(cm.field()) {
 		return "", false, nil
 	}
-	q, ok := unionQuery(cm, values)
+	q, ok := unionQuery(cm, values, e.zone())
 	return q, ok, nil
 }
 
@@ -1294,7 +1316,7 @@ func (e *executor) orUnionTerms(leaves []Expr, meta *tableMeta, env *evalEnv) (s
 			}
 			values[j] = v
 		}
-		if q, ok := unionQuery(cm, values); ok {
+		if q, ok := unionQuery(cm, values, e.zone()); ok {
 			terms = append(terms, q)
 		}
 	}
@@ -1305,14 +1327,23 @@ func (e *executor) orUnionTerms(leaves []Expr, meta *tableMeta, env *evalEnv) (s
 }
 
 // unionQuery builds an index query matching rows whose column equals any of
-// values: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`.
-func unionQuery(cm columnMeta, values []Value) (string, bool) {
+// values: numeric `(@c:[v v] | @c:[w w])` or TAG `@c:{a | b}`. Values are
+// converted to the column's type in the session time zone z.
+func unionQuery(cm columnMeta, values []Value, z tzZone) (string, bool) {
 	var parts []string
 	for _, v := range values {
 		if v.Null {
 			continue
 		}
-		cv, err := Coerce(v, cm.Type)
+		if lo, hi, ok, err := localBounds(v, cm.Type, z); ok {
+			// Every local time that can read as v (see planWhere).
+			if err != nil {
+				return "", false
+			}
+			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.field(), lo, hi))
+			continue
+		}
+		cv, err := coerceIn(v, cm.Type, z)
 		if err != nil {
 			continue // cannot equal any stored value
 		}
@@ -1340,7 +1371,7 @@ func unionQuery(cm columnMeta, values []Value) (string, bool) {
 	// Callers re-check the predicate on the rows, so the query may be wider.
 	q, _ = widenMissing(q, cm, func(m Value) bool {
 		for _, v := range values {
-			r, err := binaryOp("=", m, v)
+			r, err := binaryOp("=", m, v, z)
 			if b, _ := truthy(r); err != nil || b {
 				return true
 			}

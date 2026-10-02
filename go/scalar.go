@@ -245,9 +245,31 @@ func unifiedType(f *Func, args []ColType) ColType {
 
 // ---- evaluation ----
 
+// zonedText gives the arguments of a function that reads them as text with
+// each timestamp with time zone as its text in the session time zone z.
+func zonedText(args []Value, z tzZone) []Value {
+	if z.isUTC() {
+		return args
+	}
+	var out []Value
+	for i, a := range args {
+		if a.T.Kind == KindTimestamp && a.T.TZ != "" && !a.Null {
+			if out == nil {
+				out = slices.Clone(args)
+			}
+			out[i] = stringValue(a.textIn(z))
+		}
+	}
+	if out == nil {
+		return args
+	}
+	return out
+}
+
 // evalConditional evaluates the functions that accept NULL arguments:
-// NULLIF, GREATEST and LEAST (COALESCE and IIF are handled by the caller).
-func evalConditional(f *Func, args []Value) (Value, error) {
+// NULLIF, GREATEST and LEAST (COALESCE and IIF are handled by the caller),
+// in the session time zone z.
+func evalConditional(f *Func, args []Value, z tzZone) (Value, error) {
 	t, _ := scalarFuncType(f, argTypes(args))
 	if f.Name == "NULLIF" {
 		a, b := args[0], args[1]
@@ -257,7 +279,7 @@ func evalConditional(f *Func, args []Value) (Value, error) {
 		if b.Null {
 			return a, nil
 		}
-		c, ok := compareValues(a, b)
+		c, ok := compareIn(a, b, z)
 		if !ok {
 			return Value{}, fmt.Errorf("NULLIF cannot compare %s with %s", a.T.SQLName(), b.T.SQLName())
 		}
@@ -292,7 +314,7 @@ func evalConditional(f *Func, args []Value) (Value, error) {
 		if a.Null {
 			continue
 		}
-		v, err := Coerce(a, t)
+		v, err := coerceIn(a, t, z)
 		if err != nil {
 			return Value{}, fmt.Errorf("%s: %v", f.Name, err)
 		}
@@ -300,7 +322,7 @@ func evalConditional(f *Func, args []Value) (Value, error) {
 			best, has = v, true
 			continue
 		}
-		c, ok := compareValues(v, best)
+		c, ok := compareIn(v, best, z)
 		if !ok {
 			return Value{}, fmt.Errorf("%s cannot compare %s with %s", f.Name, v.T.SQLName(), best.T.SQLName())
 		}
@@ -322,16 +344,17 @@ func (env *evalEnv) evalIIF(f *Func) (Value, error) {
 		return Value{}, err
 	}
 	if b, ok := truthy(c); ok && b {
-		return env.eval(f.Args[1])
+		return env.branchValue(f, f.Args[1])
 	}
-	return env.eval(f.Args[2])
+	return env.branchValue(f, f.Args[2])
 }
 
 // scalarFunc evaluates a math, string or regular-expression function
 // (implScalar in funcs.go). Arguments are non-NULL (NULLs are handled by the
-// caller).
-func scalarFunc(f *Func, args []Value) (Value, error) {
-	text := func(i int) string { return args[i].Text() }
+// caller); z is the session time zone, in which a timestamp with time zone
+// is text.
+func scalarFunc(f *Func, args []Value, z tzZone) (Value, error) {
+	text := func(i int) string { return args[i].textIn(z) }
 	switch f.Name {
 	// ---- math ----
 	case "ROUND", "TRUNC", "FLOOR", "CEIL", "CEILING":
@@ -497,11 +520,11 @@ func scalarFunc(f *Func, args []Value) (Value, error) {
 		sum := md5.Sum([]byte(text(0)))
 		return stringValue(hex.EncodeToString(sum[:])), nil
 	case "REGEXP_REPLACE":
-		return regexpReplaceFunc(args)
+		return regexpReplaceFunc(zonedText(args, z))
 	case "STARTS_WITH":
 		return boolValue(strings.HasPrefix(text(0), text(1))), nil
 	case "~", "~*", "SIMILAR TO", "REGEXP_LIKE", "REGEXP_COUNT", "REGEXP_INSTR", "REGEXP_SUBSTR", "REGEXP_MATCH":
-		return regexpFunc(f, args)
+		return regexpFunc(f, zonedText(args, z))
 	}
 	return Value{}, fmt.Errorf("unsupported function %s", f.Name)
 }

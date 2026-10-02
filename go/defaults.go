@@ -155,7 +155,7 @@ func (e *executor) checkDefault(ctx context.Context, def ColumnDef) (string, Val
 	if err != nil {
 		return "", Value{}, invalidArg(err)
 	}
-	cv, err := Coerce(v, def.Type)
+	cv, err := coerceIn(v, def.Type, e.zone())
 	if err != nil {
 		return "", Value{}, errorf(adbc.StatusInvalidArgument, "column %q: %v", def.Name, err)
 	}
@@ -210,7 +210,7 @@ func (d *columnDefaults) value(i int) (Value, error) {
 	if err != nil {
 		return Value{}, invalidArg(err)
 	}
-	cv, err := Coerce(v, c.Type)
+	cv, err := coerceIn(v, c.Type, d.env.zone())
 	if err != nil {
 		return Value{}, errorf(adbc.StatusInvalidArgument, "column %q: %v", c.Name, err)
 	}

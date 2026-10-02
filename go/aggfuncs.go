@@ -397,11 +397,12 @@ func (s *stringAgg) result(env *evalEnv, t ColType) (Value, error) {
 		sort.SliceStable(s.items, func(i, j int) bool { return lessKeys(s.items[i][nargs:], s.items[j][nargs:], order) })
 	}
 	var b strings.Builder
+	z := env.zone()
 	for i, item := range s.items {
 		if i > 0 && nargs > 1 && !item[1].Null {
-			b.WriteString(item[1].Text())
+			b.WriteString(item[1].textIn(z))
 		}
-		b.WriteString(item[0].Text())
+		b.WriteString(item[0].textIn(z))
 	}
 	return stringValue(b.String()), nil
 }
@@ -558,12 +559,12 @@ func lerp(lo, hi Value, p float64) (Value, error) {
 		// The conversion keeps the product from being fused into an FMA.
 		return floatValue(typeFloat64, lo.F+float64((hi.F-lo.F)*p)), nil
 	}
-	d, err := binaryOp("-", hi, lo)
+	d, err := binaryOp("-", hi, lo, utcZone)
 	if err != nil {
 		return Value{}, err
 	}
 	if d, err = scaleInterval(d, p); err != nil {
 		return Value{}, err
 	}
-	return binaryOp("+", lo, d)
+	return binaryOp("+", lo, d, utcZone)
 }

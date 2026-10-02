@@ -54,15 +54,16 @@ var subqueryStats struct {
 type eqClass uint8
 
 const (
-	clsNone      eqClass = iota // no key: NaN, or a kind not listed here
-	clsNum                      // integers and decimals, compared exactly
-	clsBool                     // compared with integers and decimals as 0/1
-	clsFloat                    // floats other than NaN
-	clsStr                      // strings and binary, compared bytewise
-	clsInterval                 // compared by total length
-	clsDate                     // compared by day
-	clsTime                     // compared after converting units
-	clsTimestamp                // compared after converting units
+	clsNone        eqClass = iota // no key: NaN, or a kind not listed here
+	clsNum                        // integers and decimals, compared exactly
+	clsBool                       // compared with integers and decimals as 0/1
+	clsFloat                      // floats other than NaN
+	clsStr                        // strings and binary, compared bytewise
+	clsInterval                   // compared by total length
+	clsDate                       // compared by day
+	clsTime                       // compared after converting units
+	clsTimestamp                  // compared after converting units
+	clsTimestampTZ                // compared after converting units; apart from TIMESTAMP (the session time zone)
 	numClasses
 )
 
@@ -82,6 +83,8 @@ func classOf(t ColType) eqClass {
 		return clsDate
 	case k == KindTime:
 		return clsTime
+	case k == KindTimestamp && t.TZ != "":
+		return clsTimestampTZ
 	case k == KindTimestamp:
 		return clsTimestamp
 	}
@@ -118,7 +121,7 @@ func floatKey(v Value) string {
 // one map. Integers, decimals and booleans compare exactly with each other,
 // so they share a tag.
 var classTag = [numClasses]string{clsNum: "n", clsBool: "n", clsFloat: "f", clsStr: "s",
-	clsInterval: "i", clsDate: "d", clsTime: "t", clsTimestamp: "p"}
+	clsInterval: "i", clsDate: "d", clsTime: "t", clsTimestamp: "p", clsTimestampTZ: "z"}
 
 func exactNum(c eqClass) bool { return c == clsNum || c == clsBool }
 
@@ -135,6 +138,8 @@ type inSet struct {
 	col  int
 	// noIndex makes the set compare one by one (a result used only once).
 	noIndex bool
+	// zone is the session time zone values of different types compare in.
+	zone tzZone
 
 	built      bool
 	sawNull    bool
@@ -173,7 +178,7 @@ func (s *inSet) linear(x Value) (found, sawNull bool) {
 			sawNull = true
 			continue
 		}
-		if c, ok := compareValues(x, v); ok && c == 0 {
+		if c, ok := compareIn(x, v, s.zone); ok && c == 0 {
 			return true, sawNull
 		}
 	}
@@ -254,7 +259,7 @@ func (s *inSet) contains(x Value) (found, sawNull bool) {
 		return s.linear(x)
 	}
 	for _, v := range s.odd {
-		if c, ok := compareValues(x, v); ok && c == 0 {
+		if c, ok := compareIn(x, v, s.zone); ok && c == 0 {
 			return true, s.sawNull
 		}
 	}
@@ -267,7 +272,7 @@ func (e *executor) cachedInSet(sq *Subquery, rows [][]Value) *inSet {
 	if s, ok := e.cache.inSets[sq]; ok {
 		return s
 	}
-	s := &inSet{rows: rows}
+	s := &inSet{rows: rows, zone: e.zone()}
 	e.cache.inSets[sq] = s
 	return s
 }
@@ -300,7 +305,7 @@ func sameEqClass(a, b ColType) bool {
 	if ca == clsNone || ca != cb {
 		return false
 	}
-	return (ca != clsTime && ca != clsTimestamp) || a.Unit == b.Unit
+	return (ca != clsTime && ca != clsTimestamp && ca != clsTimestampTZ) || a.Unit == b.Unit
 }
 
 // semiKey returns the key of a non-NULL key value expected to be of type t;
@@ -549,14 +554,14 @@ next:
 		if isRow {
 			rg := r.rowGroups[string(buf)]
 			if rg == nil {
-				rg = &rowSet{col: n, n: len(rowX.Items)}
+				rg = &rowSet{col: n, n: len(rowX.Items), zone: e.zone()}
 				r.rowGroups[string(buf)] = rg
 				r.groups[string(buf)] = nil
 			}
 			rg.rows = append(rg.rows, row)
 		} else if sq.Kind == SubqueryIn {
 			if !ok {
-				g = &inSet{col: n}
+				g = &inSet{col: n, zone: e.zone()}
 				r.groups[string(buf)] = g
 			}
 			g.rows = append(g.rows, row)
@@ -646,7 +651,7 @@ func (e *executor) semiJoinTerm(ctx context.Context, sq *Subquery, meta *tableMe
 		if !ok || !cm.Indexed || !simpleName(cm.field()) || len(r.distinct[i]) > maxUnionTerms {
 			continue
 		}
-		if q, ok := unionQuery(cm, r.distinct[i]); ok {
+		if q, ok := unionQuery(cm, r.distinct[i], e.zone()); ok {
 			return q, true
 		}
 	}

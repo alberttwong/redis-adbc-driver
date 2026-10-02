@@ -34,6 +34,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 const (
@@ -469,8 +471,11 @@ func temporalType(op string, a, b ColType) (ColType, bool, error) {
 	return bad()
 }
 
-// temporalOp evaluates date/time arithmetic on non-NULL operands.
-func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
+// temporalOp evaluates date/time arithmetic on non-NULL operands, in the
+// session time zone z: months and days are added to a timestamp with time
+// zone on its local time (addIntervalIn), and a TIMESTAMP or DATE
+// subtracted from or by one is a local time.
+func temporalOp(op string, l, r Value, rt ColType, z tzZone) (Value, error) {
 	lk, rk := l.T.Kind, r.T.Kind
 	switch {
 	case lk == KindInterval && rk == KindInterval:
@@ -530,7 +535,17 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 		}
 		return fromTime(tm.Add(time.Duration(timeOfDay(r))), rt)
 	case rt.Kind == KindInterval:
-		// timestamp/date - timestamp/date: days and time, no months.
+		// timestamp/date - timestamp/date: days and time, no months. With
+		// a timestamp with time zone, both are instants.
+		if isTimestampTZ(l.T) != isTimestampTZ(r.T) {
+			var err error
+			if l, err = asInstant(l, z); err == nil {
+				r, err = asInstant(r, z)
+			}
+			if err != nil {
+				return Value{}, err
+			}
+		}
 		a, err := toTime(l)
 		if err != nil {
 			return Value{}, err
@@ -561,8 +576,26 @@ func temporalOp(op string, l, r Value, rt ColType) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		if isTimestampTZ(rt) {
+			return fromTime(addIntervalIn(tm, iv, z), rt)
+		}
 		return fromTime(addInterval(tm, iv), rt)
 	}
+}
+
+// isTimestampTZ reports whether t is TIMESTAMP WITH TIME ZONE.
+func isTimestampTZ(t ColType) bool { return t.Kind == KindTimestamp && t.TZ != "" }
+
+// asInstant converts a TIMESTAMP or DATE to a TIMESTAMP WITH TIME ZONE, as
+// a local time in z, keeping a timestamp's unit.
+func asInstant(v Value, z tzZone) (Value, error) {
+	switch {
+	case isTimestampTZ(v.T):
+		return v, nil
+	case v.T.Kind == KindTimestamp:
+		return coerceIn(v, timestampType(v.T.Unit, "UTC"), z)
+	}
+	return coerceIn(v, timestampType(arrow.Second, "UTC"), z)
 }
 
 // age implements AGE(a, b): a - b in years, months, days and time, by

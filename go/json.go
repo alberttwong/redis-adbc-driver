@@ -219,9 +219,9 @@ func (env *evalEnv) evalJSONFunc(f *Func) (Value, error) {
 	}
 	switch f.Name {
 	case "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT", "__JSON_OBJECT":
-		return buildJSONObject(f, args)
+		return buildJSONObject(f, args, env.zone())
 	case "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "__JSON_ARRAY":
-		return buildJSONArray(f, args)
+		return buildJSONArray(f, args, env.zone())
 	}
 	// The other functions return NULL for a NULL argument.
 	t, _ := jsonFuncType(f)
@@ -233,7 +233,7 @@ func (env *evalEnv) evalJSONFunc(f *Func) (Value, error) {
 	switch f.Name {
 	case "TO_JSON", "TO_JSONB":
 		var b strings.Builder
-		writeJSONValue(&b, args[0], isJSONExpr(f.Args[0]))
+		writeJSONValue(&b, args[0], isJSONExpr(f.Args[0]), env.zone())
 		return jsonResult(f, b.String())
 	case "JSON_OBJECT", "JSONB_OBJECT":
 		return jsonObjectFromArrays(f, args)
@@ -968,10 +968,11 @@ func writeJSONString(b *strings.Builder, s string) {
 }
 
 // jsonText is the text of a SQL value inside JSON, as in Postgres: ISO 8601
-// times (2024-01-15T10:30:00.5+00:00, fractions without trailing zeros), \x
-// and hex digits for binary values, NaN and Infinity for such doubles, and
-// otherwise the value's text.
-func jsonText(v Value) string {
+// times (2024-01-15T10:30:00.5+00:00, fractions without trailing zeros; a
+// timestamp with time zone in the session time zone z), \x and hex digits
+// for binary values, NaN and Infinity for such doubles, and otherwise the
+// value's text.
+func jsonText(v Value, z tzZone) string {
 	switch v.T.Kind {
 	case KindFloat32, KindFloat64:
 		switch {
@@ -983,7 +984,7 @@ func jsonText(v Value) string {
 			return "-Infinity"
 		}
 	case KindTimestamp:
-		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", 0, true)
+		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", v.offsetIn(z), true)
 	case KindBinary:
 		return `\x` + hex.EncodeToString([]byte(v.S))
 	}
@@ -992,8 +993,9 @@ func jsonText(v Value) string {
 
 // writeJSONValue writes a SQL value as JSON, as Postgres's to_json does:
 // numbers and booleans as themselves, NULL as null, anything else as a
-// string (see jsonText). isJSON says the value is JSON already.
-func writeJSONValue(b *strings.Builder, v Value, isJSON bool) {
+// string (see jsonText). isJSON says the value is JSON already; z is the
+// session time zone.
+func writeJSONValue(b *strings.Builder, v Value, isJSON bool, z tzZone) {
 	k := v.T.Kind
 	switch {
 	case v.Null:
@@ -1003,13 +1005,13 @@ func writeJSONValue(b *strings.Builder, v Value, isJSON bool) {
 	case k.isFloat() && !math.IsNaN(v.F) && !math.IsInf(v.F, 0):
 		b.WriteString(v.Text())
 	default:
-		writeJSONString(b, jsonText(v))
+		writeJSONString(b, jsonText(v, z))
 	}
 }
 
 // buildJSONObject implements JSON_BUILD_OBJECT(k, v, …), its JSONB_ spelling
 // and JSON_OBJECT(k VALUE v, …).
-func buildJSONObject(f *Func, args []Value) (Value, error) {
+func buildJSONObject(f *Func, args []Value, z tzZone) (Value, error) {
 	c := f.JSON
 	if c == nil {
 		c = &jsonClauses{}
@@ -1028,7 +1030,7 @@ func buildJSONObject(f *Func, args []Value) (Value, error) {
 		case v.Null && c.absentOnNull:
 			continue
 		}
-		key := jsonText(k)
+		key := jsonText(k, z)
 		if c.uniqueKeys {
 			if seen[key] {
 				var q strings.Builder
@@ -1042,7 +1044,7 @@ func buildJSONObject(f *Func, args []Value) (Value, error) {
 		}
 		writeJSONString(&b, key)
 		b.WriteString(" : ")
-		writeJSONValue(&b, v, isJSONExpr(f.Args[i+1]))
+		writeJSONValue(&b, v, isJSONExpr(f.Args[i+1]), z)
 		n++
 	}
 	b.WriteByte('}')
@@ -1051,7 +1053,7 @@ func buildJSONObject(f *Func, args []Value) (Value, error) {
 
 // buildJSONArray implements JSON_BUILD_ARRAY(…), its JSONB_ spelling and
 // JSON_ARRAY(…).
-func buildJSONArray(f *Func, args []Value) (Value, error) {
+func buildJSONArray(f *Func, args []Value, z tzZone) (Value, error) {
 	var b strings.Builder
 	b.WriteByte('[')
 	n := 0
@@ -1062,7 +1064,7 @@ func buildJSONArray(f *Func, args []Value) (Value, error) {
 		if n > 0 {
 			b.WriteString(", ")
 		}
-		writeJSONValue(&b, v, isJSONExpr(f.Args[i]))
+		writeJSONValue(&b, v, isJSONExpr(f.Args[i]), z)
 		n++
 	}
 	b.WriteByte(']')
@@ -1456,7 +1458,7 @@ func (a *jsonAgg) add(in []Value) error {
 	return nil
 }
 
-func (a *jsonAgg) result(_ *evalEnv, _ ColType) (Value, error) {
+func (a *jsonAgg) result(env *evalEnv, _ ColType) (Value, error) {
 	if len(a.rows) == 0 {
 		return nullValue(typeString), nil
 	}
@@ -1485,10 +1487,10 @@ func (a *jsonAgg) result(_ *evalEnv, _ ColType) (Value, error) {
 			b.WriteString(", ")
 		}
 		if object {
-			writeJSONString(&b, jsonText(r.args[0]))
+			writeJSONString(&b, jsonText(r.args[0], env.zone()))
 			b.WriteString(" : ")
 		}
-		writeJSONValue(&b, r.args[len(r.args)-1], isJSONExpr(f.Args[len(f.Args)-1]))
+		writeJSONValue(&b, r.args[len(r.args)-1], isJSONExpr(f.Args[len(f.Args)-1]), env.zone())
 	}
 	if object {
 		b.WriteString(" }")
