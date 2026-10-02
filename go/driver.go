@@ -69,6 +69,17 @@ const (
 	// takes time proportional to the number of rows.
 	OptionStringRenameRekey = "adbc.redis.rename_rekey"
 
+	// OptionStringReadTimeout (database or connection) is how long the
+	// client waits for each reply: a duration such as "30s" or "10m", or a
+	// number of seconds; "0" means no timeout. It defaults to the URI's
+	// read_timeout parameter, or else defaultReadTimeout (see timeout.go).
+	// The connection option overrides the database's.
+	OptionStringReadTimeout = "adbc.redis.read_timeout"
+	// OptionStringWriteTimeout (database or connection) is how long the
+	// client waits to send each command, in the same format. It follows the
+	// read timeout unless it is set here or in the URI (write_timeout).
+	OptionStringWriteTimeout = "adbc.redis.write_timeout"
+
 	PushdownExact = "exact"
 	PushdownAll   = "all"
 	PushdownNone  = "none"

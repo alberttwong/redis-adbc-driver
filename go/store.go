@@ -376,8 +376,10 @@ func (s *store) claimNames(ctx context.Context, schema, table string) (tableName
 		if nm.temp && s.tempUsedPrefix(nm.prefix) {
 			continue
 		}
+		// The pipeline is sent once (see onceCmd): sent again, its SADDs
+		// would find the names taken.
 		pipe := s.client.Pipeline()
-		addP := pipe.SAdd(ctx, prefixesKey, nm.prefix)
+		addP := once(ctx, pipe, "SADD", prefixesKey, nm.prefix)
 		addI := pipe.SAdd(ctx, indexesKey, nm.index)
 		var released *goredis.BoolCmd
 		if !nm.temp {
@@ -387,13 +389,14 @@ func (s *store) claimNames(ctx context.Context, schema, table string) (tableName
 		if _, err := pipe.Exec(ctx); err != nil {
 			return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
 		}
-		if addP.Val() == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
+		gotP, _ := addP.Int64()
+		if gotP == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
 			s.noteTempNames(nm)
 			return nm, nil
 		}
 		// Give back what this candidate got.
 		pipe = s.client.Pipeline()
-		if addP.Val() == 1 {
+		if gotP == 1 {
 			pipe.SRem(ctx, prefixesKey, nm.prefix)
 		}
 		if addI.Val() == 1 {
@@ -573,27 +576,59 @@ type store struct {
 
 	// The connection's temporary tables and views (see temp.go).
 	temp tempSpace
+
+	// retired are clients replaced by another one with other timeouts (see
+	// connectionImpl.setTimeouts), closed with the connection.
+	retired []goredis.UniversalClient
 }
+
+// onceCmd is a command that go-redis must not send again when it fails.
+// go-redis re-sends most commands after a timeout or a broken connection,
+// though Redis may have run them already. That is harmless for most of the
+// driver's commands, but not for these:
+//   - Search commands. A repeated FT.CURSOR READ returns the next page, so
+//     the rows of the page that timed out would be missing from the result;
+//     a repeated FT.CREATE or FT.ALTER fails ("already exists", "Duplicate
+//     field"); and repeating a slow FT.AGGREGATE just loads the server more.
+//   - Commands whose reply the driver acts on: SET … NX and SADD, which
+//     would report that the first attempt's key or member already exists.
+//
+// A pipeline with one of them in it isn't sent again either.
+type onceCmd struct{ *goredis.Cmd }
+
+func (onceCmd) NoRetry() bool { return true }
+
+// processor is a client, or a cluster node's client.
+type processor interface {
+	Process(ctx context.Context, cmd goredis.Cmder) error
+}
+
+// once runs a command that must not be sent twice (see onceCmd).
+func once(ctx context.Context, c processor, args ...any) *goredis.Cmd {
+	cmd := goredis.NewCmd(ctx, args...)
+	_ = c.Process(ctx, onceCmd{cmd})
+	return cmd
+}
+
+// searchConn sends FT.* commands, each once (see onceCmd).
+type searchConn struct{ c processor }
+
+func (n searchConn) Do(ctx context.Context, args ...any) *goredis.Cmd { return once(ctx, n.c, args...) }
 
 // search returns the connection used for FT.* commands. On a cluster every
 // search command for an index (including FT.CURSOR READ, whose cursor lives
 // on the node that created it) goes to the same node, which coordinates the
 // query across shards.
-// searchConn is the subset of a client used for FT.* commands.
-type searchConn interface {
-	Do(ctx context.Context, args ...any) *goredis.Cmd
-}
-
 func (s *store) search(ctx context.Context, index string) (searchConn, error) {
 	cc, ok := s.client.(*goredis.ClusterClient)
 	if !ok {
-		return s.client, nil
+		return searchConn{s.client}, nil
 	}
 	node, err := cc.MasterForKey(ctx, index)
 	if err != nil {
-		return nil, wrapRedis(err, "failed to pick a node for search")
+		return searchConn{}, wrapRedis(err, "failed to pick a node for search")
 	}
-	return node, nil
+	return searchConn{node}, nil
 }
 
 // searchDo runs one FT.* command for an index.
@@ -859,6 +894,12 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 		}
 		return err
 	}
+	// DROP TABLE isn't refused while a re-key moves the table's rows (the
+	// re-key then fails). One that its connection abandoned is rolled back
+	// first, so that it doesn't outlive the table (see rekey.go).
+	if meta.RekeyTo != "" {
+		s.recoverStale(ctx, meta.prefix())
+	}
 	// DD deletes every document the index knows about.
 	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
 		!isUnknownIndex(err) {
@@ -927,7 +968,7 @@ func (s *store) createSchema(ctx context.Context, schema string, ifNotExists boo
 	if reservedSchema(schema) {
 		return errorf(adbc.StatusInvalidArgument, "schema name %q is reserved for temporary tables and views", schema)
 	}
-	n, err := s.client.SAdd(ctx, schemasKey, schema).Result()
+	n, err := once(ctx, s.client, "SADD", schemasKey, schema).Int64()
 	if err != nil {
 		return wrapRedis(err, "failed to create schema")
 	}

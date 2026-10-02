@@ -229,14 +229,18 @@ func (s *store) ensureTempSchema(ctx context.Context) (string, error) {
 		id := strconv.FormatInt(n, 10)
 		// Ids are unique unless the counter was lost; skip any id that is
 		// alive or still owns objects.
-		ok, err := s.client.SetNX(ctx, tempAliveKey(id), "1", ttl).Result()
+		err = once(ctx, s.client, "SET", tempAliveKey(id), "1", "PX", ttl.Milliseconds(), "NX").Err()
+		ok := err == nil
+		if errors.Is(err, goredis.Nil) {
+			err = nil
+		}
 		if err != nil {
 			return "", wrapRedis(err, "failed to allocate a temporary schema")
 		}
 		if !ok {
 			continue
 		}
-		added, err := s.client.SAdd(ctx, tempOwnersKey, id).Result()
+		added, err := once(ctx, s.client, "SADD", tempOwnersKey, id).Int64()
 		if err != nil || added == 0 {
 			s.client.Del(ctx, tempAliveKey(id))
 			if err != nil {
