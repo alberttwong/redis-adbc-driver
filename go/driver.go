@@ -102,6 +102,10 @@ type driverImpl struct {
 
 // NewDriver creates a new Redis driver using the given Arrow allocator.
 func NewDriver(alloc memory.Allocator) driverbase.DriverWithContext {
+	return driverbase.NewDriver(newDriverImpl(alloc))
+}
+
+func newDriverImpl(alloc memory.Allocator) *driverImpl {
 	info := driverbase.DefaultDriverInfo("Redis")
 	info.MustRegister(map[adbc.InfoCode]any{
 		adbc.InfoDriverName:      driverName,
@@ -110,7 +114,7 @@ func NewDriver(alloc memory.Allocator) driverbase.DriverWithContext {
 	})
 	base := driverbase.NewDriverImplBase(info, alloc)
 	base.ErrorHelper.DriverName = "redis"
-	return driverbase.NewDriver(&driverImpl{DriverImplBase: base})
+	return &driverImpl{DriverImplBase: base}
 }
 
 func validatePushdown(v string) error {
@@ -132,6 +136,15 @@ func parseRenameRekey(v string) (bool, error) {
 }
 
 func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.DatabaseWithContext, error) {
+	db, err := d.newDatabaseImpl(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return driverbase.NewDatabase(db), nil
+}
+
+// newDatabaseImpl is a database with the given options set.
+func (d *driverImpl) newDatabaseImpl(ctx context.Context, opts map[string]string) (*databaseImpl, error) {
 	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase, driverbase.TracingOptions{})
 	if err != nil {
 		return nil, err
@@ -146,5 +159,5 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
 	}
-	return driverbase.NewDatabase(db), nil
+	return db, nil
 }

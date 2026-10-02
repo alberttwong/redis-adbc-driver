@@ -229,7 +229,9 @@ HASHes and indexes created some other way (for example your own
 load it through the driver; bulk ingest from Arrow is the quickest route.
 The driver doesn't touch such indexes, even one with the name a new table's
 index would take (see "Indexes the driver didn't create are left alone"
-below).
+below). `redis-arrow check` and `redis-arrow scan` read such HASHes as Arrow
+IPC, or copy them into a table (see
+[Existing HASH collections](#existing-hash-collections-check-and-scan)).
 
 **Limitation: Redis Flex databases are not supported yet**
 
@@ -535,7 +537,10 @@ Stop Redis with `docker compose down`.
 
 `redis-arrow` writes a query's result as an
 [Arrow IPC](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
-file or stream, and bulk-ingests an IPC file or stream into a table. It links
+file or stream, and bulk-ingests an IPC file or stream into a table. Its
+`check` and `scan` commands read HASHes that something other than the
+driver wrote (see
+[Existing HASH collections](#existing-hash-collections-check-and-scan)). It links
 the driver as a Go library, so it needs neither cgo nor the shared library.
 Build it from `go`:
 
@@ -592,6 +597,158 @@ build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table
   the first batch, so exporting a large table needs memory for all of it.
   Import reads a stream batch by batch, but reads a file on stdin into
   memory first, since the file format's footer is at its end.
+
+## Existing HASH collections: `check` and `scan`
+
+The driver only sees tables it created. HASHes that an application wrote
+(`user:1`, `user:2`, …, maybe with the application's own search index) can
+still be read two ways, and `redis-arrow check` tells you whether each one
+works and what is missing:
+
+- **Arrow IPC.** `redis-arrow scan` reads the HASHes themselves and writes
+  them as an Arrow IPC file or stream, one row per HASH. It needs no index
+  and no driver metadata, and writes nothing to Redis.
+- **SQL, by copying.** `redis-arrow scan … | redis-arrow import -table …`
+  bulk-ingests that stream into a new driver table, which SQL then queries
+  like any other. The originals are left as they are. The table is a
+  snapshot: import again with `-mode replace` to refresh it. It needs the
+  Query Engine, a database that isn't Redis Flex, and memory for a second
+  copy of the data.
+
+Both are part of `redis-arrow` (see above), and take its `-uri` and
+`-option` flags.
+
+**Check.** Without `-prefix`, `check` lists the collections it finds: the
+prefixes (up to the last `:`) of HASH keys in a sample of 10,000 keys, the
+prefixes of search indexes on HASHes, and the driver's own tables. With a
+prefix, it reads a sample of the HASHes, guesses the columns, and prints a
+checklist for each way of reading them. Each item is `ok`, `warn`,
+`missing` (the suggested command provides it) or `blocker` (something to
+change first), with a fix:
+
+```bash
+build/redis-arrow check -prefix user: -table users
+```
+
+```text
+Collection user: on Redis 8.6.2 (standalone)
+  501 HASH keys; the columns are guessed from 501 of them
+  search index idx:users (prefix user:): 499 documents, 2 indexing failures
+
+Guessed columns (as table public.users):
+  COLUMN      TYPE                         ARROW TYPE             PRESENT  NOTES
+  _key        VARCHAR                      utf8                   100%     each HASH's key
+  name        VARCHAR                      utf8                   100%
+  age         VARCHAR                      utf8                   100%     2 of 501 values aren't BIGINT (such as "n/a" in user:500)
+  active      BOOLEAN                      bool                   99.8%    true/false text
+  created_at  TIMESTAMP(6) WITH TIME ZONE  timestamp[us, tz=UTC]  99.8%    ISO 8601 text
+  balance     NUMERIC(38,2)                decimal(38, 2)         99.8%
+  zip         VARCHAR                      utf8                   99.8%    numbers with leading zeros, kept as text
+  avatar      VARBINARY                    binary                 10.0%    not UTF-8; 50 values have a NUL byte
+
+Arrow IPC (redis-arrow scan): READY
+  [ok]      501 HASH keys under user:
+  [ok]      the columns are guessed from all 501 HASHes
+  [ok]      every field has a column type (8 columns)
+  [warn]    age is VARCHAR: 2 of 501 values aren't BIGINT (such as "n/a" in user:500)
+            fix: -type age=BIGINT -on-error null reads them as NULL
+  run: redis-arrow scan -prefix user: -o users.arrow
+
+SQL, copied into a driver table (redis-arrow scan | redis-arrow import): READY
+  [ok]      the Query Engine (RediSearch) is available
+  [ok]      public.users doesn't exist yet: import creates it
+  [ok]      its rows go under public:users:, which has no keys, and its index is idx:public:users
+  [ok]      a copy needs about 0.10 MB (MEMORY USAGE of the sampled HASHes, scaled to all of them), plus its index; 13 MB are in use, and there is no maxmemory limit
+  run: redis-arrow scan -prefix user: | redis-arrow import -table users
+```
+
+`-json` writes the same report as JSON. `check` writes nothing to Redis,
+and exits 0 whenever it could check (whether or not a checklist is
+ready). What the checklists look for:
+
+- **Arrow IPC:** HASH keys under the prefix; how many the columns were
+  guessed from; columns that a few odd values made `VARCHAR`; `-type`
+  overrides that some sampled values don't convert to; fields that can't
+  be columns (`__rowid`, other names starting with `__`, an empty name).
+- **SQL by copying:** the Query Engine (`FT._LIST`); not Redis Flex (the
+  probe the driver runs on connect); the target isn't a view (an existing
+  table is a warning: import with `-mode replace` or `append`); no keys
+  already under the key prefix the new table would take (they would merge
+  with its rows), which also rules out copying a collection into its own
+  prefix; column names that can't be indexed (only letters, digits and `_`
+  can, and at most 200 columns); memory: the sampled HASHes' `MEMORY USAGE`
+  scaled to all of them, against `used_memory`, `maxmemory` and
+  `maxmemory_policy` (summed over a cluster's primaries). It is a blocker
+  when the copy doesn't fit, or leaves less than 10% free under an
+  `allkeys-*` policy (which could evict the originals); otherwise less
+  than 10% free is a warning.
+
+**How columns are guessed.** Every field becomes a column (`-rename
+field=column` renames one), plus `_key` with each HASH's key (`-key-column`
+names it; empty for none). A column's type is the narrowest that fits the
+text of every sampled value, read as a SQL cast reads it:
+
+| Values | Type |
+|-|-|
+| `true`, `false`, `t`, `f`, `yes`, `no` (any case) | `BOOLEAN` |
+| integers that fit in 64 bits | `BIGINT` (only `0` and `1` too, with a note) |
+| fixed-point numbers such as `12.50` (at most 9 decimals), and longer integers | `NUMERIC(38, s)`, s the most decimals seen |
+| other numbers: exponents, more decimals, `NaN`, `Infinity` | `DOUBLE PRECISION` |
+| `YYYY-MM-DD` | `DATE` |
+| ISO 8601 dates and times (`T` or a space, optional fraction and offset) | `TIMESTAMP(p)`, or `TIMESTAMP(p) WITH TIME ZONE` if any has an offset (the rest are read as UTC); p is 6, or the most fractional digits seen if that is more |
+| not UTF-8 | `VARBINARY` |
+| anything else, mixed kinds, and integers with leading zeros (`007`) | `VARCHAR` |
+
+An empty value doesn't count, and reads as NULL in a column that isn't a
+string. A field that some HASHes lack is NULL there. When at most 5% of a
+column's values don't fit the type the rest share, the column is `VARCHAR`,
+and `check` suggests `-type col=TYPE -on-error null`. `-type col=TYPE`
+sets any column's type (SQL type names, as in `CREATE TABLE`).
+
+**Scan.** `scan` takes `check`'s `-prefix`, `-sample`, `-key-column`,
+`-type` and `-rename`, and export's `-o`, `-format` and `-compression`:
+
+```bash
+build/redis-arrow scan -prefix user: -type age=BIGINT -on-error null -o users.arrow
+```
+
+```bash
+build/redis-arrow scan -prefix user: | build/redis-arrow import -table users
+```
+
+- **Columns** are guessed from the first `-sample` HASHes (1,000 by
+  default, `-1` for all of them) before the scan starts. A field that only
+  later HASHes have isn't in the schema: `scan` skips it and names it at
+  the end (`skipped fields that the sample didn't have …`). Every column is
+  nullable.
+- **A value that doesn't convert** to its column's type stops the scan with
+  the key, the field and the value, and nothing is written. With
+  `-on-error null` it is read as NULL instead, and counted at the end.
+- **Consistency:** keys come from `SCAN` (on every primary of a cluster)
+  and each HASH from `HGETALL`, so this isn't a snapshot. A HASH that
+  exists for the whole scan is read once (`SCAN` can return a key twice;
+  `scan` remembers the keys it has read, which takes memory for every key).
+  One created or deleted meanwhile may or may not be read.
+- **Memory:** `scan` streams batches of up to 10,000 rows, so unlike
+  `export` it doesn't hold the whole result.
+
+**ACL users.** `check` and `scan` need read access to the collection's keys
+(`%R~user:*`), and these commands; `check` also reads the driver's metadata
+(`%R~adbc:*`):
+
+```text
+# scan
++ping +info +scan +hgetall
+# check also
++ft._list +ft.info +ft.aggregate +memory|usage
++get +exists +smembers +sismember +hget +hexists
+# A cluster (OSS Cluster API) also
++cluster|slots +command
+```
+
+`check` leaves out the search indexes on keys the user may not read (Redis
+refuses `FT.INFO` on them), and says how many. Without `MEMORY USAGE`, it
+warns that it can't estimate the memory a copy needs, and goes on.
 
 ## Architecture: hybrid index-row layout
 

@@ -136,3 +136,33 @@ func TestSQLLeftoverIndexReused(t *testing.T) {
 	h.exec(`INSERT INTO it_fi_left VALUES (7)`)
 	h.expectRows(`SELECT a FROM it_fi_left`, "7")
 }
+
+// An ACL user that may not read the keys of an index with the name a new
+// table would take can't run FT.INFO on it (NOPERM): the table takes the
+// next names, as for any other index that isn't the driver's.
+func TestACLForeignIndexName(t *testing.T) {
+	a := newACLHarness(t)
+	st := &store{client: a.raw}
+	a.exec(`DROP TABLE IF EXISTS it_fi_acl`)
+	last, err := st.lastNames(a.ctx, a.raw, "public", "it_fi_acl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, next := namesFor("public", "it_fi_acl", last+1), namesFor("public", "it_fi_acl", last+2)
+	if err := st.searchDo(a.ctx, app.index, "FT.CREATE", app.index, "ON", "HASH", "PREFIX", 1, "it_fi_acl_app:",
+		"SCHEMA", "n", "NUMERIC").Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		a.exec(`DROP TABLE IF EXISTS it_fi_acl`)
+		_ = st.searchDo(a.ctx, app.index, "FT.DROPINDEX", app.index).Err()
+	})
+	a.user("it_fi_acl", append(a.driverCommands(false), "~adbc:*", "~public:*")...)
+	u := a.connect("it_fi_acl", nil)
+	u.exec(`CREATE TABLE it_fi_acl (a INTEGER)`)
+	u.exec(`INSERT INTO it_fi_acl VALUES (1)`)
+	u.expectRows(`SELECT index_name FROM information_schema.tables WHERE table_name = 'it_fi_acl'`, next.index)
+	if err := st.searchDo(a.ctx, app.index, "FT.INFO", app.index).Err(); err != nil {
+		t.Errorf("the application's index: %v", err)
+	}
+}

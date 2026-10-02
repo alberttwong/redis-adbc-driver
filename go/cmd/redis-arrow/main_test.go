@@ -85,6 +85,11 @@ func TestCommandLineErrors(t *testing.T) {
 		{[]string{"import", "-table", "t", "a.arrow", "b.arrow"}, "want one input path"},
 		{[]string{"import", "-table", "t", filepath.Join(t.TempDir(), "missing.arrow")}, "no such file"},
 		{[]string{"export", "-bogus"}, "flag provided but not defined"},
+		{[]string{"scan"}, "-prefix is required"},
+		{[]string{"scan", "-prefix", "u:", "-on-error", "skip"}, "unknown -on-error"},
+		{[]string{"scan", "-prefix", "u:", "-format", "csv"}, "unknown -format"},
+		{[]string{"scan", "-prefix", "u:", "-type", "age"}, "want key=value"},
+		{[]string{"check", "u:"}, "unexpected arguments"},
 		{[]string{"merge"}, `unknown command "merge"`},
 	} {
 		err := run(ctx, c.args, strings.NewReader(""), io.Discard, io.Discard)

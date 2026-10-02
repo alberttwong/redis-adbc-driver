@@ -485,8 +485,14 @@ func reserveNames(ctx context.Context, p goredis.Pipeliner, nm tableNames) {
 func (s *store) foreignIndex(ctx context.Context, nm tableNames) (bool, error) {
 	reply, err := s.searchDo(ctx, nm.index, "FT.INFO", nm.index).Result()
 	if err != nil {
-		if isUnknownIndex(err) {
+		switch {
+		case isUnknownIndex(err):
 			return false, nil
+		case strings.HasPrefix(err.Error(), "NOPERM"):
+			// Redis refuses FT.INFO on an index whose key prefixes the ACL
+			// user may not read, and the names' prefix isn't one of them
+			// (the user is creating a table there): it isn't a leftover.
+			return true, nil
 		}
 		return false, wrapRedis(err, "failed to check the search index "+nm.index)
 	}
@@ -502,6 +508,15 @@ type indexInfo struct {
 	prefixes []string
 	filter   string
 	numDocs  int64
+	failures int64 // hash_indexing_failures
+	// attrs are the attributes: each one's identifier, attribute name, type
+	// and options (SORTABLE, SEPARATOR ",", …).
+	attrs []indexAttr
+}
+
+type indexAttr struct {
+	identifier, name, typ string
+	options               []string
 }
 
 // indexInfoOf reads an FT.INFO reply (RESP2: a flat list of names and
@@ -530,6 +545,36 @@ func indexInfoOf(reply any) indexInfo {
 			}
 		case "num_docs":
 			info.numDocs, _ = strconv.ParseInt(fmt.Sprint(list[i+1]), 10, 64)
+		case "hash_indexing_failures":
+			info.failures, _ = strconv.ParseInt(fmt.Sprint(list[i+1]), 10, 64)
+		case "attributes":
+			attrs, _ := list[i+1].([]any)
+			for _, a := range attrs {
+				parts, _ := a.([]any)
+				var at indexAttr
+				for j := 0; j < len(parts); j++ {
+					name := fmt.Sprint(parts[j])
+					switch {
+					case j+1 < len(parts) && (name == "identifier" || name == "attribute" || name == "type"):
+						v := fmt.Sprint(parts[j+1])
+						j++
+						switch name {
+						case "identifier":
+							at.identifier = v
+						case "attribute":
+							at.name = v
+						default:
+							at.typ = v
+						}
+					case j+1 < len(parts) && name == "SEPARATOR":
+						at.options = append(at.options, name+" "+fmt.Sprint(parts[j+1]))
+						j++
+					default:
+						at.options = append(at.options, name)
+					}
+				}
+				info.attrs = append(info.attrs, at)
+			}
 		}
 	}
 	return info

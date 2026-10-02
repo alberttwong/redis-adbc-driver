@@ -52,6 +52,9 @@ const usage = `usage: redis-arrow <command> [flags] [args]
 Commands:
   export   run SQL and write the result as an Arrow IPC file or stream
   import   bulk-ingest an Arrow IPC file or stream into a table
+  check    check an existing HASH collection: guess its columns, and list
+           what Arrow IPC and SQL need
+  scan     read an existing HASH collection as an Arrow IPC file or stream
 
 Run "redis-arrow <command> -h" for a command's flags.
 `
@@ -87,6 +90,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runExport(ctx, args[1:], stdout, stderr)
 	case "import":
 		return runImport(ctx, args[1:], stdin, stderr)
+	case "check":
+		return runCheck(ctx, args[1:], stdout, stderr)
+	case "scan":
+		return runScan(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "-help", "--help":
 		fmt.Fprint(stdout, usage)
 		return nil
@@ -130,9 +137,8 @@ func (c *connFlags) register(fs *flag.FlagSet) {
 	fs.Var(c.opts, "option", "database option `key=value`, such as adbc.redis.read_timeout=30m (repeatable)")
 }
 
-// open connects to Redis. The returned func closes the connection and the
-// database.
-func (c *connFlags) open(ctx context.Context) (adbc.ConnectionWithContext, func(), error) {
+// options are the database options: the -option flags and the URI.
+func (c *connFlags) options() map[string]string {
 	uri := c.uri
 	if uri == "" {
 		uri = os.Getenv("REDIS_URI")
@@ -143,7 +149,13 @@ func (c *connFlags) open(ctx context.Context) (adbc.ConnectionWithContext, func(
 	opts := map[string]string{}
 	maps.Copy(opts, c.opts)
 	opts[adbc.OptionKeyURI] = uri
-	db, err := redis.NewDriver(alloc).NewDatabaseWithContext(ctx, opts)
+	return opts
+}
+
+// open connects to Redis. The returned func closes the connection and the
+// database.
+func (c *connFlags) open(ctx context.Context) (adbc.ConnectionWithContext, func(), error) {
+	db, err := redis.NewDriver(alloc).NewDatabaseWithContext(ctx, c.options())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -256,47 +268,47 @@ func runExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return errors.New("the statement ran but returned no result set, so nothing was written")
 	}
 
-	dst := stdout
-	commit := func() error { return nil }
-	if *out != "-" {
-		// Write next to the target and rename, so that a failure leaves no
-		// partial file behind.
-		f, err := os.CreateTemp(filepath.Dir(*out), "."+filepath.Base(*out)+".*.tmp")
-		if err != nil {
-			return err
-		}
-		committed := false
-		defer func() {
-			if !committed {
-				_ = f.Close()
-				_ = os.Remove(f.Name())
-			}
-		}()
-		dst = f
-		commit = func() error {
-			if err := f.Chmod(0o644); err != nil {
-				return err
-			}
-			if err := f.Close(); err != nil {
-				return err
-			}
-			if err := os.Rename(f.Name(), *out); err != nil {
-				return err
-			}
-			committed = true
-			return nil
-		}
-	}
-
-	rows, err := writeIPC(dst, rdr, fileFormat, ipcOpts)
+	rows, err := writeOutput(*out, stdout, rdr, fileFormat, ipcOpts)
 	if err != nil {
-		return err
-	}
-	if err := commit(); err != nil {
 		return err
 	}
 	fmt.Fprintf(stderr, "%d %s\n", rows, plural(rows, "row", "rows"))
 	return nil
+}
+
+// writeOutput writes every batch of rdr to the path out, or to stdout for
+// "-", and returns the number of rows. A file is written next to its target
+// and renamed, so that a failure leaves no partial file behind.
+func writeOutput(out string, stdout io.Writer, rdr array.RecordReader, fileFormat bool, ipcOpts []ipc.Option) (int64, error) {
+	if out == "-" {
+		return writeIPC(stdout, rdr, fileFormat, ipcOpts)
+	}
+	f, err := os.CreateTemp(filepath.Dir(out), "."+filepath.Base(out)+".*.tmp")
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}
+	}()
+	rows, err := writeIPC(f, rdr, fileFormat, ipcOpts)
+	if err != nil {
+		return 0, err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(f.Name(), out); err != nil {
+		return 0, err
+	}
+	committed = true
+	return rows, nil
 }
 
 // writeIPC writes every batch of rdr to w and returns the number of rows.
