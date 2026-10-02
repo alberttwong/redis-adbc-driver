@@ -499,7 +499,7 @@ func (env *evalEnv) evalJSONQuery(f *Func) (Value, error) {
 	}
 	var v Value
 	if f.Name == "JSON_VALUE" {
-		v, err = jsonValueResult(c, items)
+		v, err = jsonValueResult(c, items, env.zone())
 	} else {
 		v, err = jsonQueryResult(c, items)
 	}
@@ -533,14 +533,14 @@ func (env *evalEnv) jsonBehavior(f *Func, b jsonBehavior) (Value, error) {
 		case err != nil:
 			return Value{}, err
 		case v.Null || !c.returnJSON:
-			return Coerce(v, c.returning)
+			return coerceIn(v, c.returning, env.zone())
 		}
 		// For a JSON result, text is read as JSON and other values are
 		// encoded.
 		text := v.S
 		if v.T.Kind != KindString {
 			var sb strings.Builder
-			writeJSONValue(&sb, v, isJSONExpr(x))
+			writeJSONValue(&sb, v, isJSONExpr(x), env.zone())
 			text = sb.String()
 		}
 		s, err := normalizeJSONB(text)
@@ -563,7 +563,9 @@ func jsonReturning(c *jsonClauses, text string) (Value, error) {
 // jsonValueResult is the result of JSON_VALUE: the one scalar item, as text
 // (a string's value, a number in NUMERIC form) converted to the RETURNING
 // type; NULL for a JSON null.
-func jsonValueResult(c *jsonClauses, items []*jsonNode) (Value, error) {
+// z is the session time zone, in which text becomes a timestamp with time
+// zone.
+func jsonValueResult(c *jsonClauses, items []*jsonNode, z tzZone) (Value, error) {
 	it := items[0]
 	switch {
 	case len(items) > 1 || it.kind == jsonArray || it.kind == jsonObject:
@@ -590,7 +592,7 @@ func jsonValueResult(c *jsonClauses, items []*jsonNode) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	return Coerce(stringValue(s), c.returning)
+	return coerceIn(stringValue(s), c.returning, z)
 }
 
 // jsonQueryResult is the result of JSON_QUERY: the one item as JSON, or

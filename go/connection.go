@@ -60,6 +60,8 @@ func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, err
 		return formatTimeout(c.timeouts.read), nil
 	case OptionStringWriteTimeout:
 		return formatTimeout(c.timeouts.write), nil
+	case OptionStringTimeZone:
+		return c.sess.value("timezone").text, nil
 	}
 	return c.ConnectionImplBase.GetOption(ctx, key)
 }
@@ -91,6 +93,13 @@ func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error
 			return err
 		}
 		c.writeFollows = follows
+		return nil
+	case OptionStringTimeZone:
+		tz, err := timeZoneParam(value)
+		if err != nil {
+			return err
+		}
+		c.sess.setDefaultZone(tz)
 		return nil
 	}
 	return c.ConnectionImplBase.SetOption(ctx, key, value)

@@ -294,10 +294,10 @@ func isDistinctOp(op string) bool { return op == "IS DISTINCT FROM" || op == "IS
 
 // distinctFrom evaluates a IS [NOT] DISTINCT FROM b: NULLs are equal to each
 // other and distinct from any value. The result is never NULL.
-func distinctFrom(op string, a, b Value) (Value, error) {
+func distinctFrom(op string, a, b Value, z tzZone) (Value, error) {
 	distinct := a.Null != b.Null
 	if !a.Null && !b.Null {
-		c, ok := compareValues(a, b)
+		c, ok := compareIn(a, b, z)
 		if !ok {
 			return Value{}, fmt.Errorf("cannot compare %s with %s", a.T.Kind, b.T.Kind)
 		}
@@ -323,12 +323,12 @@ func (env *evalEnv) evalItems(items []Expr) ([]Value, error) {
 // op, as the rewritten comparisons do: = and <> item by item (NULL if the
 // result depends on a NULL item), the ordering operators left to right up
 // to the first pair that is unequal or has a NULL.
-func rowCompareValues(op string, l, r []Value) (Value, error) {
+func rowCompareValues(op string, l, r []Value, z tzZone) (Value, error) {
 	switch op {
 	case "=", "<>":
 		sawNull := false
 		for i := range l {
-			v, err := binaryOp(op, l[i], r[i])
+			v, err := binaryOp(op, l[i], r[i], z)
 			if err != nil {
 				return Value{}, err
 			}
@@ -350,12 +350,12 @@ func rowCompareValues(op string, l, r []Value) (Value, error) {
 		if l[i].Null || r[i].Null {
 			return nullValue(typeBool), nil
 		}
-		eq, err := binaryOp("=", l[i], r[i])
+		eq, err := binaryOp("=", l[i], r[i], z)
 		if err != nil {
 			return Value{}, err
 		}
 		if b, _ := truthy(eq); !b {
-			return binaryOp(op, l[i], r[i])
+			return binaryOp(op, l[i], r[i], z)
 		}
 	}
 	return boolValue(op == "<=" || op == ">="), nil
@@ -383,6 +383,8 @@ type rowSet struct {
 	col, n int
 	// noIndex makes the set compare one by one (a result used only once).
 	noIndex bool
+	// zone is the session time zone values of different types compare in.
+	zone tzZone
 
 	built   bool
 	classes []uint16 // per item, the eqClass bits of the hashed values
@@ -421,7 +423,7 @@ func (s *rowSet) compareRow(x, row []Value) int {
 			res = 0
 			continue
 		}
-		if c, ok := compareValues(a, b); !ok || c != 0 {
+		if c, ok := compareIn(a, b, s.zone); !ok || c != 0 {
 			return -1
 		}
 	}
@@ -596,7 +598,7 @@ func (e *executor) cachedRowSet(sq *Subquery, rows [][]Value, n int) *rowSet {
 	if s, ok := e.cache.rowSets[sq]; ok {
 		return s
 	}
-	s := &rowSet{rows: rows, n: n}
+	s := &rowSet{rows: rows, n: n, zone: e.zone()}
 	e.cache.rowSets[sq] = s
 	return s
 }
@@ -607,7 +609,7 @@ func (env *evalEnv) evalRowIn(sq *Subquery, r *RowExpr, rows [][]Value) (Value, 
 	if err != nil {
 		return Value{}, err
 	}
-	set := &rowSet{rows: rows, n: len(x), noIndex: true}
+	set := &rowSet{rows: rows, n: len(x), noIndex: true, zone: env.zone()}
 	if !sq.correlated {
 		// The same rows for every outer row: probe a hash set.
 		set = env.exec.cachedRowSet(sq, rows, len(x))
@@ -628,7 +630,7 @@ func (env *evalEnv) evalRowQuantified(sq *Subquery, r *RowExpr, rows [][]Value) 
 	}
 	sawNull := false
 	for _, row := range rows {
-		v, err := rowCompareValues(sq.Op, x, row[:len(x)])
+		v, err := rowCompareValues(sq.Op, x, row[:len(x)], env.zone())
 		if err != nil {
 			return Value{}, err
 		}
@@ -703,7 +705,7 @@ func (e *executor) rowInTerm(ctx context.Context, sq *Subquery, r *RowExpr, meta
 		if len(values) > maxUnionTerms {
 			continue
 		}
-		if q, ok := unionQuery(cm, values); ok {
+		if q, ok := unionQuery(cm, values, e.zone()); ok {
 			terms = append(terms, q)
 		}
 	}

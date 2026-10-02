@@ -14,12 +14,15 @@
 
 package redis
 
-// Date/time functions. All computations are in UTC (timestamps are stored
-// as UTC instants); the current time is fixed once per statement.
+// Date/time functions. Timestamps with time zone are stored as UTC
+// instants; their fields (EXTRACT, DATE_TRUNC, AGE, …) are those of their
+// local time in the session time zone (timezone.go), as in Postgres. The
+// current time is fixed once per statement.
 
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -94,7 +97,9 @@ func fromTime(tm time.Time, t ColType) (Value, error) {
 
 func epochSeconds(v Value, tm time.Time) float64 {
 	if v.T.Kind == KindTime {
-		return float64(tm.Hour()*3600+tm.Minute()*60+tm.Second()) + float64(tm.Nanosecond())/1e9
+		// The time of day itself, so that 24:00:00 is 86400.
+		sec, nanos := splitUnits(v.I, v.T.Unit)
+		return float64(sec) + float64(nanos)/1e9
 	}
 	return float64(tm.Unix()) + float64(tm.Nanosecond())/1e9
 }
@@ -145,18 +150,54 @@ func normalizeField(f string) string {
 	return f
 }
 
-// datePart implements DATE_PART / EXTRACT.
-func datePart(field string, v Value) (Value, error) {
-	tm, err := toTime(v)
+// datePart implements DATE_PART / EXTRACT, in the session time zone z: the
+// fields of a timestamp with time zone are those of its local time, and
+// timezone, timezone_hour and timezone_minute its offset there (seconds,
+// hours and minutes east of UTC).
+func datePart(field string, v Value, z tzZone) (Value, error) {
+	utc, err := toTime(v)
 	if err != nil {
 		return Value{}, err
 	}
+	tm, off := utc, 0
+	withTZ := isTimestampTZ(v.T)
+	if withTZ {
+		off = z.offsetAt(utc.Unix())
+		tm = utc.Add(time.Duration(off) * time.Second)
+	}
 	f := normalizeField(field)
+	switch f {
+	case "timezone", "timezone_hour", "timezone_minute":
+		if !withTZ {
+			typ := "timestamp without time zone"
+			switch v.T.Kind {
+			case KindDate:
+				typ = "date"
+			case KindTime:
+				typ = "time without time zone"
+			}
+			return Value{}, fmt.Errorf("unit %q not supported for type %s", field, typ)
+		}
+		n := off
+		switch f {
+		case "timezone_hour":
+			n = off / 3600
+		case "timezone_minute":
+			n = off / 60 % 60
+		}
+		return intValue(typeInt64, int64(n)), nil
+	}
 	if v.T.Kind == KindTime {
 		switch f {
 		case "hour", "minute", "second", "milliseconds", "microseconds", "epoch":
 		default:
 			return Value{}, fmt.Errorf("field %q is not valid for TIME values", field)
+		}
+		if f == "hour" {
+			// Of the time of day itself: 24 for 24:00:00, which rounding to
+			// a lower precision can give (as in Postgres).
+			sec, _ := splitUnits(v.I, v.T.Unit)
+			return intValue(typeInt64, sec/3600), nil
 		}
 	}
 	i := func(n int) (Value, error) { return intValue(typeInt64, int64(n)), nil }
@@ -198,7 +239,7 @@ func datePart(field string, v Value) (Value, error) {
 	case "microseconds":
 		return i(tm.Second()*1_000_000 + tm.Nanosecond()/1000)
 	case "epoch":
-		return floatValue(typeFloat64, epochSeconds(v, tm)), nil
+		return floatValue(typeFloat64, epochSeconds(v, utc)), nil
 	case "decade":
 		return i(int(math.Floor(float64(tm.Year()) / 10)))
 	case "century":
@@ -215,6 +256,27 @@ func datePart(field string, v Value) (Value, error) {
 		return i(-((-y)/1000 + 1))
 	}
 	return Value{}, fmt.Errorf("unknown date/time field %q", field)
+}
+
+// truncIn truncates an instant to the start of the given unit of its local
+// time in z, as Postgres truncates a timestamp with time zone: a day or a
+// longer unit starts at that local time, read back with the DST rule
+// (localToUTC); a shorter one keeps the instant's offset, so 01:30 PST on
+// a fall-back day truncates to 01:00 PST, not PDT.
+func truncIn(unit string, tm time.Time, z tzZone) (time.Time, error) {
+	if z.isUTC() {
+		return truncTime(unit, tm)
+	}
+	off := time.Duration(z.offsetAt(tm.Unix())) * time.Second
+	tr, err := truncTime(unit, tm.Add(off))
+	if err != nil {
+		return time.Time{}, err
+	}
+	switch normalizeField(unit) {
+	case "microseconds", "milliseconds", "second", "minute", "hour":
+		return tr.Add(-off), nil
+	}
+	return z.instant(tr), nil
 }
 
 // truncTime truncates a time to the start of the given unit.
@@ -355,9 +417,9 @@ func dateAddType(part Expr, x ColType) ColType {
 }
 
 // dateAdd implements DATEADD(part, n, x), and DATE_SUB with sign -1: x plus
-// n parts, as a value of type t. Months clamp to the end of the month, as
-// with intervals.
-func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
+// n parts, as a value of type t, in the session time zone z. Months clamp to
+// the end of the month, as with intervals.
+func dateAdd(name string, args []Value, sign int64, t ColType, z tzZone) (Value, error) {
 	part, ok := datePartOf(args[0].Text())
 	if !ok {
 		return Value{}, fmt.Errorf("%s: unknown date part %q", name, args[0].Text())
@@ -381,7 +443,7 @@ func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
 			return Value{}, fmt.Errorf("%s: date part %s is not valid for TIME values", name, part)
 		}
 	case KindString:
-		if x, err = Coerce(x, t); err != nil {
+		if x, err = coerceIn(x, t, z); err != nil {
 			return Value{}, fmt.Errorf("%s: %v", name, err)
 		}
 	default:
@@ -400,7 +462,7 @@ func dateAdd(name string, args []Value, sign int64, t ColType) (Value, error) {
 		iv, err = intervalValue(0, n/(nsPerDay/ns), n%(nsPerDay/ns)*ns)
 	}
 	if err == nil {
-		x, err = temporalOp("+", x, iv, t)
+		x, err = temporalOp("+", x, iv, t, z)
 	}
 	if err != nil {
 		return Value{}, fmt.Errorf("%s: %v", name, err)
@@ -611,6 +673,11 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 			return dateTruncType(args[1]), true
 		}
 		return typeTimestamp, true
+	case "DATE_BIN":
+		if len(args) == 3 {
+			return dateBinType(args[1], args[2]), true
+		}
+		return typeTimestampTZ, true
 	}
 	return ColType{}, false
 }
@@ -631,16 +698,21 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		return int(c.I), nil
 	}
 	done := func(v Value, err error) (Value, bool, error) { return v, true, err }
+	z := env.zone()
+	// local is the wall-clock time whose fields a function reads.
+	local := func(v Value) (time.Time, error) { return localFields(v, z) }
 	switch f.Name {
-	case "CURRENT_DATE", "CURRENT_TIMESTAMP", "NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP",
-		"LOCALTIMESTAMP", "CURRENT_TIME", "LOCALTIME":
+	case "CURRENT_TIMESTAMP", "NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP":
 		// An optional precision argument is accepted and ignored.
 		return done(fromTime(env.now(), t))
+	case "CURRENT_DATE", "LOCALTIMESTAMP", "CURRENT_TIME", "LOCALTIME":
+		// The local date and time in the session time zone.
+		return done(fromTime(z.localTime(env.now()), t))
 	case "DATE_PART":
 		if args[1].T.Kind == KindInterval {
 			return done(intervalPart(args[0].Text(), args[1]))
 		}
-		return done(datePart(args[0].Text(), args[1]))
+		return done(datePart(args[0].Text(), args[1], z))
 	case "__INTERVAL":
 		// INTERVAL n UNIT / INTERVAL 'n' UNIT
 		u, ok := intervalUnits[args[1].Text()]
@@ -657,14 +729,15 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 	case "AGE":
 		var a, b time.Time
 		var err error
+		// The fields of the local times, as Postgres subtracts them.
 		if len(args) == 1 {
 			// AGE(x) is measured from the start of the current day.
-			n := env.now()
+			n := z.localTime(env.now())
 			a = time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.UTC)
-			b, err = toTime(args[0])
+			b, err = local(args[0])
 		} else {
-			if a, err = toTime(args[0]); err == nil {
-				b, err = toTime(args[1])
+			if a, err = local(args[0]); err == nil {
+				b, err = local(args[1])
 			}
 		}
 		if err != nil {
@@ -676,7 +749,7 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if field == "" {
 			field = strings.ToLower(f.Name)
 		}
-		v, err := datePart(field, args[0])
+		v, err := datePart(field, args[0], z)
 		if err == nil && v.T.Kind == KindFloat64 {
 			v = intValue(typeInt64, int64(math.Floor(v.F))) // SECOND() is whole seconds
 		}
@@ -695,17 +768,25 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if err != nil {
 			return done(Value{}, err)
 		}
-		tr, err := truncTime(args[0].Text(), tm)
+		var tr time.Time
+		if isTimestampTZ(args[1].T) {
+			tr, err = truncIn(args[0].Text(), tm, z)
+		} else {
+			tr, err = truncTime(args[0].Text(), tm)
+		}
 		if err != nil {
 			return done(Value{}, err)
 		}
 		return done(fromTime(tr, t))
+	case "DATE_BIN":
+		return done(dateBin(args, t, z))
 	case "DATE_DIFF", "DATEDIFF", "TIMESTAMPDIFF":
-		a, err := toTime(args[1])
+		// Boundaries crossed in local time.
+		a, err := local(args[1])
 		if err != nil {
 			return done(Value{}, err)
 		}
-		b, err := toTime(args[2])
+		b, err := local(args[2])
 		if err != nil {
 			return done(Value{}, err)
 		}
@@ -720,9 +801,9 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if f.Name == "DATE_SUB" {
 			sign = -1
 		}
-		return done(dateAdd(f.Name, args, sign, t))
+		return done(dateAdd(f.Name, args, sign, t, z))
 	case "LAST_DAY":
-		tm, err := toTime(args[0])
+		tm, err := local(args[0])
 		if err != nil {
 			return done(Value{}, err)
 		}
@@ -780,6 +861,9 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if int(tm.Month()) != parts[1] || tm.Day() != parts[2] || parts[3] > 23 || parts[4] > 59 || whole > 59 {
 			return done(Value{}, fmt.Errorf("date/time field value out of range"))
 		}
+		if f.Name == "MAKE_TIMESTAMPTZ" {
+			tm = z.instant(tm) // a local time in the session time zone
+		}
 		return done(fromTime(tm, t))
 	case "TO_TIMESTAMP", "TO_DATE":
 		if f.Name == "TO_TIMESTAMP" && len(args) == 1 {
@@ -795,17 +879,99 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 		if err != nil {
 			return done(Value{}, err)
 		}
+		if f.Name == "TO_TIMESTAMP" {
+			tm = z.instant(tm) // a local time in the session time zone
+		}
 		return done(fromTime(tm, t))
 	case "TO_CHAR":
 		if args[1].Text() == "" {
 			return done(nullValue(typeString), nil) // as in Postgres
 		}
-		s, err := toChar(args[0], args[1].Text())
+		s, err := toChar(args[0], args[1].Text(), z)
 		return done(stringValue(s), err)
 	case "TIMEZONE":
-		return done(atTimeZone(f, args, t))
+		return done(atTimeZone(f, args, t, z))
 	case "CONVERT_TIMEZONE":
 		return done(convertTimezone(f, args, t))
 	}
 	return Value{}, false, nil
+}
+
+// dateBinType is the result type of DATE_BIN(stride, source, origin), as
+// Postgres picks between its TIMESTAMP and TIMESTAMP WITH TIME ZONE forms:
+// a TIMESTAMP when the source or the origin is one and neither has a time
+// zone, otherwise a TIMESTAMP WITH TIME ZONE (dates and text are read as
+// one, Postgres's preferred type). The unit is microseconds, or the
+// arguments' finer one.
+func dateBinType(source, origin ColType) ColType {
+	naive := func(t ColType) bool { return t.Kind == KindTimestamp && t.TZ == "" }
+	tz := "UTC"
+	if (naive(source) || naive(origin)) && !isTimestampTZ(source) && !isTimestampTZ(origin) {
+		tz = ""
+	}
+	unit := arrow.Microsecond
+	for _, a := range []ColType{source, origin} {
+		if a.Kind == KindTimestamp && unitsPerSecond[a.Unit] > unitsPerSecond[unit] {
+			unit = a.Unit
+		}
+	}
+	return timestampType(unit, tz)
+}
+
+// dateBin implements DATE_BIN(stride, source, origin), of type t, as
+// Postgres does: the start of the stride-long bin, counted from origin,
+// that source falls in (also when origin is after source). The stride is
+// elapsed time, without months (a day is 24 hours), so the session time
+// zone z only matters for reading a TIMESTAMP, a DATE or text as a
+// timestamp with time zone.
+func dateBin(args []Value, t ColType, z tzZone) (Value, error) {
+	stride := args[0]
+	if stride.T.Kind == KindString {
+		iv, err := intervalLiteral(stride.S)
+		if err != nil {
+			return Value{}, err
+		}
+		stride = iv
+	}
+	if stride.T.Kind != KindInterval {
+		return Value{}, noSuchFunction("date_bin", false, argTypes(args))
+	}
+	if stride.Months != 0 {
+		return Value{}, fmt.Errorf("timestamps cannot be binned into intervals containing months or years")
+	}
+	step := new(big.Int).Mul(big.NewInt(int64(stride.Days)), big.NewInt(nsPerDay))
+	step.Add(step, big.NewInt(stride.I))
+	if step.Sign() <= 0 {
+		return Value{}, fmt.Errorf("stride must be greater than zero")
+	}
+	// at is a source or origin in nanoseconds since the epoch, as t.
+	at := func(v Value) (*big.Int, error) {
+		switch v.T.Kind {
+		case KindTimestamp, KindDate, KindString:
+		default:
+			return nil, noSuchFunction("date_bin", false, argTypes(args))
+		}
+		c, err := coerceIn(v, t, z)
+		if err != nil {
+			return nil, err
+		}
+		sec, nanos := splitUnits(c.I, c.T.Unit)
+		n := new(big.Int).Mul(big.NewInt(sec), big.NewInt(nsPerSecond))
+		return n.Add(n, big.NewInt(nanos)), nil
+	}
+	src, err := at(args[1])
+	if err != nil {
+		return Value{}, err
+	}
+	origin, err := at(args[2])
+	if err != nil {
+		return Value{}, err
+	}
+	// source - ((source - origin) mod stride), the mod rounding down.
+	_, m := new(big.Int).DivMod(new(big.Int).Sub(src, origin), step, new(big.Int))
+	units, _ := new(big.Int).DivMod(m.Sub(src, m), big.NewInt(nsPerSecond/unitsPerSecond[t.Unit]), new(big.Int))
+	if !units.IsInt64() {
+		return Value{}, errTimestampRange
+	}
+	return intValue(t, units.Int64()), nil
 }

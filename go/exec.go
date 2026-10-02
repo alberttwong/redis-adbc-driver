@@ -56,6 +56,10 @@ type executor struct {
 	// script is set while running a script of several statements, which is
 	// a transaction for SET LOCAL (see session.go).
 	script bool
+	// tz is the session time zone of the statement being run, read from
+	// sess when it starts (tzKnown) and after SET (see zone).
+	tz      tzZone
+	tzKnown bool
 }
 
 // execResult is the outcome of one statement.
@@ -165,6 +169,7 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 	}()
 	e.params, e.paramTypes = params, paramTypes
 	e.returning = nil
+	e.readZone()
 	if e.now.IsZero() {
 		e.now = time.Now().UTC()
 	}
@@ -178,15 +183,15 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		if err != nil {
 			return execResult{}, err
 		}
-		return execResult{isQuery: true, cols: plan.columns(), rows: rows, affected: int64(len(rows))}, nil
+		return e.fitResult(execResult{isQuery: true, cols: plan.columns(), rows: rows, affected: int64(len(rows))}, nil)
 	case *InsertStmt:
-		return e.dmlResult(e.runInsert(ctx, st, params))
+		return e.fitResult(e.dmlResult(e.runInsert(ctx, st, params)))
 	case *UpdateStmt:
-		return e.dmlResult(e.runUpdate(ctx, st, params))
+		return e.fitResult(e.dmlResult(e.runUpdate(ctx, st, params)))
 	case *DeleteStmt:
-		return e.dmlResult(e.runDelete(ctx, st, params))
+		return e.fitResult(e.dmlResult(e.runDelete(ctx, st, params)))
 	case *MergeStmt:
-		return e.dmlResult(e.runMerge(ctx, st, params))
+		return e.fitResult(e.dmlResult(e.runMerge(ctx, st, params)))
 	case *CreateTableStmt:
 		if st.AsSelect != nil {
 			n, err := e.runCreateTableAs(ctx, st)
@@ -226,12 +231,37 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 	return execResult{}, errorf(adbc.StatusNotImplemented, "unsupported statement %T", ps.Stmt)
 }
 
+// fitResult converts a query result's values to their columns' types in
+// the session time zone, where a value's type differs from its column's (a
+// CASE or COALESCE branch, such as a TIMESTAMP in a TIMESTAMP WITH TIME
+// ZONE column, or a timestamp in a text one). In UTC the conversion to
+// Arrow values (buildRecord) does the same.
+func (e *executor) fitResult(res execResult, err error) (execResult, error) {
+	z := e.zone()
+	if err != nil || !res.isQuery || z.isUTC() {
+		return res, err
+	}
+	for _, row := range res.rows {
+		for j, v := range row {
+			if j < len(res.cols) && !v.Null && v.T != res.cols[j].Type {
+				cv, err := coerceIn(v, res.cols[j].Type, z)
+				if err != nil {
+					return execResult{}, invalidArg(err)
+				}
+				row[j] = cv
+			}
+		}
+	}
+	return res, nil
+}
+
 // runSession runs transaction control, SET and SHOW (session.go).
 func (e *executor) runSession(st Stmt) (execResult, error) {
 	if e.sess == nil {
 		// An executor made without a connection (tests).
 		e.sess = newSession(e.schema)
 	}
+	defer e.readZone() // a SET, or the end of a transaction, may change it
 	switch st := st.(type) {
 	case *TransactionStmt:
 		return execResult{affected: -1}, e.runTransaction(st)
@@ -349,7 +379,7 @@ func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (i
 	for i, row := range rows {
 		out := make([]Value, len(row))
 		for j, v := range row {
-			cv, err := Coerce(v, meta.Columns[j].Type)
+			cv, err := coerceIn(v, meta.Columns[j].Type, e.zone())
 			if err != nil {
 				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", meta.Columns[j].Name, err)
 			}
@@ -508,7 +538,7 @@ func insertRow(env *evalEnv, meta *tableMeta, defs *columnDefaults, checks *tabl
 			return nil, invalidArg(err)
 		}
 		col := meta.Columns[targets[j]]
-		cv, err := Coerce(v, col.Type)
+		cv, err := coerceIn(v, col.Type, env.zone())
 		if err != nil {
 			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 		}
@@ -563,7 +593,7 @@ func (e *executor) insertSelect(ctx context.Context, st *InsertStmt, meta *table
 		given := make([]bool, len(meta.Columns))
 		for j, v := range res {
 			col := meta.Columns[targets[j]]
-			cv, err := Coerce(v, col.Type)
+			cv, err := coerceIn(v, col.Type, e.zone())
 			if err != nil {
 				return 0, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 			}
@@ -1356,7 +1386,7 @@ func setValues(env *evalEnv, meta *tableMeta, cols []int, sets []SetClause) ([]V
 		if err != nil {
 			return nil, invalidArg(err)
 		}
-		cv, err := Coerce(v, col.Type)
+		cv, err := coerceIn(v, col.Type, env.zone())
 		if err != nil {
 			return nil, errorf(adbc.StatusInvalidArgument, "column %q: %v", col.Name, err)
 		}

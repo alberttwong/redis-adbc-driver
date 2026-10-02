@@ -319,7 +319,7 @@ func TestRowSetMatchesRowComparisons(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					got, err := rowCompareValues(op, x, r)
+					got, err := rowCompareValues(op, x, r, utcZone)
 					if err != nil {
 						t.Fatal(err)
 					}

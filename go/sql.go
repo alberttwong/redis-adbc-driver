@@ -3640,6 +3640,14 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if err != nil {
 					return nil, &sqlError{msg: err.Error()}
 				}
+				if withTZ {
+					if _, _, _, hasTZ, _ := parseTimestamp(s.text); !hasTZ {
+						// A local time in the session time zone, which is
+						// known when the statement runs (a SET earlier in
+						// the script may change it): read then.
+						return &Cast{X: &Literal{V: stringValue(s.text)}, T: v.T}, nil
+					}
+				}
 				return &Literal{V: v}, nil
 			}
 			p.pos = save

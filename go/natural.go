@@ -198,7 +198,7 @@ func (jp *joinPlan) fillMerged(env *evalEnv, i int, rows []map[string]Value) err
 			if err != nil {
 				return invalidArg(err)
 			}
-			if v, err = Coerce(v, m.typ); err != nil {
+			if v, err = coerceIn(v, m.typ, env.zone()); err != nil {
 				return invalidArg(err)
 			}
 			row[m.key] = v

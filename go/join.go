@@ -45,6 +45,7 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 type joinItem struct {
@@ -682,7 +683,7 @@ func (e *executor) runJoin(ctx context.Context, jp *joinPlan, need map[string]bo
 				if len(values) > maxUnionTerms {
 					continue
 				}
-				if q, ok := unionQuery(cm, values); ok {
+				if q, ok := unionQuery(cm, values, e.zone()); ok {
 					switch {
 					case q == noMatchQuery:
 						wp.none = true // no key of the left rows can match
@@ -795,11 +796,23 @@ func (e *executor) joinRows(env *evalEnv, kind string, left, right []map[string]
 	// A pair with a CHAR side compares strings without trailing spaces
 	// (lengths.go), so its keys drop them on both sides.
 	char := make([]bool, len(pairs))
+	// A pair of a DATE or TIMESTAMP with a TIMESTAMP WITH TIME ZONE (or a
+	// DATE with a TIMESTAMP) is keyed as the latter, converted in the
+	// session time zone, as compareIn compares them.
+	keyType := make([]ColType, len(pairs))
 	for i, p := range pairs {
 		lt, _ := inferType(p.left, env.types, nil)
 		rt, _ := inferType(p.right, env.types, nil)
 		char[i] = lt.isChar() || rt.isChar()
+		temporal := func(t ColType) bool { return t.Kind == KindDate || t.Kind == KindTimestamp }
+		if temporal(lt) && temporal(rt) && (lt.Kind != rt.Kind || lt.TZ != rt.TZ) {
+			keyType[i] = timestampType(arrow.Second, "") // a date's unit
+			if isTimestampTZ(lt) || isTimestampTZ(rt) {
+				keyType[i].TZ = "UTC"
+			}
+		}
 	}
+	zone := env.zone()
 	keyOf := func(row map[string]Value, side func(equiPair) Expr) (string, bool, error) {
 		env.row = row
 		var b strings.Builder
@@ -810,6 +823,15 @@ func (e *executor) joinRows(env *evalEnv, kind string, left, right []map[string]
 			}
 			if char[i] && v.T.Kind == KindString && !v.Null {
 				v = Value{T: ColType{Kind: KindString, Fixed: true}, S: v.S}
+			}
+			if kt := keyType[i]; kt.Kind != KindNull && !v.Null && (v.T.Kind != kt.Kind || v.T.TZ != kt.TZ) {
+				// The value's own unit, so that nothing is rounded.
+				if v.T.Kind == KindTimestamp {
+					kt.Unit = v.T.Unit
+				}
+				if v, err = coerceIn(v, kt, zone); err != nil {
+					return "", false, nil // matches nothing, as compareIn
+				}
 			}
 			k, ok := joinKey(v)
 			if !ok {

@@ -14,12 +14,12 @@
 
 package redis
 
-// Time zone conversion: x AT TIME ZONE z (TIMEZONE(z, x)), x AT LOCAL
-// (TIMEZONE(x)) and CONVERT_TIMEZONE([src,] tgt, x).
+// Time zones: x AT TIME ZONE z (TIMEZONE(z, x)), x AT LOCAL (TIMEZONE(x)),
+// CONVERT_TIMEZONE([src,] tgt, x), and the session time zone (SET TIME
+// ZONE, the TimeZone parameter).
 //
-// The session time zone is UTC: a TIMESTAMP WITH TIME ZONE is an instant,
-// stored and shown in UTC, and a TIMESTAMP is a wall-clock time. As in
-// Postgres:
+// A TIMESTAMP WITH TIME ZONE is an instant, stored as UTC, and a TIMESTAMP
+// is a wall-clock time. As in Postgres:
 //
 //   - timestamp AT TIME ZONE z reads the timestamp as a local time in z and
 //     gives the instant (a timestamp with time zone);
@@ -40,19 +40,63 @@ package redis
 // A local time that a DST transition skips (02:30 on a spring-forward day)
 // is read with the offset before the transition, and one that it repeats
 // (01:30 on a fall-back day) with the offset after it, as Postgres does.
+//
+// The session time zone (UTC unless SET TIME ZONE or adbc.redis.time_zone
+// changes it) is where a timestamp with time zone is shown and read as
+// local time, as in Postgres: its text (casts, ||, TO_CHAR, JSON), text
+// without an offset read as one, conversions to and from TIMESTAMP and
+// DATE, its fields (EXTRACT, DATE_TRUNC, AGE, …), adding months and days to
+// one, CURRENT_DATE / LOCALTIMESTAMP / CURRENT_TIME, and AT LOCAL. Stored
+// values, Arrow results and index queries are UTC instants, whatever it is.
+// Code that has an evalEnv gets the zone from env.zone(); the functions
+// without one (Coerce, compareValues, Text) use UTC, and their …In forms
+// take the zone.
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	_ "time/tzdata" // the IANA zones, so that builds don't depend on the host's
+
+	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 // tzZone is a time zone: an IANA zone, or a fixed offset when loc is nil.
+// The zero value is UTC.
 type tzZone struct {
 	loc *time.Location
 	off int // fixed offset, seconds east of UTC
+	// abbr is a fixed offset's abbreviation, TO_CHAR's TZ ("" for UTC).
+	abbr string
+}
+
+// utcZone is UTC, the session time zone unless it is set.
+var utcZone = tzZone{}
+
+// isUTC reports whether the zone is UTC at every instant (so conversions
+// can be skipped).
+func (z tzZone) isUTC() bool {
+	return (z.loc == nil && z.off == 0) || z.loc == time.UTC
+}
+
+// abbrevAt is the zone's abbreviation at the instant utc (seconds since the
+// epoch), as TO_CHAR's TZ writes it: PST or PDT for America/Los_Angeles,
+// IST for Asia/Kolkata, UTC for UTC.
+func (z tzZone) abbrevAt(utc int64) string {
+	if z.loc != nil {
+		name, _ := time.Unix(utc, 0).In(z.loc).Zone()
+		return name
+	}
+	if z.abbr == "" && z.off == 0 {
+		return "UTC"
+	}
+	return z.abbr
 }
 
 // offsetAt is the zone's offset, in seconds east of UTC, at the instant
@@ -146,9 +190,23 @@ func resolveZone(name string) (tzZone, error) {
 }
 
 func lookupZone(name string) (tzZone, bool) {
-	if off, ok := zoneAbbrevs[strings.ToLower(name)]; ok {
-		return tzZone{off: off}, true
+	if z, ok := abbrevZone(name); ok {
+		return z, true
 	}
+	if z, ok := ianaZone(name); ok {
+		return z, true
+	}
+	return posixZone(name)
+}
+
+// abbrevZone is the zone of a time zone abbreviation (zoneAbbrevs).
+func abbrevZone(name string) (tzZone, bool) {
+	off, ok := zoneAbbrevs[strings.ToLower(name)]
+	return tzZone{off: off, abbr: strings.ToUpper(name)}, ok
+}
+
+// ianaZone is the IANA zone a name names, case-insensitive.
+func ianaZone(name string) (tzZone, bool) {
 	// time.LoadLocation reads "" as UTC and "Local" as the host's zone,
 	// neither of which is a zone name.
 	if name != "" && !strings.EqualFold(name, "local") {
@@ -158,10 +216,24 @@ func lookupZone(name string) (tzZone, bool) {
 			}
 		}
 	}
-	if off, ok := posixOffset(name); ok {
-		return tzZone{off: off}, true
-	}
 	return tzZone{}, false
+}
+
+// posixZone is the zone of a POSIX-style offset (posixOffset). Its
+// abbreviation is the name before the offset: UTC for 'UTC+5', +0530 for
+// '<+0530>-05:30'.
+func posixZone(name string) (tzZone, bool) {
+	off, ok := posixOffset(name)
+	if !ok {
+		return tzZone{}, false
+	}
+	abbr := name
+	if strings.HasPrefix(name, "<") {
+		abbr = name[1:strings.IndexByte(name, '>')]
+	} else if i := strings.IndexAny(name, "0123456789,+-"); i >= 0 {
+		abbr = name[:i]
+	}
+	return tzZone{off: off, abbr: strings.ToUpper(abbr)}, true
 }
 
 // zoneSpellings are the spellings of an IANA zone name to try, since zone
@@ -340,22 +412,34 @@ func convertTimezoneType(x ColType) ColType {
 }
 
 // atTimeZone evaluates TIMEZONE(z, x) (x AT TIME ZONE z), or with one
-// argument TIMEZONE(x) (x AT LOCAL: the session time zone, UTC). Arguments
-// are non-NULL; t is the result type.
-func atTimeZone(f *Func, args []Value, t ColType) (Value, error) {
-	zv, x := stringValue("UTC"), args[0]
-	if len(args) == 2 {
-		zv, x = args[0], args[1]
-	}
-	if !zoneTimestamp(x) || (zv.T.Kind != KindString && zv.T.Kind != KindInterval) {
+// argument TIMEZONE(x) (x AT LOCAL: the session time zone, session).
+// Arguments are non-NULL; t is the result type. A date or text is read as a
+// timestamp with time zone, in the session time zone.
+func atTimeZone(f *Func, args []Value, t ColType, session tzZone) (Value, error) {
+	z, x := session, args[len(args)-1]
+	if !zoneTimestamp(x) {
 		return Value{}, noSuchFunction(f.Name, false, argTypes(args))
 	}
-	var z tzZone
+	if len(args) == 2 {
+		var err error
+		switch zv := args[0]; zv.T.Kind {
+		case KindInterval:
+			z, err = intervalZone(zv)
+		case KindString:
+			z, err = resolveZone(zv.S)
+		default:
+			return Value{}, noSuchFunction(f.Name, false, argTypes(args))
+		}
+		if err != nil {
+			return Value{}, err
+		}
+	}
 	var err error
-	if zv.T.Kind == KindInterval {
-		z, err = intervalZone(zv)
-	} else {
-		z, err = resolveZone(zv.S)
+	switch x.T.Kind {
+	case KindString:
+		x, err = parseStringIn(x.S, typeTimestampTZ, session)
+	case KindDate:
+		x, err = coerceIn(x, typeTimestampTZ, session)
 	}
 	if err != nil {
 		return Value{}, err
@@ -406,4 +490,314 @@ func convertTimezone(f *Func, args []Value, t ColType) (Value, error) {
 	}
 	utc := src.localToUTC(tm.Unix())
 	return fromTime(time.Unix(utc+int64(tgt.offsetAt(utc)), int64(tm.Nanosecond())).UTC(), t)
+}
+
+// ---- the session time zone ----
+
+// pgEpoch is Postgres's epoch, 2000-01-01 00:00:00 UTC, in seconds since
+// the Unix epoch. Postgres rounds timestamps half away from it.
+const pgEpoch = 946684800
+
+// maxZoneOffset bounds a session time zone's offset, as Postgres's POSIX
+// parser does (hours up to 167).
+const maxZoneOffset = 168 * 3600
+
+// sessionZone resolves a value of the TimeZone parameter (SET TIME ZONE,
+// SET timezone, adbc.redis.time_zone) as Postgres's check_timezone does. It
+// returns the zone and the text SHOW shows:
+//
+//   - INTERVAL 'x' [qualifier], also as text: an offset east of Greenwich,
+//     without months or days. Shown as Postgres names such a zone,
+//     <+05:30>-05:30.
+//   - A number: hours east of Greenwich (SQL's sign, which is the reverse
+//     of POSIX's), shown the same way: -8 is <-08>+08.
+//   - An IANA zone name, case-insensitive, shown as the tz database spells
+//     it (america/new_york is America/New_York), then a POSIX-style offset
+//     ('UTC+5', west of Greenwich), shown in upper case.
+//   - Unlike Postgres, which refuses them here, a time zone abbreviation
+//     (zoneAbbrevs) that isn't also a zone name, as a fixed offset, shown in
+//     upper case: PST.
+//
+// Anything else is `invalid value for parameter "TimeZone": "x"`.
+func sessionZone(text string) (tzZone, string, error) {
+	invalid := func() (tzZone, string, error) {
+		return tzZone{}, "", invalidValue("TimeZone", text)
+	}
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) >= 8 && strings.EqualFold(trimmed[:8], "interval") {
+		return intervalSessionZone(text)
+	}
+	if hours, ok := zoneHours(trimmed); ok {
+		off := int(hours * 3600)
+		if off <= -maxZoneOffset || off >= maxZoneOffset {
+			return invalid()
+		}
+		return offsetSessionZone(off)
+	}
+	if z, ok := ianaZone(text); ok {
+		return z, canonicalZoneName(z.loc.String()), nil
+	}
+	if z, ok := posixZone(text); ok {
+		return z, strings.ToUpper(text), nil
+	}
+	if z, ok := abbrevZone(text); ok {
+		return z, strings.ToUpper(text), nil
+	}
+	return invalid()
+}
+
+// zoneDirs are where time.LoadLocation looks for zone files before the
+// tz database embedded in the driver (as in Go's zoneinfo_unix.go).
+var zoneDirs = []string{"/usr/share/zoneinfo/", "/usr/share/lib/zoneinfo/", "/usr/lib/locale/TZ/", "/etc/zoneinfo/"}
+
+// canonicalZoneName is the tz database's spelling of a zone name that
+// time.LoadLocation loaded. On a case-insensitive file system (macOS) it
+// loads a zone file in any case, so the spelling is looked up in the
+// directory listing, as Postgres looks up zone names. The embedded tz
+// database is case-sensitive: a name loaded from it is spelled right.
+func canonicalZoneName(name string) string {
+	dirs := zoneDirs
+	if z := os.Getenv("ZONEINFO"); z != "" {
+		dirs = append([]string{z}, dirs...)
+	}
+	for _, dir := range dirs {
+		if exact, ok := exactZonePath(dir, name); ok {
+			return exact
+		}
+	}
+	return name
+}
+
+// exactZonePath finds the file name names under dir, ignoring case, and
+// returns its path as spelled in the directory.
+func exactZonePath(dir, name string) (string, bool) {
+	parts := strings.Split(name, "/")
+	for i, part := range parts {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return "", false
+		}
+		found := ""
+		for _, e := range entries {
+			if e.Name() == part {
+				found = part
+				break
+			}
+			if found == "" && strings.EqualFold(e.Name(), part) {
+				found = e.Name()
+			}
+		}
+		if found == "" {
+			return "", false
+		}
+		parts[i] = found
+		dir = filepath.Join(dir, found)
+	}
+	return strings.Join(parts, "/"), true
+}
+
+// zoneHours reads a TimeZone value that is a number, as Postgres's strtod
+// does: hours, possibly with a fraction or an exponent.
+func zoneHours(s string) (float64, bool) {
+	digit := false
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+			digit = true
+		case c == '.' || c == '+' || c == '-' || c == 'e' || c == 'E':
+		default:
+			return 0, false
+		}
+	}
+	if !digit {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	return f, err == nil
+}
+
+// intervalSessionZone reads INTERVAL 'x' [qualifier] as a TimeZone value.
+func intervalSessionZone(text string) (tzZone, string, error) {
+	invalid := invalidValue("TimeZone", text)
+	x, err := parseExprText(text)
+	if err != nil {
+		return tzZone{}, "", invalid
+	}
+	v, err := (&evalEnv{}).eval(x)
+	if err != nil || v.Null || v.T.Kind != KindInterval {
+		return tzZone{}, "", invalid
+	}
+	shown := "INTERVAL '" + formatInterval(v) + "'"
+	switch {
+	case v.Months != 0:
+		return tzZone{}, "", errorf(adbc.StatusInvalidArgument,
+			"invalid value for parameter %q: %q (cannot specify months in time zone interval)", "TimeZone", shown)
+	case v.Days != 0:
+		return tzZone{}, "", errorf(adbc.StatusInvalidArgument,
+			"invalid value for parameter %q: %q (cannot specify days in time zone interval)", "TimeZone", shown)
+	}
+	off := int(v.I / int64(time.Second))
+	if off <= -maxZoneOffset || off >= maxZoneOffset {
+		return tzZone{}, "", invalidValue("TimeZone", shown)
+	}
+	return offsetSessionZone(off)
+}
+
+// offsetSessionZone is the session zone of a fixed offset (seconds east),
+// with the name Postgres gives it: <+05:30>-05:30 for 05:30 east, <-08>+08
+// for 8 hours west (POSIX's sign after the brackets).
+func offsetSessionZone(off int) (tzZone, string, error) {
+	abs := off
+	if abs < 0 {
+		abs = -abs
+	}
+	hm := fmt.Sprintf("%02d", abs/3600)
+	if r := abs % 3600; r != 0 {
+		hm += fmt.Sprintf(":%02d", r/60)
+		if r%60 != 0 {
+			hm += fmt.Sprintf(":%02d", r%60)
+		}
+	}
+	east, west := "+"+hm, "-"+hm
+	if off < 0 {
+		east, west = west, east
+	}
+	return tzZone{off: off, abbr: east}, "<" + east + ">" + west, nil
+}
+
+// errTimestampRange is the error for a timestamp that a time zone moves
+// out of the range of its unit.
+var errTimestampRange = errors.New("timestamp out of range")
+
+// localUnits converts v, units since the epoch of an instant (a timestamp
+// with time zone), to the local time in z, in the same units.
+func (z tzZone) localUnits(v int64, unit arrow.TimeUnit) (int64, error) {
+	if z.isUTC() {
+		return v, nil
+	}
+	per := unitsPerSecond[unit]
+	d := int64(z.offsetAt(floorDiv(v, per))) * per
+	r := v + d
+	if (d > 0) != (r > v) && d != 0 {
+		return 0, errTimestampRange
+	}
+	return r, nil
+}
+
+// utcUnits converts a local time in z (units since the epoch, read as if
+// it were UTC) to the instant, in the same units, resolving DST gaps and
+// overlaps as Postgres does (localToUTC).
+func (z tzZone) utcUnits(local int64, unit arrow.TimeUnit) (int64, error) {
+	if z.isUTC() {
+		return local, nil
+	}
+	per := unitsPerSecond[unit]
+	sec := floorDiv(local, per)
+	d := (z.localToUTC(sec) - sec) * per
+	r := local + d
+	if (d > 0) != (r > local) && d != 0 {
+		return 0, errTimestampRange
+	}
+	return r, nil
+}
+
+// localTime is the local time in z of an instant, as a time.Time in UTC
+// with the local wall clock.
+func (z tzZone) localTime(tm time.Time) time.Time {
+	if z.isUTC() {
+		return tm
+	}
+	return tm.Add(time.Duration(z.offsetAt(tm.Unix())) * time.Second)
+}
+
+// instant is the instant of a local wall-clock time in z (a time.Time in
+// UTC), resolving DST gaps and overlaps as Postgres does.
+func (z tzZone) instant(local time.Time) time.Time {
+	if z.isUTC() {
+		return local
+	}
+	return time.Unix(z.localToUTC(local.Unix()), int64(local.Nanosecond())).UTC()
+}
+
+// localFields is the wall-clock time of a date/time value whose fields
+// (year, hour, …) a function reads: a timestamp with time zone's local time
+// in z, and the others' own (toTime).
+func localFields(v Value, z tzZone) (time.Time, error) {
+	tm, err := toTime(v)
+	if err == nil && v.T.Kind == KindTimestamp && v.T.TZ != "" {
+		tm = z.localTime(tm)
+	}
+	return tm, err
+}
+
+// addIntervalIn adds an interval to an instant as Postgres adds one to a
+// timestamp with time zone: months, then days, on the local time in z (each
+// read back with Postgres's DST rule), then the time as elapsed time. So a
+// day is 23 or 25 hours across a DST transition.
+func addIntervalIn(tm time.Time, iv Value, z tzZone) time.Time {
+	if z.isUTC() {
+		return addInterval(tm, iv)
+	}
+	if iv.Months != 0 {
+		tm = z.instant(addMonths(z.localTime(tm), int(iv.Months)))
+	}
+	if iv.Days != 0 {
+		tm = z.instant(z.localTime(tm).AddDate(0, 0, int(iv.Days)))
+	}
+	return tm.Add(time.Duration(iv.I))
+}
+
+// offsetRange is the least and the greatest offset (seconds east of UTC)
+// the zone has within span seconds of the instant utc.
+func (z tzZone) offsetRange(utc, span int64) (int, int) {
+	if z.loc == nil {
+		return z.off, z.off
+	}
+	lo, hi := z.offsetAt(utc), z.offsetAt(utc)
+	t := utc - span
+	for range 64 {
+		tm := time.Unix(t, 0).In(z.loc)
+		_, off := tm.Zone()
+		lo, hi = min(lo, off), max(hi, off)
+		_, end := tm.ZoneBounds()
+		if end.IsZero() || end.Unix() > utc+span {
+			break
+		}
+		t = end.Unix()
+	}
+	return lo, hi
+}
+
+// localBounds is for index queries on a TIMESTAMP or DATE column of type
+// ct compared with a TIMESTAMP WITH TIME ZONE cv, in a session time zone z
+// other than UTC (ok is false otherwise). Postgres reads each row's value
+// as a local time in z, which isn't monotonic (a local time in a DST gap
+// reads as a later instant than the times just after the gap), so cv can't
+// simply be converted to a local time: lo and hi (stored values) bound the
+// local times that read as cv, from cv's local time with the least and
+// the greatest offset z has around it. A row with a value below lo reads
+// as an instant before cv, one above hi as one after it; the comparison is
+// re-checked on the rows between. err is set if a bound is out of range.
+func localBounds(cv Value, ct ColType, z tzZone) (lo, hi string, ok bool, err error) {
+	if !isTimestampTZ(cv.T) || z.isUTC() || !(ct.Kind == KindDate || (ct.Kind == KindTimestamp && ct.TZ == "")) {
+		return "", "", false, nil
+	}
+	per := unitsPerSecond[cv.T.Unit]
+	offLo, offHi := z.offsetRange(floorDiv(cv.I, per), 2*86400)
+	bound := func(off int) (string, error) {
+		d := int64(off) * per
+		local := cv.I + d
+		if (d > 0) != (local > cv.I) && d != 0 {
+			return "", errTimestampRange
+		}
+		v, err := Coerce(intValue(timestampType(cv.T.Unit, ""), local), ct)
+		if err != nil {
+			return "", err
+		}
+		return encodeStored(v), nil
+	}
+	if lo, err = bound(offLo); err == nil {
+		hi, err = bound(offHi)
+	}
+	return lo, hi, true, err
 }

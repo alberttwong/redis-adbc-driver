@@ -168,8 +168,8 @@ func errTooManySeriesRows() error {
 }
 
 // generateSeries returns the values of GENERATE_SERIES(args) for column type
-// t (from seriesType).
-func generateSeries(t ColType, args []Value) ([]Value, error) {
+// t (from seriesType), in the session time zone z.
+func generateSeries(t ColType, args []Value, z tzZone) ([]Value, error) {
 	for _, a := range args {
 		if a.Null {
 			return nil, nil
@@ -180,7 +180,7 @@ func generateSeries(t ColType, args []Value) ([]Value, error) {
 		step = args[2]
 	}
 	if t.Kind == KindTimestamp {
-		return timestampSeries(t, args[0], args[1], step)
+		return timestampSeries(t, args[0], args[1], step, z)
 	}
 	vals := make([]Value, 3)
 	for i, a := range []Value{args[0], args[1], step} {
@@ -263,13 +263,16 @@ func generateSeries(t ColType, args []Value) ([]Value, error) {
 	return out, nil
 }
 
-// timestampSeries adds the interval step to start until it passes stop.
-func timestampSeries(t ColType, start, stop, step Value) ([]Value, error) {
+// timestampSeries adds the interval step to start until it passes stop. For
+// a timestamp with time zone, months and days are added in the session time
+// zone z, as Postgres does (addIntervalIn), and text and dates are local
+// times there.
+func timestampSeries(t ColType, start, stop, step Value, z tzZone) ([]Value, error) {
 	var err error
-	if start, err = Coerce(start, t); err != nil {
+	if start, err = coerceIn(start, t, z); err != nil {
 		return nil, invalidArg(err)
 	}
-	if stop, err = Coerce(stop, t); err != nil {
+	if stop, err = coerceIn(stop, t, z); err != nil {
 		return nil, invalidArg(err)
 	}
 	if step, err = Coerce(step, typeInterval); err != nil {
@@ -297,7 +300,11 @@ func timestampSeries(t ColType, start, stop, step Value) ([]Value, error) {
 			return nil, invalidArg(err)
 		}
 		out = append(out, v)
-		cur = addInterval(cur, step)
+		if t.TZ != "" {
+			cur = addIntervalIn(cur, step, z)
+		} else {
+			cur = addInterval(cur, step)
+		}
 	}
 	return out, nil
 }

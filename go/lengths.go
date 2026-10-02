@@ -139,18 +139,19 @@ func cutRunes(s string, n int) (string, bool) {
 	return s, false
 }
 
-// castValue is CAST(v AS t): Coerce, except that a cast to a bounded string
-// type cuts the text to its length, as Postgres's explicit casts do.
-func castValue(v Value, t ColType) (Value, error) {
+// castValue is CAST(v AS t) in the session time zone z: coerceIn, except
+// that a cast to a bounded string type cuts the text to its length, as
+// Postgres's explicit casts do.
+func castValue(v Value, t ColType, z tzZone) (Value, error) {
 	if t.Kind != KindString || t.Length == 0 || v.Null {
-		return Coerce(v, t)
+		return coerceIn(v, t, z)
 	}
-	s, err := Coerce(v, ColType{Kind: KindString, Fixed: t.Fixed})
+	s, err := coerceIn(v, ColType{Kind: KindString, Fixed: t.Fixed}, z)
 	if err != nil {
 		return Value{}, err
 	}
 	s.S, _ = cutRunes(s.S, int(t.Length))
-	return Coerce(s, t)
+	return coerceIn(s, t, z)
 }
 
 // fitLength checks a value (already coerced to t) that is written to a

@@ -228,7 +228,7 @@ func TestSQLSetLocal(t *testing.T) {
 
 	// SET LOCAL checks its parameter and value even where it has no effect.
 	h.expectErrorText(`SET LOCAL nosuch = 1`, `unrecognized configuration parameter "nosuch"`)
-	h.expectErrorText(`SET LOCAL TIME ZONE 'Europe/Paris'`, `invalid value for parameter "TimeZone": "Europe/Paris" (only UTC is supported)`)
+	h.expectErrorText(`SET LOCAL TIME ZONE 'Mars/Base'`, `invalid value for parameter "TimeZone": "Mars/Base"`)
 }
 
 // The parameters SET, RESET and SHOW accept, with their values.
@@ -290,7 +290,7 @@ func TestSQLSetParameters(t *testing.T) {
 		`search_path|public|Sets the schema for unqualified names: the first schema of the list, skipping "$user", pg_catalog and pg_temp (adbc.redis.default_schema by default).`,
 		`standard_conforming_strings|on|'...' strings treat backslashes literally. Only on is supported.`,
 		`statement_timeout|0|Maximum allowed duration of any statement. Accepted and shown, not enforced.`,
-		`TimeZone|UTC|Time zone for displaying and interpreting time stamps. Only UTC is supported.`)
+		`TimeZone|UTC|Time zone for displaying and interpreting time stamps (adbc.redis.time_zone, UTC by default).`)
 
 	// ExecuteSchema of SHOW gives its column.
 	for sql, cols := range map[string]string{`SHOW datestyle`: "DateStyle", `SHOW ALL`: "name|setting|description"} {
@@ -304,10 +304,10 @@ func TestSQLSetParameters(t *testing.T) {
 	}
 
 	for _, c := range []struct{ sql, want string }{
-		{`SET TIME ZONE 'Europe/Paris'`, `invalid value for parameter "TimeZone": "Europe/Paris" (only UTC is supported)`},
-		{`SET TIME ZONE -7`, `invalid value for parameter "TimeZone": "-7" (only UTC is supported)`},
-		{`SET TIME ZONE INTERVAL '-08:00' HOUR TO MINUTE`, `invalid value for parameter "TimeZone": "INTERVAL '-08:00' HOUR TO MINUTE" (only UTC is supported)`},
-		{`SET timezone = 'America/New_York'`, `invalid value for parameter "TimeZone": "America/New_York" (only UTC is supported)`},
+		{`SET TIME ZONE 'Europe/Pariss'`, `invalid value for parameter "TimeZone": "Europe/Pariss"`},
+		{`SET TIME ZONE 200`, `invalid value for parameter "TimeZone": "200"`},
+		{`SET TIME ZONE INTERVAL '1 day'`, `invalid value for parameter "TimeZone": "INTERVAL '1 day'" (cannot specify days in time zone interval)`},
+		{`SET timezone = 'America/New York'`, `invalid value for parameter "TimeZone": "America/New York"`},
 		{`SET timezone = 'UTC', 'GMT'`, `SET TimeZone takes only one argument`},
 		{`SET client_encoding = 'LATIN1'`, `invalid value for parameter "client_encoding": "LATIN1" (only UTF8 is supported)`},
 		{`SET NAMES 'SQL_ASCII'`, `invalid value for parameter "client_encoding": "SQL_ASCII" (only UTF8 is supported)`},

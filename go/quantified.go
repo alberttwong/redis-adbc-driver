@@ -94,7 +94,7 @@ func (env *evalEnv) evalQuantified(sq *Subquery, rows [][]Value) (Value, error) 
 			if (sq.Op == ">" || sq.Op == ">=") == all {
 				bound = q.max
 			}
-			v, err := binaryOp(sq.Op, x, bound)
+			v, err := binaryOp(sq.Op, x, bound, env.zone())
 			if err != nil {
 				return Value{}, err
 			}
@@ -109,7 +109,7 @@ func (env *evalEnv) evalQuantified(sq *Subquery, rows [][]Value) (Value, error) 
 	}
 	sawNull := false
 	for _, r := range rows {
-		v, err := binaryOp(sq.Op, x, r[0])
+		v, err := binaryOp(sq.Op, x, r[0], env.zone())
 		if err != nil {
 			return Value{}, err
 		}

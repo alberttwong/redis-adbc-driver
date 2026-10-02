@@ -55,6 +55,7 @@ type tracer struct {
 	mark, unmark Value
 	markType     ColType
 	traces       []trace // per result row
+	zone         tzZone  // the session time zone of the path's text
 }
 
 // trace is what a row's SEARCH and CYCLE columns are computed from.
@@ -111,7 +112,7 @@ func (e *executor) newTracer(ctx context.Context, def *CTE, rc *recursionCheck, 
 		}
 		return out, nil
 	}
-	tr := &tracer{def: def, mark: boolValue(true), unmark: boolValue(false), markType: typeBool}
+	tr := &tracer{def: def, mark: boolValue(true), unmark: boolValue(false), markType: typeBool, zone: e.zone()}
 	var err error
 	if s := def.Search; s != nil {
 		if tr.search, err = positions("search", s.By); err != nil {
@@ -285,7 +286,7 @@ func (tr *tracer) finish(rows [][]Value) [][]Value {
 			if tr.traces[i].cycle {
 				mark = tr.mark
 			}
-			row = append(row, mark, stringValue(pathText(tr.traces[i].path)))
+			row = append(row, mark, stringValue(pathText(tr.traces[i].path, tr.zone)))
 		}
 		out[i] = row
 	}
@@ -317,7 +318,7 @@ func compareTuples(a, b [][]Value) int {
 
 // pathText renders rows like Postgres's text of an array of records:
 // {(1,a),"(2,b c)"}.
-func pathText(path [][]Value) string {
+func pathText(path [][]Value, z tzZone) string {
 	quote := func(s, special string) bool {
 		if s == "" {
 			return true
@@ -344,7 +345,7 @@ func pathText(path [][]Value) string {
 			if v.Null {
 				continue
 			}
-			s := v.Text()
+			s := v.textIn(z)
 			if !quote(s, `"\(),`) {
 				rec.WriteString(s)
 				continue

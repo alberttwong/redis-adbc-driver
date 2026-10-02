@@ -273,6 +273,7 @@ var funcDefs = []funcDef{
 	{name: "LOCALTIME", min: 0, max: 1, impl: implDateTime},
 	{name: "DATE_PART", min: 2, max: 2, impl: implDateTime}, // also EXTRACT(field FROM x)
 	{name: "DATE_TRUNC", min: 2, max: 2, impl: implDateTime},
+	{name: "DATE_BIN", min: 3, max: 3, impl: implDateTime},
 	{name: "YEAR", min: 1, max: 1, impl: implDateTime},
 	{name: "QUARTER", min: 1, max: 1, impl: implDateTime},
 	{name: "MONTH", min: 1, max: 1, impl: implDateTime},

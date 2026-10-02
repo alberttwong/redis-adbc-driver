@@ -194,6 +194,28 @@ func convertUnit(v int64, from, to arrow.TimeUnit) (int64, error) {
 	return floorDiv(v, f/t), nil
 }
 
+// roundUnit converts v from unit `from` to unit `to`. To a coarser unit it
+// rounds half away from epoch (seconds since the Unix epoch), as Postgres
+// rounds a value to a lower precision (AdjustTimestampForTypmod and
+// AdjustTimeForTypmod round half away from zero, and Postgres's timestamps
+// count from 2000-01-01, pgEpoch; times from midnight, 0). A carry moves
+// into the next second, minute, day or year.
+func roundUnit(v int64, from, to arrow.TimeUnit, epoch int64) (int64, error) {
+	f, t := unitsPerSecond[from], unitsPerSecond[to]
+	if t >= f {
+		return convertUnit(v, from, to)
+	}
+	k := f / t
+	q, r := v/k, v%k
+	if r < 0 {
+		q, r = q-1, r+k
+	}
+	if 2*r > k || (2*r == k && v > epoch*f) {
+		q++
+	}
+	return q, nil
+}
+
 // secondsNanosToUnit combines seconds and nanoseconds into a count of units
 // without intermediate overflow.
 func secondsNanosToUnit(sec, nanos int64, unit arrow.TimeUnit) (int64, error) {
@@ -390,14 +412,50 @@ func unitForDigits(digits int) arrow.TimeUnit {
 	return arrow.Microsecond
 }
 
+// pgMicros is a fraction of a second (nanoseconds) in microseconds as
+// Postgres reads one from text: rint(fraction × 10⁶), with the fraction as
+// a double, so that an exact half rounds to even (.0000005 is 0, .0000015
+// is 2, .1234565 is .123456). It is 1,000,000 for .9999995.
+func pgMicros(nanos int64) int64 {
+	return int64(math.RoundToEven(float64(nanos) / 1e9 * 1e6))
+}
+
+// inMicros is a time or timestamp read from text with more than 6 digits
+// (in nanoseconds) as Postgres reads it, in microseconds (pgMicros).
+func inMicros(v Value) Value {
+	if v.T.Unit != arrow.Nanosecond {
+		return v
+	}
+	sec, nanos := splitUnits(v.I, arrow.Nanosecond)
+	v.T.Unit, v.I = arrow.Microsecond, sec*1_000_000+pgMicros(nanos)
+	return v
+}
+
 // timestampLiteral builds a timestamp value from a SQL literal string.
 func timestampLiteral(s string, withTZ bool) (Value, error) {
-	sec, nanos, digits, _, err := parseTimestamp(s)
+	return timestampLiteralIn(s, withTZ, utcZone)
+}
+
+// timestampLiteralIn is timestampLiteral in the session time zone z: text
+// without an offset read as a timestamp with time zone is a local time in
+// z. The unit has the fraction's digits (microseconds, or nanoseconds for
+// more than 6).
+func timestampLiteralIn(s string, withTZ bool, z tzZone) (Value, error) {
+	sec, nanos, digits, hasTZ, err := parseTimestamp(s)
 	if err != nil {
 		return Value{}, err
 	}
+	if withTZ && !hasTZ {
+		sec = z.localToUTC(sec)
+	}
 	unit := unitForDigits(digits)
 	v, err := secondsNanosToUnit(sec, nanos, unit)
+	if err != nil && unit == arrow.Nanosecond {
+		// Outside the nanoseconds' range (1677 to 2262): microseconds, as
+		// Postgres reads them.
+		unit = arrow.Microsecond
+		v, err = secondsNanosToUnit(sec, pgMicros(nanos)*1000, unit)
+	}
 	if err != nil {
 		return Value{}, err
 	}
@@ -462,9 +520,10 @@ func numberLiteral(text string) (Value, error) {
 // DateStyle ISO, whatever the declared precision: seconds always, then the
 // fraction without trailing zeros (and no "." when it is zero), so
 // 2024-01-10 10:00:00 and 2024-01-10 10:00:00.5. A timestamp with time zone
-// has its offset (+00: the session time zone is UTC). A year before 1 AD is
-// written as its BC year (astronomical year 0 is 0001-01-01 BC), and a year
-// past 9999 with all its digits.
+// is its local time in the session time zone, with that zone's offset
+// (2024-01-10 02:00:00-08; +00 in UTC). A year before 1 AD is written as
+// its BC year (astronomical year 0 is 0001-01-01 BC), and a year past 9999
+// with all its digits.
 
 // splitUnits splits v units since the epoch (or midnight) into whole
 // seconds and nanoseconds.
@@ -550,8 +609,14 @@ func formatTime(v int64, unit arrow.TimeUnit) string {
 	return fmt.Sprintf("%02d:%02d:%02d", sec/3600, (sec%3600)/60, sec%60) + fractionText(nanos)
 }
 
-// Text renders a value the way CAST(x AS VARCHAR) would.
-func (v Value) Text() string {
+// Text renders a value the way CAST(x AS VARCHAR) would in the time zone
+// UTC.
+func (v Value) Text() string { return v.textIn(utcZone) }
+
+// textIn renders a value the way CAST(x AS VARCHAR) does in the session
+// time zone z: a timestamp with time zone is its local time in z, with
+// z's offset at that instant.
+func (v Value) textIn(z tzZone) string {
 	switch v.T.Kind {
 	case KindBool:
 		if v.I != 0 {
@@ -578,11 +643,20 @@ func (v Value) Text() string {
 	case KindTime:
 		return formatTime(v.I, v.T.Unit)
 	case KindTimestamp:
-		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", 0, false)
+		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", v.offsetIn(z), false)
 	case KindInterval:
 		return formatInterval(v)
 	}
 	return ""
+}
+
+// offsetIn is the offset (seconds east of UTC) a timestamp with time zone
+// is shown with in the session time zone z, and 0 for other values.
+func (v Value) offsetIn(z tzZone) int {
+	if v.T.Kind != KindTimestamp || v.T.TZ == "" || z.isUTC() {
+		return 0
+	}
+	return z.offsetAt(floorDiv(v.I, unitsPerSecond[v.T.Unit]))
 }
 
 // ---- coercion ----
@@ -610,21 +684,31 @@ func (v Value) asFloat() (float64, bool) {
 	return 0, false
 }
 
-// Coerce converts a value to the given type, as done on INSERT and CAST.
-func Coerce(v Value, t ColType) (Value, error) {
+// Coerce converts a value to the given type, as done on INSERT and CAST,
+// in the time zone UTC (see coerceIn).
+func Coerce(v Value, t ColType) (Value, error) { return coerceIn(v, t, utcZone) }
+
+// coerceIn converts a value to the given type, as done on INSERT and CAST,
+// in the session time zone z, as Postgres converts in its session time
+// zone: a TIMESTAMP becomes a TIMESTAMP WITH TIME ZONE as a local time in
+// z, a TIMESTAMP WITH TIME ZONE becomes its local time (also as a DATE or a
+// TIME), a DATE is local midnight, text without an offset is read as a
+// local time, and a timestamp with time zone as text has z's offset. A time
+// or timestamp of a lower precision is rounded (roundUnit).
+func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 	if v.Null || t.Kind == KindNull {
 		return nullValue(t), nil
 	}
 	fail := func() (Value, error) {
-		return Value{}, fmt.Errorf("cannot convert %s value %q to %s", v.T.Kind, v.Text(), t.SQLName())
+		return Value{}, fmt.Errorf("cannot convert %s value %q to %s", v.T.Kind, v.textIn(z), t.SQLName())
 	}
 	// Parse strings into the target type first.
 	if v.T.Kind == KindString && t.Kind != KindString && t.Kind != KindBinary {
-		parsed, err := parseString(v.S, t)
+		parsed, err := parseStringIn(v.S, t, z)
 		if err != nil {
 			return Value{}, err
 		}
-		return Coerce(parsed, t)
+		return coerceIn(parsed, t, z)
 	}
 	switch t.Kind {
 	case KindBool:
@@ -700,11 +784,11 @@ func Coerce(v Value, t ColType) (Value, error) {
 		case t.Fixed && v.T.isChar():
 			return charValue(v.S, t), nil
 		case t.Fixed:
-			return charValue(v.Text(), t), nil
+			return charValue(v.textIn(z), t), nil
 		case v.T.Kind == KindString && !v.T.Fixed:
 			return v, nil
 		}
-		return stringValue(v.Text()), nil
+		return stringValue(v.textIn(z)), nil
 	case KindBinary:
 		if v.T.Kind == KindBinary || v.T.Kind == KindString {
 			return binaryValue(v.S), nil
@@ -714,19 +798,29 @@ func Coerce(v Value, t ColType) (Value, error) {
 		case KindDate:
 			return v, nil
 		case KindTimestamp:
-			return dateValue(floorDiv(v.I, unitsPerSecond[v.T.Unit]*86400))
+			local, err := v.wallClock(z)
+			if err != nil {
+				return Value{}, err
+			}
+			return dateValue(floorDiv(local, unitsPerSecond[v.T.Unit]*86400))
 		}
 	case KindTime:
 		if v.T.Kind == KindTime {
-			i, err := convertUnit(v.I, v.T.Unit, t.Unit)
+			i, err := roundUnit(v.I, v.T.Unit, t.Unit, 0)
 			if err != nil {
 				return Value{}, err
 			}
 			return intValue(t, i), nil
 		}
 		if v.T.Kind == KindTimestamp {
+			// The time of day, rounded: 23:59:59.9 is 24:00:00 in TIME(0),
+			// as in Postgres.
+			local, err := v.wallClock(z)
+			if err != nil {
+				return Value{}, err
+			}
 			per := unitsPerSecond[v.T.Unit] * 86400
-			i, err := convertUnit(v.I-floorDiv(v.I, per)*per, v.T.Unit, t.Unit)
+			i, err := roundUnit(local-floorDiv(local, per)*per, v.T.Unit, t.Unit, 0)
 			if err != nil {
 				return Value{}, err
 			}
@@ -739,13 +833,25 @@ func Coerce(v Value, t ColType) (Value, error) {
 	case KindTimestamp:
 		switch v.T.Kind {
 		case KindTimestamp:
-			i, err := convertUnit(v.I, v.T.Unit, t.Unit)
+			i, err := v.I, error(nil)
+			switch {
+			case v.T.TZ == "" && t.TZ != "":
+				i, err = z.utcUnits(i, v.T.Unit)
+			case v.T.TZ != "" && t.TZ == "":
+				i, err = z.localUnits(i, v.T.Unit)
+			}
+			if err == nil {
+				i, err = roundUnit(i, v.T.Unit, t.Unit, pgEpoch)
+			}
 			if err != nil {
 				return Value{}, err
 			}
 			return intValue(t, i), nil
 		case KindDate:
 			i, err := secondsNanosToUnit(v.I*86400, 0, t.Unit)
+			if err == nil && t.TZ != "" {
+				i, err = z.utcUnits(i, t.Unit) // local midnight
+			}
 			if err != nil {
 				return Value{}, err
 			}
@@ -753,6 +859,16 @@ func Coerce(v Value, t ColType) (Value, error) {
 		}
 	}
 	return fail()
+}
+
+// wallClock is a timestamp's wall-clock time in units since the epoch: its
+// own for a TIMESTAMP, and for a TIMESTAMP WITH TIME ZONE the local time in
+// the session time zone z.
+func (v Value) wallClock(z tzZone) (int64, error) {
+	if v.T.TZ == "" {
+		return v.I, nil
+	}
+	return z.localUnits(v.I, v.T.Unit)
 }
 
 // castable reports whether Coerce converts some values of type from to type
@@ -775,7 +891,15 @@ func castable(from, to ColType) bool {
 }
 
 // parseString converts text into a value of the given type.
-func parseString(s string, t ColType) (Value, error) {
+func parseString(s string, t ColType) (Value, error) { return parseStringIn(s, t, utcZone) }
+
+// parseStringIn converts text into a value of the given type, reading a
+// timestamp with time zone without an offset as a local time in the
+// session time zone z. Times and timestamps have the precision written
+// (timestampLiteral), not t's; for a t of microseconds or fewer, text with
+// more digits is read as Postgres reads it, in microseconds (pgMicros),
+// before it is rounded to t (so '….4999995' is 10:00:01 in TIMESTAMP(0)).
+func parseStringIn(s string, t ColType, z tzZone) (Value, error) {
 	trimmed := strings.TrimSpace(s)
 	switch t.Kind {
 	case KindBool:
@@ -801,10 +925,18 @@ func parseString(s string, t ColType) (Value, error) {
 			return timestampLiteral(trimmed, false)
 		}
 		return dateLiteral(trimmed)
-	case KindTime:
-		return timeLiteral(trimmed)
-	case KindTimestamp:
-		return timestampLiteral(trimmed, t.TZ != "")
+	case KindTime, KindTimestamp:
+		var v Value
+		var err error
+		if t.Kind == KindTime {
+			v, err = timeLiteral(trimmed)
+		} else {
+			v, err = timestampLiteralIn(trimmed, t.TZ != "", z)
+		}
+		if err == nil && t.Unit != arrow.Nanosecond {
+			v = inMicros(v)
+		}
+		return v, err
 	case KindInterval:
 		return intervalLiteral(trimmed)
 	}
@@ -880,9 +1012,26 @@ func decodeStored(s string, t ColType) (Value, error) {
 
 // ---- comparison ----
 
-// compareValues compares two non-null values; ok is false when the values
-// are not comparable.
-func compareValues(a, b Value) (int, bool) {
+// compareValues compares two non-null values in the time zone UTC (see
+// compareIn); ok is false when the values are not comparable.
+func compareValues(a, b Value) (int, bool) { return compareIn(a, b, utcZone) }
+
+// textOperand converts text compared with a value of type t to t's type,
+// in the session time zone z. A time or timestamp keeps the precision
+// written, as Postgres compares at full precision: '10:00:00.5' is not
+// equal to a TIMESTAMP(0) of 10:00:01 or 10:00:00.
+func textOperand(s Value, t ColType, z tzZone) (Value, error) {
+	if t.Kind == KindTime || t.Kind == KindTimestamp {
+		return parseStringIn(s.S, t, z)
+	}
+	return coerceIn(s, t, z)
+}
+
+// compareIn compares two non-null values in the session time zone z, which
+// reads text compared with a timestamp with time zone, and a TIMESTAMP or
+// DATE compared with one, as local times; ok is false when the values are
+// not comparable.
+func compareIn(a, b Value, z tzZone) (int, bool) {
 	ak, bk := a.T.Kind, b.T.Kind
 	switch {
 	case ak == KindInterval && bk == KindInterval:
@@ -900,17 +1049,17 @@ func compareValues(a, b Value) (int, bool) {
 		}
 		return bytes.Compare([]byte(as), []byte(bs)), true
 	case ak == KindString && bk != KindString:
-		pb, err := Coerce(a, b.T)
+		pa, err := textOperand(a, b.T, z)
 		if err != nil {
 			return 0, false
 		}
-		return compareValues(pb, b)
+		return compareIn(pa, b, z)
 	case bk == KindString && ak != KindString:
-		pa, err := Coerce(b, a.T)
+		pb, err := textOperand(b, a.T, z)
 		if err != nil {
 			return 0, false
 		}
-		return compareValues(a, pa)
+		return compareIn(a, pb, z)
 	case (ak.isInteger() || ak == KindBool) && (bk.isInteger() || bk == KindBool):
 		return cmpInt(a.I, b.I), true
 	case ak == KindDecimal || bk == KindDecimal:
@@ -933,24 +1082,35 @@ func compareValues(a, b Value) (int, bool) {
 	case ak == bk && (ak == KindDate):
 		return cmpInt(a.I, b.I), true
 	case (ak == KindTime && bk == KindTime) || (ak == KindTimestamp && bk == KindTimestamp):
-		u := a.T.Unit
-		if unitsPerSecond[b.T.Unit] > unitsPerSecond[u] {
-			u = b.T.Unit
+		if ak == KindTimestamp && (a.T.TZ == "") != (b.T.TZ == "") {
+			// A TIMESTAMP compared with a TIMESTAMP WITH TIME ZONE is a
+			// local time in z.
+			var err error
+			if a.T.TZ == "" {
+				a, err = coerceIn(a, timestampType(a.T.Unit, "UTC"), z)
+			} else {
+				b, err = coerceIn(b, timestampType(b.T.Unit, "UTC"), z)
+			}
+			if err != nil {
+				return 0, false
+			}
 		}
-		ai, err1 := convertUnit(a.I, a.T.Unit, u)
-		bi, err2 := convertUnit(b.I, b.T.Unit, u)
-		if err1 != nil || err2 != nil {
-			return 0, false
+		// Seconds, then nanoseconds: exact for any units and range (a BC
+		// timestamp has no nanoseconds' count).
+		as, an := splitUnits(a.I, a.T.Unit)
+		bs, bn := splitUnits(b.I, b.T.Unit)
+		if c := cmpInt(as, bs); c != 0 {
+			return c, true
 		}
-		return cmpInt(ai, bi), true
+		return cmpInt(an, bn), true
 	case ak == KindTimestamp && bk == KindDate:
-		pb, err := Coerce(b, a.T)
+		pb, err := coerceIn(b, a.T, z)
 		if err != nil {
 			return 0, false
 		}
 		return cmpInt(a.I, pb.I), true
 	case ak == KindDate && bk == KindTimestamp:
-		pa, err := Coerce(a, b.T)
+		pa, err := coerceIn(a, b.T, z)
 		if err != nil {
 			return 0, false
 		}

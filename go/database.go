@@ -39,6 +39,8 @@ type databaseImpl struct {
 	// timeouts are adbc.redis.read_timeout and write_timeout (see
 	// timeout.go).
 	timeouts timeoutSettings
+	// timeZone is adbc.redis.time_zone (text "" if not set).
+	timeZone paramValue
 }
 
 // clientOptions returns the go-redis options from the URI, or the address,
@@ -109,7 +111,7 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 	conn := &connectionImpl{
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 		store:              st,
-		sess:               newSession(d.schema),
+		sess:               d.newSession(),
 		pushdown:           d.pushdown,
 		rekey:              d.rekey,
 		clientOpts:         opts,
@@ -209,6 +211,11 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 			return formatTimeout(t.read), nil
 		}
 		return formatTimeout(t.write), nil
+	case OptionStringTimeZone:
+		if d.timeZone.text == "" {
+			return utcParam.text, nil
+		}
+		return d.timeZone.text, nil
 	}
 	return d.DatabaseImplBase.GetOption(ctx, key)
 }
@@ -265,10 +272,25 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 		} else {
 			d.timeouts.write = &t
 		}
+	case OptionStringTimeZone:
+		tz, err := timeZoneParam(value)
+		if err != nil {
+			return err
+		}
+		d.timeZone = tz
 	default:
 		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}
 	return nil
+}
+
+// newSession is a new connection's settings.
+func (d *databaseImpl) newSession() *session {
+	s := newSession(d.schema)
+	if d.timeZone.text != "" {
+		s.defaultZone = d.timeZone
+	}
+	return s
 }
 
 func (d *databaseImpl) SetOptions(ctx context.Context, options map[string]string) error {

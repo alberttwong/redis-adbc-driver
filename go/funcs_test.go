@@ -85,6 +85,7 @@ var funcSamples = map[string]string{
 	"TO_DATE": "TO_DATE('2024-01-02', 'YYYY-MM-DD')", "TO_CHAR": "TO_CHAR(DATE '2024-01-02', 'YYYY')",
 	"TIMEZONE":         "TIMESTAMP '2024-01-02 03:04:05' AT TIME ZONE 'America/New_York'",
 	"CONVERT_TIMEZONE": "CONVERT_TIMEZONE('UTC', 'America/New_York', TIMESTAMP '2024-01-02 03:04:05')",
+	"DATE_BIN":         "DATE_BIN(INTERVAL '15 minutes', TIMESTAMP '2024-01-02 03:04:05', TIMESTAMP '2024-01-01')",
 	"__INTERVAL":       "INTERVAL 7 DAY",
 	// JSON
 	"->": `'{"a": 1}' -> 'a'`, "->>": `'{"a": 1}' ->> 'a'`, "#>": `'{"a": [1]}' #> '{a,0}'`, "#>>": `'{"a": [1]}' #>> '{a,0}'`,

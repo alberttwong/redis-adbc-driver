@@ -31,9 +31,9 @@ package redis
 //   - SET [SESSION | LOCAL] name {= | TO} value | DEFAULT, RESET and SHOW
 //     work on the parameters in the settings table below; other names are
 //     errors (unrecognized configuration parameter "x"). search_path sets
-//     the connection's current schema; the others mean nothing to the
-//     driver, or have one value it supports, and are accepted, checked and
-//     shown.
+//     the connection's current schema and TimeZone its time zone
+//     (timezone.go); the others mean nothing to the driver, or have one
+//     value it supports, and are accepted, checked and shown.
 //   - SET LOCAL lasts until the transaction ends, as in Postgres: COMMIT or
 //     ROLLBACK after a BEGIN, or else the end of the script it is in (a
 //     script of several statements is Postgres's implicit transaction). A
@@ -357,18 +357,30 @@ func (p *parser) parseShow() (Stmt, error) {
 
 // ---- the session ----
 
-// paramValue is a parameter's value: its text, as SHOW shows it, and for
-// search_path the schema it selects.
+// paramValue is a parameter's value: its text, as SHOW shows it, for
+// search_path the schema it selects, and for TimeZone the zone.
 type paramValue struct {
 	text   string
 	schema string
+	zone   tzZone
+}
+
+// utcParam is TimeZone's value UTC.
+var utcParam = paramValue{text: "UTC", zone: utcZone}
+
+// timeZoneParam checks a value of TimeZone (also adbc.redis.time_zone).
+func timeZoneParam(text string) (paramValue, error) {
+	z, shown, err := sessionZone(text)
+	return paramValue{text: shown, zone: z}, err
 }
 
 // session is a connection's settings.
 type session struct {
 	// defaultSchema is adbc.redis.default_schema, which RESET search_path
-	// goes back to.
+	// goes back to; defaultZone adbc.redis.time_zone (UTC unless set), which
+	// RESET timezone goes back to.
 	defaultSchema string
+	defaultZone   paramValue
 	// vals are the values set for the session (by SET, or the current
 	// schema by SetCurrentDbSchema); local those set by SET LOCAL, until
 	// the transaction ends. Both by lower-case name.
@@ -379,7 +391,47 @@ type session struct {
 }
 
 func newSession(schema string) *session {
-	return &session{defaultSchema: schema, vals: map[string]paramValue{}}
+	return &session{defaultSchema: schema, defaultZone: utcParam, vals: map[string]paramValue{}}
+}
+
+// zone is the session time zone.
+func (s *session) zone() tzZone { return s.value("timezone").zone }
+
+// zone is the session time zone of the statement being run (UTC for an
+// executor without a connection).
+func (e *executor) zone() tzZone {
+	switch {
+	case e == nil || e.sess == nil:
+		return utcZone
+	case e.tzKnown:
+		return e.tz
+	}
+	return e.sess.zone()
+}
+
+// readZone reads the session time zone for zone, when a statement starts
+// and after one that may change it.
+func (e *executor) readZone() {
+	e.tzKnown = false
+	if e.sess != nil {
+		e.tz, e.tzKnown = e.sess.zone(), true
+	}
+}
+
+// zone is the session time zone expressions are evaluated in.
+func (env *evalEnv) zone() tzZone {
+	if env == nil {
+		return utcZone
+	}
+	return env.exec.zone()
+}
+
+// setDefaultZone makes v the session's default time zone and its current
+// one (adbc.redis.time_zone on the connection).
+func (s *session) setDefaultZone(v paramValue) {
+	s.defaultZone = v
+	delete(s.vals, "timezone")
+	delete(s.local, "timezone")
 }
 
 // value returns a parameter's current value.
@@ -540,19 +592,13 @@ var settings = map[string]*setting{
 		parse: parseSearchPath,
 	},
 	"timezone": {
-		name:    "TimeZone",
-		desc:    "Time zone for displaying and interpreting time stamps. Only UTC is supported.",
-		initial: fixed("UTC"),
-		parse: func(vals []SetValue, _ paramValue) (paramValue, error) {
-			v, err := oneValue("TimeZone", vals)
-			if err != nil {
-				return paramValue{}, err
-			}
-			if v.Kind == SetNumber || v.Kind == SetOther || !strings.EqualFold(v.Text, "UTC") {
-				return paramValue{}, onlyValue("TimeZone", v.Text, "UTC")
-			}
-			return paramValue{text: "UTC"}, nil
+		name: "TimeZone",
+		desc: "Time zone for displaying and interpreting time stamps (adbc.redis.time_zone, UTC by default).",
+		initial: func(s *session) paramValue {
+			return s.defaultZone
 		},
+		// parse is set by init: an INTERVAL value is evaluated, which
+		// refers back to settings.
 	},
 	"client_encoding": {
 		name:    "client_encoding",
@@ -644,6 +690,16 @@ var settings = map[string]*setting{
 			return paramValue{}, invalidValue("IntervalStyle", v.Text)
 		},
 	},
+}
+
+func init() {
+	settings["timezone"].parse = func(vals []SetValue, _ paramValue) (paramValue, error) {
+		v, err := oneValue("TimeZone", vals)
+		if err != nil {
+			return paramValue{}, err
+		}
+		return timeZoneParam(v.Text)
+	}
 }
 
 func invalidValue(name, text string) error {

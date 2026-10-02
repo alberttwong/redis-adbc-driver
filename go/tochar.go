@@ -32,7 +32,10 @@ package redis
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 // dchKeyword is a template pattern: its spelling in a format and the
@@ -179,21 +182,36 @@ func ordinal(s string, th byte) string {
 
 var romanMonths = []string{"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"}
 
-// toChar formats a date, time or timestamp as Postgres's TO_CHAR does. The
-// time zone is UTC: TZ is UTC for a timestamp with time zone or a date
-// (which Postgres converts to one) and empty for a timestamp, and TZH, TZM
-// and OF are +00, 00 and +00. A time is formatted as on 1970-01-01.
-func toChar(v Value, format string) (string, error) {
+// toChar formats a date, time or timestamp as Postgres's TO_CHAR does, in
+// the session time zone z. A timestamp with time zone is formatted as its
+// local time in z, a date as one at local midnight (Postgres converts it to
+// one): TZ is z's abbreviation there (UTC, PST, IST), and TZH, TZM and OF
+// its offset (+00, 00 and +00 in UTC). For a timestamp TZ is empty and the
+// offset +00. A time is formatted as on 1970-01-01.
+func toChar(v Value, format string, z tzZone) (string, error) {
+	if v.T.Kind == KindDate {
+		// As the timestamp with time zone of its local midnight (01:00 if
+		// midnight is in a DST gap).
+		var err error
+		if v, err = coerceIn(v, timestampType(arrow.Second, "UTC"), z); err != nil {
+			return "", err
+		}
+	}
 	tm, err := toTime(v)
 	if err != nil {
 		return "", err
 	}
-	tzName := ""
-	if v.T.Kind == KindDate || (v.T.Kind == KindTimestamp && v.T.TZ != "") {
-		tzName = "UTC"
+	tzName, off := "", 0
+	if isTimestampTZ(v.T) {
+		off, tzName = z.offsetAt(tm.Unix()), z.abbrevAt(tm.Unix())
+		tm = tm.Add(time.Duration(off) * time.Second)
 	}
+	tzName = strings.ToUpper(tzName)
 	// The UTC offset, for TZH, TZM and OF.
-	offSign, offAbs := '+', 0
+	offSign, offAbs := '+', off
+	if off < 0 {
+		offSign, offAbs = '-', -off
+	}
 	y := tm.Year() // astronomical: 0 is 1 BC
 	bc := y <= 0
 	// era is a year as written with an era (1 BC is 1).

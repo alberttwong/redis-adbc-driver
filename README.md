@@ -734,7 +734,12 @@ splits or cuts; see "Strings in the index" above), `ORDER BY` on indexed
 columns, `LIMIT/OFFSET`, and aggregates. A constant
 that doesn't fit the column's type exactly (`int_col > 1.5`, `numeric_col =
 1.249`, `date_col < TIMESTAMP '… 12:00:00'`) is pushed as an inclusive bound
-at its rounded value and re-checked by the driver.
+at its rounded value and re-checked by the driver. A `TIMESTAMP WITH TIME
+ZONE` column compared with a local time (text without an offset, a
+`TIMESTAMP` or a `DATE`) is pushed as that local time's instant in the
+session time zone. A `TIMESTAMP` or `DATE` column compared with a timestamp
+with time zone is pushed as the range of local times that can be that
+instant (in a DST gap, 02:30 is the same instant as 03:30) and re-checked.
 
 Row values always come from the HASHes as stored, never from the index sort
 vectors: `LOAD @c` on a SORTABLE numeric attribute returns the sort vector's
@@ -1297,8 +1302,9 @@ field, even if later rows have it.
 - `GENERATE_SERIES(start, stop [, step])` in FROM, with Postgres's overloads:
   integers (step 1 by default) and numerics, and timestamps with an interval
   step (`DATE` arguments give `TIMESTAMP WITH TIME ZONE`, as in Postgres;
-  cast with `::date`). The column is named `generate_series`, or after the
-  alias (`AS g` → `g`, `AS g(n)` → `n`). A zero step is an error, a step in
+  cast with `::date`; a `TIMESTAMP WITH TIME ZONE` series adds its step's
+  months and days in the session time zone). The column is named
+  `generate_series`, or after the alias (`AS g` → `g`, `AS g(n)` → `n`). A zero step is an error, a step in
   the wrong direction or a NULL argument gives no rows, and month steps
   clamp (`Jan 31, Feb 29, Mar 29, …`). Parameters work, and so do joins
   (`generate_series(…) d LEFT JOIN t ON t.day = d::date` for a date spine)
@@ -1499,14 +1505,17 @@ field, even if later rows have it.
   `CONCAT`, `STRING_AGG`, `LIKE`, `MD5(CAST(x AS TEXT))`, …) as Postgres
   writes them, whatever the declared precision: seconds always, then the
   fraction without trailing zeros (`2024-01-10 10:00:00`,
-  `2024-01-10 10:00:00.5`, `10:00:00.05`), the offset of a timestamp with
-  time zone (`2024-01-10 10:00:00+00`), a year before 1 AD as a BC year
-  (`0044-03-15 BC`), and a year past 9999 with all its digits
+  `2024-01-10 10:00:00.5`, `10:00:00.05`), a timestamp with time zone as
+  its local time in the session time zone with that zone's offset
+  (`2024-01-10 10:00:00+00` in UTC, `2024-01-10 02:00:00-08` in
+  America/Los_Angeles; see Session time zone), a year before 1 AD as a BC
+  year (`0044-03-15 BC`), and a year past 9999 with all its digits
   (`10000-01-01`). Text in those forms reads back as the same value, and
   there is no year 0. JSON (`TO_JSON`, `JSON_BUILD_OBJECT`, …) has the ISO
-  8601 form, `2024-01-10T10:00:00.5+00:00`. Intervals are written as in
-  Postgres too, with a `+` on a field after a negative one (`-1 days
-  +02:00:00`). Query results are Arrow values, which this doesn't change
+  8601 form, `2024-01-10T10:00:00.5+00:00`, also in the session time zone.
+  Intervals are written as in Postgres too, with a `+` on a field after a
+  negative one (`-1 days +02:00:00`). Query results are Arrow values, which
+  this doesn't change
   - **Upgrading from v0.0.7 and earlier:** they kept the declared
     precision's trailing zeros (`2024-01-10 10:00:00.000000`, `10:00:00.000`,
     `2024-01-10 10:00:00.000+00`), wrote years before 1 AD as `0000-…` or
@@ -1531,7 +1540,11 @@ field, even if later rows have it.
   `v` (converted to the type). The result has the target type. An error
   while computing `x`, and a cast between types that never convert (`DATE`
   to `BOOLEAN`), are still errors. A cast to `VARCHAR(n)` or `CHAR(n)` cuts
-  the text to `n` characters, and `CHAR(n)` pads it (see String lengths)
+  the text to `n` characters, and `CHAR(n)` pads it (see String lengths). A
+  cast to a `TIME(p)` or `TIMESTAMP(p)` of a lower precision rounds (see
+  Fractional seconds under Types), and casts between `TIMESTAMP`,
+  `TIMESTAMP WITH TIME ZONE`, `DATE`, `TIME` and text use the session time
+  zone (see Session time zone)
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
   negative: `ROUND(1250, -2)` is 1300), `FLOOR`, `CEIL` / `CEILING`, `MOD` / `%`,
   `POWER` / `POW`, `SQRT`, `CBRT`, `LN`, `LOG(x)` (base 10) / `LOG(b, x)`,
@@ -1639,19 +1652,27 @@ field, even if later rows have it.
   so `WHERE n > ROUND(?)` is still an index query; functions over columns are
   evaluated by the driver on the rows the index returns. `RANDOM()` is
   computed for every row and never pushed down
-- Date/time functions. The session time zone is UTC: a `TIMESTAMP WITH
-  TIME ZONE` is shown in UTC, and the current time is fixed once per
-  statement:
+- Date/time functions. A `TIMESTAMP WITH TIME ZONE`'s fields are those of
+  its local time in the session time zone (see Session time zone), and the
+  current time is fixed once per statement:
   - `CURRENT_DATE`, `CURRENT_TIMESTAMP` / `NOW()`, `CURRENT_TIME`,
-    `LOCALTIMESTAMP`, `LOCALTIME`
+    `LOCALTIMESTAMP`, `LOCALTIME` (the date and times are local)
   - `EXTRACT(field FROM x)` / `DATE_PART('field', x)` for `year`, `isoyear`,
     `quarter`, `month`, `week` (ISO), `day`, `dow` (0 = Sunday), `isodow`,
     `doy`, `hour`, `minute`, `second`, `milliseconds`, `microseconds`, `epoch`,
-    `decade`, `century`, `millennium`; shortcuts `YEAR()`, `QUARTER()`,
-    `MONTH()`, `WEEK()`, `DAY()`, `DAYOFYEAR()`, `HOUR()`, `MINUTE()`,
-    `SECOND()`
+    `decade`, `century`, `millennium`, and for a timestamp with time zone
+    `timezone`, `timezone_hour` and `timezone_minute` (its offset, east of
+    UTC); shortcuts `YEAR()`, `QUARTER()`, `MONTH()`, `WEEK()`, `DAY()`,
+    `DAYOFYEAR()`, `HOUR()`, `MINUTE()`, `SECOND()`
   - `DATE_TRUNC('unit', x)` (dates stay dates), `DATE_DIFF('unit', a, b)`
     (unit boundaries crossed), `LAST_DAY(d)`
+  - `DATE_BIN(stride, source, origin)` (Postgres 14): the start of the
+    `stride`-long bin, counted from `origin`, that `source` is in, also when
+    `origin` is after it. The stride is elapsed time (a day is 24 hours) and
+    has no months or years (`timestamps cannot be binned into intervals
+    containing months or years`). It is a `TIMESTAMP` if the source or the
+    origin is one and neither has a time zone, otherwise a `TIMESTAMP WITH
+    TIME ZONE`, as Postgres picks its form
   - `DATEADD(part, n, x)` and `DATEDIFF(part, a, b)` (Snowflake, Redshift,
     SQL Server; what dbt's `dateadd` and `datediff` emit), with `part` a bare
     keyword or a string: `year`, `quarter`, `month`, `week`, `day`, `hour`,
@@ -1694,9 +1715,12 @@ field, even if later rows have it.
       always padded. `CC` is the century that starts in a year ending in
       01, and `-01` for the 1st century BC. Years before 1 AD are their BC
       years, for `BC` (`0044 BC`)
-    - `TZ` is `UTC` for a timestamp with time zone or a date, and empty for
-      a timestamp; `TZH`, `TZM` and `OF` are `+00`, `00` and `+00`. A time
-      is formatted as on 1970-01-01
+    - A timestamp with time zone is formatted as its local time in the
+      session time zone, and a date as local midnight: `TZ` is that zone's
+      abbreviation there (`UTC`, `PST` / `PDT`, `IST`; `tz` in lower case),
+      and `TZH`, `TZM` and `OF` its offset (`-08`, `00` and `-08`; `+00`,
+      `00` and `+00` in UTC). For a timestamp `TZ` is empty and the offset
+      `+00`. A time is formatted as on 1970-01-01
     - Anything else is copied: text in double quotes (where `\` escapes the
       next character), `\"` (a `"`), and every character that doesn't start
       a pattern, so `Mm` is `Mm` while `Dd` is two weekday numbers, as in
@@ -1705,15 +1729,17 @@ field, even if later rows have it.
     templates, with the patterns `YYYY` (also `IYYY`), `YY`, `MM`, `MONTH`
     / `MON` in any case, `DD`, `HH24`, `HH12` / `HH`, `MI`, `SS`, `MS`, `US`
     and `AM` / `PM` / `A.M.` / `P.M.`; `FX` is ignored, and other patterns
-    are an error (`format pattern "WW" cannot be parsed`)
+    are an error (`format pattern "WW" cannot be parsed`). `TO_TIMESTAMP`
+    reads the text as a local time in the session time zone
   - Time zones, as in Postgres: `x AT TIME ZONE zone` (also
     `TIMEZONE(zone, x)`) reads a `TIMESTAMP` as a local time in `zone` and
     gives that instant, a `TIMESTAMP WITH TIME ZONE`, and gives the local
     time in `zone` of a `TIMESTAMP WITH TIME ZONE`, a `TIMESTAMP`. A `DATE`
-    and text are read as a `TIMESTAMP WITH TIME ZONE`, and the precision
-    is kept. `x AT LOCAL` (also `TIMEZONE(x)`) converts to or from the
-    session time zone, UTC. There is no `TIME WITH TIME ZONE`, so a `TIME`
-    is an error (`function timezone(varchar, time) does not exist`)
+    and text are read as a `TIMESTAMP WITH TIME ZONE` (local times in the
+    session time zone), and the precision is kept. `x AT LOCAL` (also
+    `TIMEZONE(x)`) converts to or from the session time zone. There is no
+    `TIME WITH TIME ZONE`, so a `TIME` is an error (`function
+    timezone(varchar, time) does not exist`)
     - `AT TIME ZONE` binds tighter than `*` and `+` and looser than `::`
       and unary minus, left to right, so dbt_date's `cast(cast(x as
       timestamp) at time zone 'UTC' at time zone 'America/Los_Angeles' as
@@ -1747,17 +1773,84 @@ field, even if later rows have it.
       10:30 UTC), and one that the fall-back transition repeats with the
       offset after it (`TIMESTAMP '2024-11-03 01:30'` is 01:30 PST, 09:30
       UTC)
-    - Not supported: a session time zone other than UTC, `TIME WITH TIME
-      ZONE`, POSIX zones with daylight saving rules
-      (`CET-1CEST,M3.5.0,M10.5.0/3`), abbreviations other than those above
-      (such as `IST`, which Postgres reads as Israel's), and `TO_CHAR` of an
-      interval
+    - Not supported: `TIME WITH TIME ZONE`, POSIX zones with daylight saving
+      rules (`CET-1CEST,M3.5.0,M10.5.0/3`), abbreviations other than those
+      above (such as `IST`, which Postgres reads as Israel's), and `TO_CHAR`
+      of an interval
+- Session time zone (`SET TIME ZONE`, `SET timezone = …`, the
+  `adbc.redis.time_zone` option; UTC by default). Each connection has its
+  own. As in Postgres, a `TIMESTAMP WITH TIME ZONE` is an instant, and the
+  session time zone is where it is shown and read as a local time:
+  - **Text:** casts to text, `||`, `CONCAT`, `STRING_AGG`, `LIKE` and the
+    other functions that read text, `TO_CHAR` (`TZ`, `OF`, `TZH`, `TZM`)
+    and JSON write its local time with the zone's offset at that instant:
+    `2024-01-09 21:00:00-08` and `2024-07-01 11:45:30.25-07` in
+    `America/Los_Angeles`, `2024-01-10 10:30:00+05:30` in `Asia/Kolkata`.
+  - **Input:** text without an offset or zone (`'2024-01-10 02:00'`,
+    `TIMESTAMPTZ '2024-01-10 02:00'`, a bound string parameter, a value
+    written to a column) is a local time; text with an offset or a zone name
+    keeps it.
+  - **Conversions:** a `TIMESTAMP` becomes a `TIMESTAMP WITH TIME ZONE` as a
+    local time, and back as its local time; a `DATE` is local midnight, and
+    a timestamp with time zone's `DATE` and `TIME` are its local date and
+    time. These also apply where Postgres converts implicitly: comparisons
+    (`tz_col = TIMESTAMP '…'`, `tz_col >= current_date`), `IN`, `BETWEEN`,
+    `GREATEST` / `LEAST`, `COALESCE`, `CASE`, `UNION`, joins, and writes to a
+    column of the other type. `x AT LOCAL` converts to or from the session
+    time zone.
+  - **Fields and arithmetic:** `EXTRACT` / `DATE_PART` and the field
+    functions, `DATE_TRUNC` (a day or longer starts at local midnight; a
+    shorter unit keeps the offset, so `01:30 PST` truncates to `01:00 PST`
+    on a fall-back day), `AGE`, `DATEDIFF` / `DATE_DIFF`, `LAST_DAY` and
+    `TO_CHAR` read the local time. Adding an interval adds its months and
+    days to the local time and its time as elapsed time, so across the
+    spring-forward transition `+ INTERVAL '1 day'` is 23 hours and `+
+    INTERVAL '24 hours'` 24 (also `DATEADD`, `GENERATE_SERIES` and window
+    `RANGE` offsets). `DATE_BIN`'s stride is elapsed time; only its origin
+    is read as a local time.
+  - **The current time:** `CURRENT_DATE`, `LOCALTIMESTAMP`, `CURRENT_TIME`
+    and `LOCALTIME` are local; `NOW()` is the instant. `MAKE_TIMESTAMPTZ`
+    and `TO_TIMESTAMP(text, format)` read a local time.
+  - **Daylight saving time,** as in Postgres: a local time that the
+    spring-forward transition skips is read with the offset before it
+    (`'2024-03-10 02:30'` in Los Angeles is `2024-03-10 03:30:00-07`), and
+    one that the fall-back transition repeats with the offset after it
+    (`'2024-11-03 01:30'` is `01:30:00-08`).
+  - **What it doesn't change:** stored values (instants), Arrow results (a
+    `TIMESTAMP WITH TIME ZONE` column is an Arrow timestamp with time zone
+    `UTC`, with the same values in every session time zone), bulk ingest
+    (Arrow timestamps are stored as they are; a timestamp without a zone
+    written to a `TIMESTAMP WITH TIME ZONE` column is UTC), and
+    `CONVERT_TIMEZONE`, which reads a timestamp with time zone as its UTC
+    time (as Snowflake does).
+  - **Index queries** work on UTC instants: a local-time constant is
+    converted in the session time zone before it is pushed down (see "How
+    SQL is executed"), so the index returns the rows the comparison does.
+  - **Values:** the forms in the `TimeZone` row of the parameter table
+    under "Transactions and settings". An IANA name is looked up
+    case-insensitively and shown as the tz database spells it
+    (`america/new_york` is `America/New_York`). Here, as in Postgres, a zone
+    name comes before an abbreviation, so `SET TIME ZONE 'CET'` has summer
+    time (while `AT TIME ZONE 'CET'` is the abbreviation, UTC+1). Numbers
+    and `INTERVAL`s are east of Greenwich, as in Postgres's `SET TIME ZONE`
+    (`-8` and `INTERVAL '-08:00' HOUR TO MINUTE` are 8 hours behind UTC),
+    while a POSIX-style offset is west of it (`UTC+5` is 5 hours behind).
+    Unlike Postgres, an abbreviation that isn't a zone name (`PST`) is
+    accepted, as a fixed offset. An unknown zone is `invalid value for
+    parameter "TimeZone": "x"`.
+  - **Differences from Postgres:** a view, a `DEFAULT` or a `CHECK` with a
+    local-time literal (`'2024-01-01 00:00'` compared with or written to a
+    timestamp with time zone) reads it in the zone of the session that runs
+    the query or writes the row; Postgres reads it once, in the zone of the
+    session that creates the view or the table. `TIME WITH TIME ZONE`, and
+    `MAKE_TIMESTAMPTZ` with a zone argument, aren't supported.
 - Intervals and date/time arithmetic:
   - `INTERVAL '1 year 2 months 3 days 04:05:06'`, `'1.5 hours'`, `'2 days ago'`,
     `'3 04:05:06'`, `'1-2'` (years-months), ISO 8601 `'P1Y2M3DT4H'`,
     `INTERVAL '2' HOUR`, `INTERVAL 7 DAY` / `INTERVAL ? DAY`, and
     `CAST('7 days' AS INTERVAL)`
-  - `timestamp ± interval`, `date ± interval` (gives a timestamp),
+  - `timestamp ± interval` (a timestamp with time zone adds months and
+    days in the session time zone), `date ± interval` (gives a timestamp),
     `date ± integer` (days), `date - date` (days), `timestamp - timestamp`
     (an interval of days and time), `time ± interval`, `time - time`,
     `interval ± interval`, `interval * n`, `interval / n`, `-interval`
@@ -1967,7 +2060,7 @@ field, even if later rows have it.
     | Parameter | Values | Default |
     |-|-|-|
     | `search_path` | Schemas, comma-separated. Unqualified names use the first one, skipping `"$user"`, `pg_catalog` and `pg_temp` (temporary objects are always found first), as `adbc.redis.default_schema` sets it: `CREATE`, queries, writes and bulk ingest. The schema needn't exist yet (schemas exist once they have a table). `SHOW` shows the list as set, and the ADBC current schema (`adbc.connection.db_schema`) is the same setting | `adbc.redis.default_schema` |
-    | `TimeZone` (`SET TIME ZONE`) | Only `UTC`, `LOCAL` and `DEFAULT`, which are UTC: the session time zone is always UTC (see the date/time functions). Others give `invalid value for parameter "TimeZone": "…" (only UTC is supported)` | `UTC` |
+    | `TimeZone` (`SET TIME ZONE`) | The session time zone (see Session time zone): an IANA zone name (case-insensitive, shown as the tz database spells it), a POSIX-style offset (`UTC+5`, west of Greenwich, shown in upper case), a number of hours east of Greenwich (`-8`, shown `<-08>+08`), `INTERVAL '+05:30' [HOUR TO MINUTE]` (east, shown `<+05:30>-05:30`), or a time zone abbreviation (`PST`, a fixed offset; Postgres refuses these here). `LOCAL` and `DEFAULT` are the default. Others give `invalid value for parameter "TimeZone": "…"` | `adbc.redis.time_zone`, or `UTC` |
     | `client_encoding` | Only `UTF8` (`UTF-8`, `UNICODE`) | `UTF8` |
     | `application_name` | Any; not used | `''` |
     | `standard_conforming_strings` | Only `on`: `'…'` strings don't treat backslashes as escapes | `on` |
@@ -1976,8 +2069,8 @@ field, even if later rows have it.
     | `DateStyle` | Only the `ISO` style, with an order `MDY`, `DMY` or `YMD`, which has no effect (only ISO dates are read) | `ISO, MDY` |
     | `IntervalStyle` | Only `postgres`, the format of intervals cast to text | `postgres` |
 
-    The same settings through ADBC options (other than the current schema)
-    are not supported.
+    The same settings through ADBC options are not supported, other than
+    the current schema and the time zone (`adbc.redis.time_zone`).
 - Not supported: mutually recursive CTEs, `ANY` / `ALL` over arrays or
   value lists, set-returning functions in the SELECT list
   (`SELECT generate_series(1, 3)`), table functions other than
@@ -1993,9 +2086,39 @@ field, even if later rows have it.
   TIME(p), TIMESTAMP(p) [WITH TIME ZONE], INTERVAL` (interval columns are
   stored but not indexed; see String lengths for `VARCHAR(n)` / `CHAR(n)`).
   `TIME WITH TIME ZONE` is a `TIME`: there is no time-of-day type with a
+  zone. A `TIMESTAMP WITH TIME ZONE` is a UTC instant (an Arrow timestamp
+  with time zone `UTC`), shown and read as a local time in the session time
   zone.
   JSON documents are stored in `VARCHAR` columns (`NOINDEX` if they are
   never compared as a whole); `JSON` and `JSONB` are only cast targets
+  - **Fractional seconds:** `TIME(p)` and `TIMESTAMP(p)` hold 0, 3, 6 or 9
+    digits, the Arrow units: a `p` of 1 or 2 is 3, 4 or 5 is 6, and 7 or 8
+    is 9 (Postgres keeps any `p` up to 6). A value with more digits is
+    rounded half away from zero, as Postgres rounds, when it is cast to the
+    type or written to a column of it: `INSERT`, `UPDATE`, `MERGE`,
+    `CREATE TABLE … AS`, defaults and bulk ingest. The rounding carries into
+    the next second, minute, day or year (`'2024-12-31 23:59:59.5'` is
+    `2025-01-01 00:00:00` in a `TIMESTAMP(0)`), and a `TIME(0)` of
+    `23:59:59.9` is `24:00:00`, which Postgres allows (its Arrow value is
+    86,400 seconds, one past the end of Arrow's range for a time of day;
+    pyarrow reads it as 00:00:00). As in Postgres, whose timestamps count
+    from 2000-01-01, a timestamp before 2000 exactly halfway rounds down
+    (`'1999-12-31 23:59:59.5'` is `23:59:59`). The text, the Arrow value and
+    what index queries compare with are the rounded value
+    - Text with more than 6 digits read into a type of 6 or fewer is read
+      as Postgres reads it, in microseconds with an exact half rounded to
+      even, before it is rounded to the type (`'… 10:00:00.1234565'` is
+      `.123456` in a `TIMESTAMP`, `'… 10:00:00.4999995'` is `10:00:01` in a
+      `TIMESTAMP(0)`). Read into `TIME(9)` / `TIMESTAMP(9)`, and as a literal
+      (`TIMESTAMP '… .1234565'`), it is nanoseconds, which round half away
+      from zero like any other value; outside the nanoseconds' range (1677
+      to 2262) it is microseconds, read as Postgres reads them
+    - Text compared with a time or timestamp is read with the digits
+      written (in microseconds unless the other side is in nanoseconds), as
+      Postgres compares at full precision, so a `TIMESTAMP(0)` of `10:00:01`
+      equals `'… 10:00:01'` but not `'… 10:00:00.5'`
+    - Earlier versions truncated (`10:00:00.5` was `10:00:00` in a
+      `TIMESTAMP(0)`); the values they stored don't change
 
 Tables can be qualified as `schema.table` or `redis.schema.table`, and
 `pg_temp.table` is the connection's temporary table. Strings are written
@@ -2026,6 +2149,7 @@ clients can see a partly applied statement.
 | `adbc.redis.read_timeout` | database, connection | How long the client waits for each reply: `30s`, `10m`, … or a number of seconds; `0` for no timeout. Default `5m`, or the URI's `read_timeout` (see **Timeouts** under [Server requirements](#server-requirements)). The connection option overrides the database's |
 | `adbc.redis.write_timeout` | database, connection | How long the client waits to send each command, in the same format. Default: the read timeout, or the URI's `write_timeout` |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |
+| `adbc.redis.time_zone` | database, connection | The session time zone, with the values `SET TIME ZONE` takes (default `UTC`; see Session time zone), and what `RESET timezone` and `SET TIME ZONE DEFAULT` go back to. The connection option overrides the database's and replaces a `SET`'s value; reading it gives the current value, as `SHOW timezone` does |
 
 Scale tips: keep column names short (they are repeated in every HASH), raise
 `hash-max-listpack-entries` / `hash-max-listpack-value` so small rows use the

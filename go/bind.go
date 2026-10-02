@@ -80,6 +80,9 @@ type execCache struct {
 	usedTemp bool
 	// loaded are the tables the statement read (see checkReads in rekey.go).
 	loaded []*tableMeta
+	// branchTypes are the result types of CASE and IIF expressions
+	// (branchValue).
+	branchTypes map[Expr]ColType
 }
 
 func newExecCache() *execCache {
@@ -95,6 +98,7 @@ func newExecCache() *execCache {
 		materializing: map[any]bool{},
 		working:       map[*CTE]*tableMeta{},
 		extremes:      map[*Subquery]*quantExtremes{},
+		branchTypes:   map[Expr]ColType{},
 	}
 }
 
@@ -655,7 +659,7 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	set := &inSet{rows: rows, noIndex: true}
+	set := &inSet{rows: rows, noIndex: true, zone: env.zone()}
 	if !sq.correlated {
 		// The same rows for every outer row: probe a hash set.
 		set = env.exec.cachedInSet(sq, rows)

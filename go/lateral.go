@@ -281,7 +281,7 @@ func (e *executor) lateralRows(env *evalEnv, it *joinItem, wp wherePlan, memo ma
 	if rows, ok := memo[key]; ok {
 		return rows, nil
 	}
-	vals, err := generateSeries(lat.typ, args)
+	vals, err := generateSeries(lat.typ, args, env.zone())
 	if err != nil {
 		return nil, err
 	}
