@@ -230,6 +230,9 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 				moving = cur
 				return errRekeyBusy
 			}
+			if err := refuseAdopted(cur, "RENAME TO with "+OptionStringRenameRekey+" (which moves the rows to new keys)"); err != nil {
+				return err
+			}
 			if n, err := tx.Exists(ctx, newKey).Result(); err != nil {
 				return err
 			} else if n > 0 {
@@ -273,7 +276,7 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 				return nil
 			})
 			return err
-		}, oldKey, newKey, prefixesKey, indexesKey, rekeyKey, releasedKey)
+		}, oldKey, newKey, prefixesKey, indexesKey, rekeyKey, releasedKey, adoptedKey)
 		if errors.Is(err, goredis.TxFailedErr) {
 			continue
 		}

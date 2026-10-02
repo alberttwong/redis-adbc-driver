@@ -143,7 +143,7 @@ func printReport(w io.Writer, r *redis.HashReport) {
 	if len(r.Columns) > 0 {
 		fmt.Fprintf(w, "\nGuessed columns (as table %s.%s):\n", r.Schema, r.Table)
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "  COLUMN\tTYPE\tARROW TYPE\tPRESENT\tNOTES")
+		fmt.Fprintln(tw, "  COLUMN\tTYPE\tARROW TYPE\tIN PLACE\tPRESENT\tNOTES")
 		for _, c := range r.Columns {
 			name := c.Name
 			if c.Field != "" && c.Field != c.Name {
@@ -153,7 +153,11 @@ func printReport(w io.Writer, r *redis.HashReport) {
 			if r.Sampled > 0 && c.Present < r.Sampled {
 				present = fmt.Sprintf("%.1f%%", 100*float64(c.Present)/float64(r.Sampled))
 			}
-			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", name, c.Type, c.ArrowType, present, strings.Join(c.Notes, "; "))
+			inPlace := c.InPlaceType
+			if inPlace == "" {
+				inPlace = "-"
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n", name, c.Type, c.ArrowType, inPlace, present, strings.Join(c.Notes, "; "))
 		}
 		_ = tw.Flush()
 	}

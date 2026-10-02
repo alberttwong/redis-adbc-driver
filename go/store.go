@@ -213,6 +213,11 @@ type tableMeta struct {
 	Comment string `json:"comment,omitempty"`
 	// Checks are the table's CHECK constraints (see check.go).
 	Checks []checkMeta `json:"checks,omitempty"`
+	// Adopted is set for a table whose rows are HASHes that something else
+	// (an application) wrote, adopted in place with AdoptHashes (adopt.go).
+	// The driver doesn't own their keys, so it never deletes rows wholesale
+	// or moves them: see refuseAdopted.
+	Adopted bool `json:"adopted,omitempty"`
 	// readAt is when the metadata was read (or last found not to be moving),
 	// for the checks in rekey.go.
 	readAt time.Time
@@ -326,6 +331,9 @@ const (
 	registryMarker = metaPrefix + "registry"
 	cleanupKey     = metaPrefix + "cleanup"
 	namesNextKey   = metaPrefix + "names:next"
+	// adoptedKey (SET) lists the key prefixes of adopted tables, which no
+	// new table's prefix may overlap (see adoptedOverlap).
+	adoptedKey = metaPrefix + "adopted"
 )
 
 // tableNames are the key prefix and index name a table takes: for N = 1,
@@ -393,13 +401,16 @@ func (s *store) claimNames(ctx context.Context, schema, table string) (tableName
 			released = pipe.HExists(ctx, releasedKey, nm.prefix)
 			pipe.HSet(ctx, namesNextKey, nm.base, n)
 		}
+		adopted := pipe.SMembers(ctx, adoptedKey)
 		if _, err := pipe.Exec(ctx); err != nil {
 			return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
 		}
 		gotP, _ := addP.Int64()
 		var foreign bool
 		var ferr error
-		if gotP == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
+		if p := adoptedOverlap(adopted.Val(), nm.prefix); p != "" {
+			ferr = adoptedOverlapErr(schema, table, p)
+		} else if gotP == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
 			if foreign, ferr = s.foreignIndex(ctx, nm); ferr == nil && !foreign {
 				s.noteTempNames(nm)
 				return nm, nil
@@ -439,15 +450,20 @@ func (s *store) freeNames(ctx context.Context, tx *goredis.Tx, schema, table str
 			continue
 		}
 		var usedP, usedI, released *goredis.BoolCmd
+		var adopted *goredis.StringSliceCmd
 		if _, err := tx.Pipelined(ctx, func(p goredis.Pipeliner) error {
 			usedP = p.SIsMember(ctx, prefixesKey, nm.prefix)
 			usedI = p.SIsMember(ctx, indexesKey, nm.index)
 			if !nm.temp {
 				released = p.HExists(ctx, releasedKey, nm.prefix)
 			}
+			adopted = p.SMembers(ctx, adoptedKey)
 			return nil
 		}); err != nil {
 			return tableNames{}, err
+		}
+		if p := adoptedOverlap(adopted.Val(), nm.prefix); p != "" {
+			return tableNames{}, adoptedOverlapErr(schema, table, p)
 		}
 		if !usedP.Val() && !usedI.Val() && (released == nil || !released.Val()) {
 			foreign, err := s.foreignIndex(ctx, nm)
@@ -470,6 +486,34 @@ func reserveNames(ctx context.Context, p goredis.Pipeliner, nm tableNames) {
 	if !nm.temp {
 		p.HSet(ctx, namesNextKey, nm.base, nm.n)
 	}
+}
+
+// adoptedOverlap returns the adopted prefix (if any) that overlaps prefix:
+// keys could be under both, so a new table's rows would mix with an
+// application's HASHes.
+func adoptedOverlap(adopted []string, prefix string) string {
+	for _, p := range adopted {
+		if strings.HasPrefix(p, prefix) || strings.HasPrefix(prefix, p) {
+			return p
+		}
+	}
+	return ""
+}
+
+func adoptedOverlapErr(schema, table, adopted string) error {
+	return errorf(adbc.StatusAlreadyExists, "table %q.%q would have its rows under the key prefix %q of an adopted table's HASHes; use another schema",
+		displaySchema(schema), table, adopted)
+}
+
+// refuseAdopted refuses what an adopted table can't do. Its keys are an
+// application's: the driver never allocates row ids among them (the
+// application does), moves them to new keys, or deletes them wholesale.
+func refuseAdopted(meta *tableMeta, what string) error {
+	if !meta.Adopted {
+		return nil
+	}
+	return errorf(adbc.StatusNotImplemented, "%s isn't supported on %q.%q, whose rows are HASHes adopted in place (redis-arrow adopt) under %q",
+		what, displaySchema(meta.Schema), meta.Name, meta.prefix())
 }
 
 // foreignIndex reports whether a search index that isn't the driver's has
@@ -509,6 +553,12 @@ type indexInfo struct {
 	filter   string
 	numDocs  int64
 	failures int64 // hash_indexing_failures
+	// indexing is set while the index is still indexing existing keys,
+	// percent how far it is (1 when done).
+	indexing bool
+	percent  float64
+	// lastError and lastErrorKey are the last indexing failure.
+	lastError, lastErrorKey string
 	// attrs are the attributes: each one's identifier, attribute name, type
 	// and options (SORTABLE, SEPARATOR ",", …).
 	attrs []indexAttr
@@ -547,6 +597,20 @@ func indexInfoOf(reply any) indexInfo {
 			info.numDocs, _ = strconv.ParseInt(fmt.Sprint(list[i+1]), 10, 64)
 		case "hash_indexing_failures":
 			info.failures, _ = strconv.ParseInt(fmt.Sprint(list[i+1]), 10, 64)
+		case "indexing":
+			info.indexing = fmt.Sprint(list[i+1]) != "0"
+		case "percent_indexed":
+			info.percent, _ = strconv.ParseFloat(fmt.Sprint(list[i+1]), 64)
+		case "Index Errors":
+			errs, _ := list[i+1].([]any)
+			for j := 0; j+1 < len(errs); j += 2 {
+				switch fmt.Sprint(errs[j]) {
+				case "last indexing error":
+					info.lastError = fmt.Sprint(errs[j+1])
+				case "last indexing error key":
+					info.lastErrorKey = fmt.Sprint(errs[j+1])
+				}
+			}
 		case "attributes":
 			attrs, _ := list[i+1].([]any)
 			for _, a := range attrs {
@@ -1018,6 +1082,9 @@ var testHookTruncating func()
 func (s *store) truncateTables(ctx context.Context, metas []*tableMeta, restartIdentity bool) error {
 	ts := make([]*truncation, len(metas))
 	for i, meta := range metas {
+		if err := refuseAdopted(meta, "TRUNCATE"); err != nil {
+			return err
+		}
 		if err := s.checkWritable(ctx, meta); err != nil {
 			return err
 		}
@@ -1083,6 +1150,9 @@ func (s *store) truncateTables(ctx context.Context, metas []*tableMeta, restartI
 					return err
 				}
 				if err := movingErr(cur); err != nil {
+					return err
+				}
+				if err := refuseAdopted(cur, "TRUNCATE"); err != nil {
 					return err
 				}
 				if err := s.addIndexedColumns(ctx, t, cur); err != nil {
@@ -1199,8 +1269,13 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 		if meta.RekeyTo != "" {
 			s.recoverStale(ctx, meta.prefix())
 		}
-		// DD deletes every document the index knows about.
-		if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
+		// DD deletes every document the index knows about; an adopted
+		// table's HASHes stay (with the __rowid fields adopt wrote).
+		drop := []any{"FT.DROPINDEX", meta.index(), "DD"}
+		if meta.Adopted {
+			drop = drop[:2]
+		}
+		if err := s.searchDo(ctx, meta.index(), drop...).Err(); err != nil &&
 			!isUnknownIndex(err) {
 			return wrapRedis(err, "failed to drop search index")
 		}
@@ -1224,6 +1299,9 @@ func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bo
 					p.HIncrBy(ctx, releasedKey, meta.prefix(), 1) // see rekey.go
 				}
 				p.SRem(ctx, cleanupKey, cleanupMember(schema, table))
+				if meta.Adopted {
+					p.SRem(ctx, adoptedKey, meta.prefix())
+				}
 				return nil
 			})
 			return err
@@ -1375,6 +1453,9 @@ func (s *store) allocRows(ctx context.Context, meta *tableMeta, rows [][]Value) 
 	if len(rows) == 0 {
 		return rowAlloc{}, nil
 	}
+	if err := refuseAdopted(meta, "adding rows (INSERT, MERGE … INSERT, bulk ingest)"); err != nil {
+		return rowAlloc{}, err
+	}
 	for _, row := range rows {
 		for i, c := range meta.Columns {
 			if row[i].Null && !c.Nullable {
@@ -1508,6 +1589,9 @@ type rowLog struct {
 func (s *store) discardWritten(ctx context.Context, meta *tableMeta) {
 	log := meta.wrote
 	meta.wrote = rowLog{}
+	if meta.Adopted {
+		return // the keys are the application's
+	}
 	prefix := meta.prefix()
 	ctx = context.WithoutCancel(ctx)
 	pipe := s.client.Pipeline()

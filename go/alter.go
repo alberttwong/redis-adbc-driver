@@ -132,6 +132,9 @@ func (e *executor) renameTable(ctx context.Context, meta *tableMeta, to TableNam
 		return errorf(adbc.StatusAlreadyExists, "%q.%q already exists as a view", displaySchema(meta.Schema), newName)
 	}
 	if e.rekey {
+		if err := refuseAdopted(meta, "RENAME TO with "+OptionStringRenameRekey+" (which moves the rows to new keys)"); err != nil {
+			return err
+		}
 		return e.rekeyTable(ctx, meta, newName)
 	}
 	s := e.store
@@ -462,6 +465,11 @@ func (e *executor) applyAlter(ctx context.Context, m *tableMeta, cmds []AlterCmd
 // default as it is now, recorded as the column's missing value (see
 // defaults.go), so it must be the same for all of them.
 func (e *executor) alterAddColumn(ctx context.Context, m *tableMeta, cmd AlterCmd, taken map[string]bool, res *alterResult) error {
+	// The application may have the field in its HASHes, and missing
+	// values count on row ids that the driver hands out.
+	if err := refuseAdopted(m, "ADD COLUMN"); err != nil {
+		return err
+	}
 	def := cmd.Def
 	if err := checkColumnName(def.Name); err != nil {
 		return err
@@ -540,6 +548,9 @@ func alterDropColumn(m *tableMeta, cmd AlterCmd, res *alterResult) error {
 	if j := slices.IndexFunc(res.added, func(a addedColumn) bool { return a.field() == f }); j >= 0 {
 		// Added by this statement: no row has its field.
 		res.added = slices.Delete(res.added, j, j+1)
+	} else if m.Adopted {
+		// An application's field: it stays in the HASHes.
+		m.RetiredFields = append(m.RetiredFields, f)
 	} else {
 		if c.MissingThrough > 0 {
 			m.PendingCleanup = append(m.PendingCleanup, nullMarker(f))

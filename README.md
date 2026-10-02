@@ -229,9 +229,9 @@ HASHes and indexes created some other way (for example your own
 load it through the driver; bulk ingest from Arrow is the quickest route.
 The driver doesn't touch such indexes, even one with the name a new table's
 index would take (see "Indexes the driver didn't create are left alone"
-below). `redis-arrow check` and `redis-arrow scan` read such HASHes as Arrow
-IPC, or copy them into a table (see
-[Existing HASH collections](#existing-hash-collections-check-and-scan)).
+below). `redis-arrow check`, `scan` and `adopt` read such HASHes as Arrow IPC,
+copy them into a table, or make them a table in place (see
+[Existing HASH collections](#existing-hash-collections-check-scan-and-adopt)).
 
 **Limitation: Redis Flex databases are not supported yet**
 
@@ -538,9 +538,9 @@ Stop Redis with `docker compose down`.
 `redis-arrow` writes a query's result as an
 [Arrow IPC](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
 file or stream, and bulk-ingests an IPC file or stream into a table. Its
-`check` and `scan` commands read HASHes that something other than the
-driver wrote (see
-[Existing HASH collections](#existing-hash-collections-check-and-scan)). It links
+`check`, `scan` and `adopt` commands read HASHes that something other than
+the driver wrote (see
+[Existing HASH collections](#existing-hash-collections-check-scan-and-adopt)). It links
 the driver as a Go library, so it needs neither cgo nor the shared library.
 Build it from `go`:
 
@@ -600,12 +600,12 @@ build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table
   Import reads a stream batch by batch, but reads a file on stdin into
   memory first, since the file format's footer is at its end.
 
-## Existing HASH collections: `check` and `scan`
+## Existing HASH collections: `check`, `scan` and `adopt`
 
 The driver only sees tables it created. HASHes that an application wrote
 (`user:1`, `user:2`, …, maybe with the application's own search index) can
-still be read two ways, and `redis-arrow check` tells you whether each one
-works and what is missing:
+still be read three ways, and `redis-arrow check` tells you whether each
+one works and what is missing:
 
 - **Arrow IPC.** `redis-arrow scan` reads the HASHes themselves and writes
   them as an Arrow IPC file or stream, one row per HASH. It needs no index
@@ -616,8 +616,15 @@ works and what is missing:
   snapshot: import again with `-mode replace` to refresh it. It needs the
   Query Engine, a database that isn't Redis Flex, and memory for a second
   copy of the data.
+- **SQL, in place.** `redis-arrow adopt` makes the HASHes themselves a
+  driver table: SQL reads what the application writes, without a copy. It
+  writes a `__rowid` field into each HASH and creates a second search index
+  beside the application's, so it needs keys that end in an integer
+  (`user:42`), and its columns are only as typed as the stored text allows
+  (see [Adopt](#adopt-hashes-in-place) below for what an adopted table can't
+  do).
 
-Both are part of `redis-arrow` (see above), and take its `-uri` and
+All three are part of `redis-arrow` (see above), and take its `-uri` and
 `-option` flags.
 
 **Check.** Without `-prefix`, `check` lists the collections it finds: the
@@ -638,15 +645,15 @@ Collection user: on Redis 8.6.2 (standalone)
   search index idx:users (prefix user:): 499 documents, 2 indexing failures
 
 Guessed columns (as table public.users):
-  COLUMN      TYPE                         ARROW TYPE             PRESENT  NOTES
-  _key        VARCHAR                      utf8                   100%     each HASH's key
-  name        VARCHAR                      utf8                   100%
-  age         VARCHAR                      utf8                   100%     2 of 501 values aren't BIGINT (such as "n/a" in user:500)
-  active      BOOLEAN                      bool                   99.8%    true/false text
-  created_at  TIMESTAMP(6) WITH TIME ZONE  timestamp[us, tz=UTC]  99.8%    ISO 8601 text
-  balance     NUMERIC(38,2)                decimal(38, 2)         99.8%
-  zip         VARCHAR                      utf8                   99.8%    numbers with leading zeros, kept as text
-  avatar      VARBINARY                    binary                 10.0%    not UTF-8; 50 values have a NUL byte
+  COLUMN      TYPE                         ARROW TYPE             IN PLACE       PRESENT  NOTES
+  _key        VARCHAR                      utf8                   -              100%     each HASH's key
+  name        VARCHAR                      utf8                   VARCHAR        100%
+  age         VARCHAR                      utf8                   VARCHAR        100%     2 of 501 values aren't BIGINT (such as "n/a" in user:500)
+  active      BOOLEAN                      bool                   VARCHAR        99.8%    true/false text
+  created_at  TIMESTAMP(6) WITH TIME ZONE  timestamp[us, tz=UTC]  VARCHAR        99.8%    ISO 8601 text
+  balance     NUMERIC(38,2)                decimal(38, 2)         NUMERIC(38,2)  99.8%
+  zip         VARCHAR                      utf8                   VARCHAR        99.8%    numbers with leading zeros, kept as text
+  avatar      VARBINARY                    binary                 VARBINARY      10.0%    not UTF-8; 50 values have a NUL byte
 
 Arrow IPC (redis-arrow scan): READY
   [ok]      501 HASH keys under user:
@@ -660,8 +667,28 @@ SQL, copied into a driver table (redis-arrow scan | redis-arrow import): READY
   [ok]      the Query Engine (RediSearch) is available
   [ok]      public.users doesn't exist yet: import creates it
   [ok]      its rows go under public:users:, which has no keys, and its index is idx:public:users
-  [ok]      a copy needs about 0.10 MB (MEMORY USAGE of the sampled HASHes, scaled to all of them), plus its index; 13 MB are in use, and there is no maxmemory limit
+  [ok]      a copy needs about 0.10 MB (MEMORY USAGE of the sampled HASHes, scaled to all of them), plus its index; 14 MB are in use, and there is no maxmemory limit
   run: redis-arrow scan -prefix user: | redis-arrow import -table users
+
+SQL, adopted in place (redis-arrow adopt): READY
+  [ok]      the Query Engine (RediSearch) is available
+  [ok]      no driver table's rows can be under user:
+  [ok]      public.users doesn't exist yet
+  [warn]    1 key (such as user:alice) doesn't end in an integer row id, and stays out of the table
+  [ok]      500 keys end in a row id (up to 500)
+  [missing] 500 HASHes have no __rowid field
+            fix: adopt writes each one's key suffix into it (HSET <key> __rowid <suffix>)
+  [warn]    active is VARCHAR in place (BOOLEAN when copied): the driver stores booleans as 0 and 1
+  [warn]    created_at is VARCHAR in place (TIMESTAMP(6) WITH TIME ZONE when copied): the driver stores dates and times as numbers
+  [missing] a search index in the driver's format on user:
+            fix: adopt creates idx:public:users:adopted, with FILTER "exists(@__rowid)"; it takes memory of its own (the application's idx:users stays as it is, and isn't used)
+  [missing] the table's metadata (adbc:{meta}:table:public:users)
+            fix: adopt writes it
+  [warn]    HASHes the application writes later have no __rowid, so SQL doesn't see them until adopt -refresh runs
+  [warn]    a later write by the application of a value a numeric column can't hold (text, an empty value, NaN) takes that HASH out of the index, and so out of the table
+  [warn]    the __rowid field shows up in the application's own HGETALL and FT.SEARCH results
+  [warn]    SQL UPDATE and DELETE change the application's HASHes; INSERT, TRUNCATE, ADD COLUMN and a re-keying RENAME are refused, and DROP TABLE drops only the index and the metadata
+  run: redis-arrow adopt -prefix user: -table users
 ```
 
 `-json` writes the same report as JSON. `check` writes nothing to Redis,
@@ -684,6 +711,17 @@ ready). What the checklists look for:
   when the copy doesn't fit, or leaves less than 10% free under an
   `allkeys-*` policy (which could evict the originals); otherwise less
   than 10% free is a warning.
+- **SQL in place:** the Query Engine, and not Redis Flex; that no driver
+  table's rows can be under the prefix (and that the prefix isn't the
+  driver's own `adbc:` or `pg_temp_`); the table, view and index names;
+  which keys end in a row id (an integer from 1 to 2^53; the others stay
+  out of the table, and may not have a `__rowid` field); `__rowid` fields
+  that aren't the key's suffix (a blocker), or that are missing (adopt
+  writes them); columns that are weaker in place than in a copy; `-type`
+  overrides that some values aren't stored as; what adopt creates; and the
+  hazards below. For a table that was adopted already, it checks the
+  index's indexing failures and the HASHes written since without a
+  `__rowid` (`adopt -refresh` adds them).
 
 **How columns are guessed.** Every field becomes a column (`-rename
 field=column` renames one), plus `_key` with each HASH's key (`-key-column`
@@ -734,6 +772,95 @@ build/redis-arrow scan -prefix user: | build/redis-arrow import -table users
 - **Memory:** `scan` streams batches of up to 10,000 rows, so unlike
   `export` it doesn't hold the whole result.
 
+<a id="adopt-hashes-in-place"></a>
+**Adopt.** `adopt` reads every HASH under the prefix, runs the in-place
+checklist on all of them, and prints what it would do. Nothing changes
+without `-apply`:
+
+```bash
+build/redis-arrow adopt -prefix user: -table users
+```
+
+```bash
+build/redis-arrow adopt -prefix user: -table users -apply
+```
+
+```text
+Adopted: public.users now reads the HASHes under user: (index idx:public:users:adopted; wrote __rowid into 500 HASHes).
+```
+
+- **What it does,** in order:
+  1. Reserve the key prefix and the index name `idx:<schema>:<table>:adopted`
+     (no driver table's index can have that name). The transaction checks
+     again that no driver table's prefix overlaps the prefix.
+  2. Create the index: the driver's format (`__rowid NUMERIC SORTABLE`, and
+     each column as a table's), over the existing keys, with `FILTER
+     "exists(@__rowid)"` so that it only holds HASHes that are rows. The
+     fields that would set a document's language, score or payload are
+     renamed to ones no application uses (`__adbc_language`, …).
+  3. Write `__rowid` (the key's suffix) into each HASH that has none. A
+     one-key Lua script does it only while the key exists, so a HASH that
+     the application deletes meanwhile isn't made again.
+  4. Wait until the index has indexed every HASH. If it couldn't index one
+     (a value written meanwhile that a NUMERIC column can't hold), adopt
+     drops the index (without `DD`) and gives the names back. The
+     `__rowid` fields it wrote stay, and it says so.
+  5. Write the table's metadata, marked `adopted`.
+  6. Write `__rowid` into the HASHes the application added meanwhile,
+     when their values fit the columns.
+
+  An adopt that stopped half-way (the process was killed, say) left a
+  record in `adbc:{meta}:adopting`. Running it again with the same `-table`
+  finishes it.
+- **Columns.** Every field is a column, as in a copy, but in place a column
+  is only `BIGINT`, `NUMERIC(38, s)` or `DOUBLE PRECISION` if every HASH
+  that has the field holds such a number. The driver reads the stored
+  text as it is: it stores booleans as 0 and 1, and dates and times as
+  integers, so `true`/`false` text and ISO dates are `VARCHAR`. A field
+  that is empty in some HASH is `VARCHAR`, since RediSearch doesn't index a
+  HASH whose `NUMERIC` field isn't a number. `-type col=TYPE` sets a type
+  that every value is stored as (`-type flag=BOOLEAN` for 0/1 flags), and
+  `-index-columns` picks the indexed columns. Every column is nullable.
+- **Strings.** The application's later writes don't tell the driver which
+  strings the index doesn't hold exactly (see "Strings in the index"
+  below), so an adopted table's indexed string columns count as
+  `truncated`. The driver then re-checks string filters, and sorts, groups
+  and reads string columns itself: always right, but slower.
+  `-trust-strings` records the levels measured now instead, for HASHes the
+  application no longer writes, or never writes with a string the index
+  doesn't hold exactly.
+- **What an adopted table refuses.** Its keys are the application's, so
+  the driver doesn't hand out row ids among them, move them, or delete them
+  wholesale:
+  - `INSERT` (and `MERGE … INSERT` and bulk ingest), `TRUNCATE`,
+    `ALTER TABLE … ADD COLUMN`, and `RENAME TO` with
+    `adbc.redis.rename_rekey` fail with `… isn't supported on
+    "public"."users", whose rows are HASHes adopted in place (redis-arrow
+    adopt) under "user:"`.
+  - `DROP TABLE` drops the adopted index (without `DD`) and the metadata.
+    The HASHes stay, with their `__rowid`. Adopting them again finds those
+    already in place.
+  - `DROP COLUMN` forgets the column. The field stays in the HASHes.
+  - No new table may have its rows under an adopted prefix: a schema named
+    `user` would put a table's rows under `user:`. `CREATE TABLE` there
+    fails.
+  - `SELECT`, `UPDATE`, `DELETE`, views, joins and `ALTER TABLE … RENAME`
+    work as on any table. `UPDATE` and `DELETE` change the application's
+    HASHes.
+- **Hazards,** which `check` and `adopt` list too:
+  - HASHes the application writes later have no `__rowid`, so SQL doesn't
+    see them (the index's filter keeps them out of counts too) until
+    `adopt -refresh -apply` writes it. `-refresh` without `-apply` counts
+    them.
+  - An application write of a value that a numeric column can't hold (text,
+    an empty value, `NaN`) takes that HASH out of the index, and so out of
+    the table. `FT.INFO` counts it as an indexing failure, and `check`
+    reports it.
+  - `__rowid` shows up in the application's own `HGETALL` and `FT.SEARCH`
+    results.
+  - An `UPDATE` racing the application's `DELETE` of the same HASH can
+    write it again, with only the updated fields.
+
 **ACL users.** `check` and `scan` need read access to the collection's keys
 (`%R~user:*`), and these commands; `check` also reads the driver's metadata
 (`%R~adbc:*`):
@@ -747,6 +874,17 @@ build/redis-arrow scan -prefix user: | build/redis-arrow import -table users
 # A cluster (OSS Cluster API) also
 +cluster|slots +command
 ```
+
+`adopt` needs the driver's own rules (see "ACL users" under
+[Server requirements](#server-requirements)), write access to the
+collection's keys (`~user:*`), and:
+
+```text
++scan +eval +evalsha +script|load
+```
+
+A user that only queries an adopted table needs the driver's read-only
+rules, with read access to the collection's keys (`%R~user:*`).
 
 `check` leaves out the search indexes on keys the user may not read (Redis
 refuses `FT.INFO` on them), and says how many. Without `MEMORY USAGE`, it
