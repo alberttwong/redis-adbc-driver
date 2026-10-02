@@ -14,9 +14,9 @@
   limitations under the License.
 -->
 
-# ADBC Driver for Redis
+# Arrow Database Connection (ADBC) driver and Apache Arrow IPC for Redis
 
-An [ADBC](https://arrow.apache.org/adbc/) driver for Redis 8.x, built on
+An [ADBC](https://arrow.apache.org/adbc/) driver and Apache Arrow IPC for Redis 8.x, built on
 [driverbase-go](https://github.com/adbc-drivers/driverbase-go) and validated
 with the [ADBC driver validation suite](https://github.com/adbc-drivers/validation).
 It supports SQL queries and Arrow bulk ingestion.
