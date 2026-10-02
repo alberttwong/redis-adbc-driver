@@ -18,9 +18,10 @@ package redis
 //
 // Every SELECT (and the target of UPDATE/DELETE) pushes a scope holding the
 // relations its columns may come from. A column reference resolves in the
-// innermost scope that has it; a reference that resolves in an enclosing
-// scope is a correlated (outer) reference, and every subquery between the
-// reference and its scope is marked correlated.
+// innermost scope that has it (for t.col, an item visible as t: by its
+// alias if it has one, else by its name; see resolveColumn); a reference
+// that resolves in an enclosing scope is a correlated (outer) reference, and
+// every subquery between the reference and its scope is marked correlated.
 //
 // Subqueries run through the same executor: uncorrelated ones once per
 // statement (cached), correlated ones once per distinct set of outer values
@@ -218,6 +219,12 @@ func (e *executor) scopeTypes() map[string]ColType {
 	return types
 }
 
+// resolveColumn resolves a column reference as Postgres does. An unqualified
+// column is one of the innermost scope that has it. A qualified one, t.col,
+// is a column of the item visible as t in the innermost scope that has one;
+// if that item has no such column, it is an error, even if an outer t has
+// one. An item with an alias is visible only by its alias: in a subquery
+// `SELECT … FROM t x`, t.col is an enclosing query's column (#102).
 func (e *executor) resolveColumn(c *ColumnRef) error {
 	if c.written == "" {
 		c.written = c.Name
@@ -228,11 +235,14 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 		sc := e.scopes[top-depth]
 		var match columnMeta
 		var matchRel relation
-		found := 0
+		found, named := 0, 0
 		for _, rel := range sc.rels {
-			if c.Qualifier != "" && !strings.EqualFold(c.Qualifier, rel.name) &&
-				!(rel.prefix == "" && strings.EqualFold(c.Qualifier, rel.meta.Name)) {
-				continue
+			if c.Qualifier != "" {
+				// rel.name is the item's alias, or its name if it has none.
+				if !strings.EqualFold(c.Qualifier, rel.name) {
+					continue
+				}
+				named++
 			}
 			col, ok := rel.meta.column(c.Name)
 			if !ok || (rel.prefix != "" && col.Name == rowIDField) || (c.Qualifier == "" && rel.hidden[col.Name]) {
@@ -269,15 +279,62 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 			}
 			return nil
 		}
+		if named > 0 {
+			// The item visible as the qualifier here has no such column.
+			return noSuchColumn(c, sc)
+		}
 	}
+	if c.Qualifier != "" {
+		return e.missingFromEntry(c.Qualifier)
+	}
+	if top < 0 {
+		return noSuchColumn(c, nil)
+	}
+	return noSuchColumn(c, e.scopes[top])
+}
+
+// noSuchColumn is the error for a column that the scope sc (nil for none)
+// doesn't have.
+func noSuchColumn(c *ColumnRef, sc *scope) error {
 	name := c.Name
 	if c.Qualifier != "" {
 		name = c.Qualifier + "." + c.Name
 	}
-	if top >= 0 && len(e.scopes[top].rels) == 1 {
-		return errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", name, e.scopes[top].rels[0].meta.Name)
+	if sc != nil && len(sc.rels) == 1 {
+		return errorf(adbc.StatusInvalidArgument, "column %q does not exist in table %q", name, sc.rels[0].meta.Name)
 	}
 	return errorf(adbc.StatusInvalidArgument, "column %q does not exist", name)
+}
+
+// missingFromEntry is Postgres's error for a qualifier that names no FROM
+// item visible at any level. When it is the name of a table, view or CTE
+// that a level reads under an alias, the message names the innermost such
+// alias, as Postgres's hint does.
+func (e *executor) missingFromEntry(name string) error {
+	for i := len(e.scopes) - 1; i >= 0; i-- {
+		if alias, ok := aliasOf(e.scopes[i].rels, name); ok {
+			return errInvalidFromEntry(name, alias)
+		}
+	}
+	return errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", name)
+}
+
+// aliasOf returns the alias under which one of rels reads the table, view
+// or CTE name.
+func aliasOf(rels []relation, name string) (string, bool) {
+	for _, rel := range rels {
+		if rel.name != "" && rel.meta != nil && !strings.EqualFold(rel.name, name) && strings.EqualFold(rel.meta.Name, name) {
+			return rel.name, true
+		}
+	}
+	return "", false
+}
+
+// errInvalidFromEntry is Postgres's error (with its hint) for a table
+// referred to by its name where only its alias is visible.
+func errInvalidFromEntry(name, alias string) error {
+	return errorf(adbc.StatusInvalidArgument,
+		"invalid reference to FROM-clause entry for table %q; perhaps you meant to reference the table alias %q", name, alias)
 }
 
 func containsRef(refs []outerRef, r outerRef) bool {

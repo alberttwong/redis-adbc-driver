@@ -989,7 +989,7 @@ field, even if later rows have it.
   where an item is a table, a CTE, `[LATERAL] (SELECT …)` or
   `[LATERAL] GENERATE_SERIES(…)`, each with an optional alias and column
   aliases (`AS a(x, y)`; `t.col` qualifies a column, and `t.*` selects one
-  item's columns, also as `schema.table.*`),
+  item's columns, also as `schema.table.*`; see "Names" below),
   with aggregates (below), `CASE` (simple and searched), arithmetic,
   `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`,
   `IS [NOT] DISTINCT FROM` (NULLs count as equal), row constructors
@@ -1000,6 +1000,32 @@ field, even if later rows have it.
   `BETWEEN`, `IN`, `COALESCE`, `LOWER/UPPER/LENGTH/ABS`, `CONCAT(a, …)` and
   `CONCAT_WS(sep, a, …)` (NULL arguments are skipped, as in Postgres; `||`
   returns NULL if either side is NULL), `from_hex`
+- **Names** resolve as in Postgres, at every query level: subqueries
+  (`EXISTS`, `IN`, `ANY` / `ALL`, scalar), `LATERAL`, derived tables, CTEs,
+  views, set operations, and the subqueries of `UPDATE`, `DELETE`, `UPDATE …
+  FROM`, `DELETE … USING` and `MERGE`:
+  - **A FROM item with an alias is visible only by its alias.** In `select
+    id from t where exists (select 1 from t x where x.v > t.v)`, `t.v` is
+    the outer row's, since the inner `t` is visible only as `x`. Up to
+    v0.0.7, a level with a single FROM item also knew it by its table's
+    name, so `t.v` was the inner row's and the query compared each row with
+    itself (#102)
+  - **A FROM item without an alias** is visible by its table name, also as
+    `schema.table.col` (the schema isn't checked)
+  - **`t.col`** is a column of the innermost level with an item visible as
+    `t`. If that item has no column `col`, it is an error, even when an
+    outer `t` has one. An unqualified `col` is a column of the innermost
+    level that has one, and `column reference "col" is ambiguous` if two of
+    that level's items have it
+  - **Errors** are Postgres's: `missing FROM-clause entry for table "t"`
+    when no level has an item visible as `t`, and `invalid reference to
+    FROM-clause entry for table "t"; perhaps you meant to reference the
+    table alias "x"` (Postgres's hint) when a level reads `t` as `x`, as in
+    `select t.id from t x` or `update t x set … where t.id = 1`. Postgres
+    gives the second only when `t` is on the search path, the driver
+    whenever an item's table, view or CTE is named `t`. A derived table
+    that refers to an earlier FROM item without `LATERAL` gets the first
+    (Postgres: the second, with a hint to add `LATERAL`)
 - `FETCH FIRST n ROWS ONLY` is `LIMIT n` (`FETCH FIRST ROW ONLY` is `LIMIT
   1`); `WITH TIES` is not supported, and a query has at most one `LIMIT` or
   `FETCH` (Postgres's "multiple LIMIT clauses not allowed")
