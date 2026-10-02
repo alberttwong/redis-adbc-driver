@@ -42,7 +42,7 @@ class RedisQuirks(model.DriverQuirks):
         # Temporary tables are per connection, in a schema it sees as pg_temp.
         statement_bulk_ingest_temporary=True,
         statement_execute_schema=True,
-        statement_get_parameter_schema=False,
+        statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
         statement_rows_affected_ddl=False,

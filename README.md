@@ -23,7 +23,7 @@ It supports SQL queries and Arrow bulk ingestion.
 
 ## Tested with
 
-The full validation suite (324 passed, 0 failed) has been run against:
+The full validation suite (325 passed, 0 failed) has been run against:
 
 | Server | Version | Connection |
 |-|-|-|
@@ -40,9 +40,8 @@ Local testing uses the Redis version that Redis Cloud runs (currently
 † Run before the two temporary-table ingest tests were enabled (322
 passed, 0 failed); not re-run since.
 
-The remaining 10 skipped tests and 1 expected failure are features the
-driver doesn't offer: constraints, statistics, a second catalog,
-transactions, and parameter-type introspection.
+The remaining 10 skipped tests are features the driver doesn't offer:
+constraints, statistics, a second catalog, and transactions.
 
 Redis Flex (RAM + SSD) databases are not supported yet, and the driver
 refuses them when it connects; see
@@ -1133,6 +1132,32 @@ field, even if later rows have it.
   parameters or `DEFAULT`, `INSERT INTO t DEFAULT VALUES`, and
   `INSERT INTO t [(cols)] SELECT …` (the query may be parenthesized:
   `INSERT INTO t (SELECT …)`)
+- **Parameters.**
+  - **Placeholders:** `$1`, `$2`, … and `?`. A `?` is numbered in order of
+    appearance, separately from `$n`: in `SELECT $2, ?` the `?` is the first
+    parameter.
+  - **Binding:** with `Bind` or `BindStream`; the statement runs once per row.
+  - **`GetParameterSchema`** describes the parameters without running the
+    statement: one unnamed, nullable field per parameter, in order, with the
+    type the parameter is used as:
+    - Compared with an expression (`=`, `<>`, `<`, …, `IS [NOT] DISTINCT
+      FROM`, and so `IN (…)` and `BETWEEN`): that expression's type. In `$1
+      IN (SELECT …)`, the subquery's column type.
+    - An `INSERT` value, or an `UPDATE` `SET` value: the target column's type.
+      This also covers `-$1` and the select items of `INSERT … SELECT`.
+    - `CAST($1 AS t)` or `$1::t`: `t`.
+    - Arithmetic with a number: that number's type.
+    - `||`, `LIKE`, `ILIKE`, `SIMILAR TO` and the regex operators: text.
+    - `AND`, `OR`, `NOT`, and `CASE WHEN` conditions: boolean.
+    - `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` arguments, and `CASE`
+      results: the type of the others.
+  - **Which use wins:** the first use that gives a type.
+  - **Null type:** a parameter gets the null type when it is used nowhere a
+    type can be taken from (`SELECT $1`), or only in a statement that needs
+    what an earlier statement of the script makes. `MERGE`'s parameters get it
+    too.
+  - **Errors:** a statement that can't be planned, such as one on an unknown
+    table, is an error.
 - Column defaults (`DEFAULT expr`), as in Postgres:
   - A row gets a column's default when it is inserted without a value for
     it: a column left out of the column list of `INSERT … VALUES`,

@@ -101,6 +101,9 @@ type execCache struct {
 	// branchTypes are the result types of CASE and IIF expressions
 	// (branchValue).
 	branchTypes map[Expr]ColType
+	// paramHints are the parameter types found while describing a
+	// statement's parameters (params.go); nil otherwise.
+	paramHints map[int]ColType
 }
 
 func newExecCache() *execCache {
@@ -224,6 +227,9 @@ func (e *executor) bind(ctx context.Context, expr Expr) error {
 		}
 		return err == nil
 	})
+	if err == nil {
+		e.noteParams(expr)
+	}
 	return err
 }
 
