@@ -527,6 +527,60 @@ docker exec -it redis-adbc-test redis-cli MONITOR
 
 Stop Redis with `docker compose down`.
 
+## Arrow IPC files: `redis-arrow`
+
+`redis-arrow` writes a query's result as an
+[Arrow IPC](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
+file or stream, and bulk-ingests an IPC file or stream into a table. It links
+the driver as a Go library, so it needs neither cgo nor the shared library.
+Build it from `go`:
+
+```bash
+make cli
+```
+
+**Export.** `-o` names the output file. The result is in the IPC file format
+(`.arrow`, also read as Feather v2), except for `.arrows` files and stdout,
+which get the stream format. `-format file|stream` overrides this, and
+`-compression lz4|zstd` compresses the batches.
+
+```bash
+build/redis-arrow export -o sales.arrow "SELECT * FROM sales WHERE status = 'shipped'"
+```
+
+```bash
+build/redis-arrow export "SELECT country, COUNT(*) AS orders FROM sales GROUP BY country" | python -c "import sys, pyarrow.ipc; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())"
+```
+
+**Import.** The input is a path, or stdin when none is given. File and stream
+are told apart by the file format's magic bytes. `-mode` is `create` (the
+default), `append`, `replace` or `create_append`, as in ADBC bulk ingest.
+`-schema` and `-index-columns` (`adbc.redis.ingest.index_columns`) are
+optional.
+
+```bash
+build/redis-arrow import -table sales_copy -mode replace sales.arrow
+```
+
+```bash
+build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table sales_copy -mode replace
+```
+
+- **Connecting:** `-uri`, else `$REDIS_URI`, else `redis://localhost:6379/0`.
+  Set a password in `$REDIS_URI` rather than in `-uri`, where other users
+  of the machine can see it in the process list. `-option key=value`
+  (repeatable) sets a database option, such as
+  `-option adbc.redis.read_timeout=30m`.
+- **Flags go before the query or the path.**
+- **Statements without a result set** (DDL, or DML without `RETURNING`)
+  still run, but `export` then fails and writes nothing. A failed export
+  leaves no partial file: it writes a temporary file next to the target and
+  renames it at the end.
+- **Memory:** the driver builds a query's whole result before it returns
+  the first batch, so exporting a large table needs memory for all of it.
+  Import reads a stream batch by batch, but reads a file on stdin into
+  memory first, since the file format's footer is at its end.
+
 ## Architecture: hybrid index-row layout
 
 ```
@@ -592,7 +646,7 @@ Stop Redis with `docker compose down`.
     when they write.
 - **NaNs in the index**: `REAL` and `DOUBLE PRECISION` columns hold `NaN`,
   `Infinity` and `-Infinity`, as in Postgres. RediSearch doesn't index a
-  HASH whose `NUMERIC` field is `NaN`, so up to v0.0.7 a row holding one was
+  HASH whose `NUMERIC` field is `NaN`, so up to v0.0.8 a row holding one was
   written and never seen again: no index query found it (only `WHERE
   __rowid = N` did), so `SELECT`, `COUNT(*)`, `UPDATE` and `DELETE` skipped
   it, and `DROP TABLE` and `TRUNCATE` left its HASH behind. A NaN is now
@@ -622,7 +676,7 @@ Stop Redis with `docker compose down`.
   - A hash join now matches a NaN with a NaN (it matched it with nothing),
     and `IN` sets and semi-joins look NaNs up by key, as `DISTINCT` and set
     operations did, instead of falling back to comparing values one by one.
-  - **Rows written before:** a row that v0.0.7 or earlier wrote with a NaN
+  - **Rows written before:** a row that v0.0.8 or earlier wrote with a NaN
     in an indexed float column is still not in the index, and its HASH stays
     behind when the table is dropped or truncated. A table has such rows
     when its `COUNT(*)` is less than the number of keys under its
@@ -746,7 +800,7 @@ How SQL is executed:
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables, columns and functions and wrong argument counts are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
 | Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
-| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1). On a cluster, a shard whose rows of a group all lack the value sends NaN as its partial `SUM`, which made the group's `SUM` and `AVG` NaN up to v0.0.7 (`AVG` of an integer column also in the default mode). So when a `SUM` comes back NaN for a group that has values, the driver runs the command again with `case(exists(@c), @c, 0)` in place of `@c` (about 2.5 times as long; a real NaN, from adding +Infinity and -Infinity, stays NaN), and a server without `case()` aggregates the query in the driver |
+| `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1). On a cluster, a shard whose rows of a group all lack the value sends NaN as its partial `SUM`, which made the group's `SUM` and `AVG` NaN up to v0.0.7 (`AVG` of an integer column also in the default mode). So when a `SUM` comes back NaN for a group that has values, the driver runs the command again with `case(exists(@c), @c, 0)` in place of `@c` (about 2.5 times as long; a real NaN, from adding +Infinity and -Infinity, stays NaN), and a server without `case()` aggregates the query in the driver. An amd64 server writes that NaN `-nan`, which up to v0.0.8 the driver didn't read, so it aggregated such queries itself |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
 | `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
 | `col LIKE 'abc%'` on an indexed string column | TAG prefix query `@c:{abc*}` on the prefix's tag, re-checked by the driver (other patterns are checked by the driver alone). RediSearch expands a prefix into at most `search-max-prefix-expansions` tags (200 by default, per shard) and silently ignores the rest, so the driver first runs the prefix query under `FT.PROFILE … LIMIT 0 1` (one more round trip, about 0.3 ms) and, unless every shard's profile reports no warning, checks the prefix on every row the rest of the WHERE clause selects instead. The server's configuration is never changed |
@@ -1260,14 +1314,14 @@ field, even if later rows have it.
     view without an alias is also visible as `schema.table.col` (or
     `redis.schema.table.col`), with its own schema only (`pg_temp` for a
     temporary table): in `select s2.t.v from s1.t`, `s2.t` names no FROM
-    item. Up to v0.0.7 the schema wasn't checked, so that query read
+    item. Up to v0.0.8 the schema wasn't checked, so that query read
     `s1.t`'s `v` (#111). CTEs, derived tables and items with an alias
     aren't visible schema-qualified
   - **Two tables or views with the same name** from different schemas can
     be FROM items together without aliases, as in Postgres: `select s1.t.v,
     s2.t.v from s1.t join s2.t on s1.t.id = s2.t.id`, in any join, `USING`
     and `NATURAL` included, and in `UPDATE … FROM` and `DELETE … USING`. Up
-    to v0.0.7 that was `table name "t" specified more than once; use
+    to v0.0.8 that was `table name "t" specified more than once; use
     aliases`. Any other two items of a level with one name still are: the
     same table twice, or an item and an alias, CTE or derived table of its
     name. A `MERGE` source can't have the target's name even then: `name
@@ -2206,7 +2260,7 @@ field, even if later rows have it.
     Postgres, NaN is greater than every other number and equal to itself,
     in comparisons, `ORDER BY`, `GROUP BY`, `DISTINCT`, joins and
     aggregates, and as text (casts, `||`, JSON) they are `NaN`, `Infinity`
-    and `-Infinity`, which were `NaN`, `+Inf` and `-Inf` up to v0.0.7.
+    and `-Infinity`, which were `NaN`, `+Inf` and `-Inf` up to v0.0.8.
     Arrow results hold the doubles themselves. `NUMERIC` has neither (in
     Postgres it has both): converting one to it fails with `cannot convert
     NaN to NUMERIC(10,2): NUMERIC values can't be NaN or infinite`, and

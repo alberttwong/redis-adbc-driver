@@ -60,7 +60,11 @@ package redis
 // +Infinity, in the same window in which it may or may not see the rows at
 // all. Earlier versions of the driver write "NaN" and don't set NaNs.
 
-import "math"
+import (
+	"math"
+	"strconv"
+	"strings"
+)
 
 // nanStored is the HASH value of a float NaN, which the index reads as +inf.
 const nanStored = "infinity"
@@ -78,6 +82,17 @@ func numericBound(v Value) string {
 		}
 	}
 	return encodeStored(v)
+}
+
+// parseFloat is strconv.ParseFloat, but also reads -nan and +nan, which it
+// doesn't. RediSearch writes a NaN's sign bit: on amd64, +inf + -inf (as in
+// a SUM) is the NaN with the sign bit set, so a reducer replies -nan there
+// and nan on arm64.
+func parseFloat(s string, bitSize int) (float64, error) {
+	if len(s) == 4 && (s[0] == '-' || s[0] == '+') && strings.EqualFold(s[1:], "nan") {
+		return math.NaN(), nil
+	}
+	return strconv.ParseFloat(s, bitSize)
 }
 
 // pushable reports whether RediSearch returns exact results for aggregates

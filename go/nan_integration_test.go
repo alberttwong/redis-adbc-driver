@@ -499,10 +499,12 @@ func TestSQLNaNAggregates(t *testing.T) {
 	counts := []string{"SELECT COUNT(x), COUNT(*) FROM it_nan_agg", "SELECT g, COUNT(x) FROM it_nan_agg GROUP BY g"}
 	pushed(true, all...)
 	pushed(true, counts...)
+	// +inf + -inf is NaN, which RediSearch writes -nan on amd64.
+	ah := hs[PushdownAll]
+	ah.expectRows("SELECT MAX(x), MIN(x), SUM(x), AVG(x) FROM it_nan_agg", "+Inf|-Inf|NaN|NaN")
 	h.exec("INSERT INTO it_nan_agg VALUES (1, 'NaN')")
 	pushed(false, all...)
 	pushed(true, counts...)
-	ah := hs[PushdownAll]
 	ah.expectRows("SELECT g, COUNT(x), MAX(x), SUM(x) FROM it_nan_agg GROUP BY g ORDER BY g", "1|3|NaN|NaN", "2|1|-Inf|-Inf")
 	ah.expectRows("SELECT x, COUNT(*) FROM it_nan_agg GROUP BY x ORDER BY x", "-Inf|1", "2|1", "+Inf|1", "NaN|1")
 	ah.expectRows("SELECT x FROM it_nan_agg ORDER BY x DESC LIMIT 1", "NaN")
