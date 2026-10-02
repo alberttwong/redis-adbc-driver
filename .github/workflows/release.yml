@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Builds the driver library for Linux (amd64, arm64) and macOS (arm64),
-# tests the Linux builds against Redis (standalone and a 3-shard cluster),
-# runs the validation suite on each Linux tarball on every distribution
-# Redis Software supports, and attaches the tarballs to the release.
+# Builds the driver library and the redis-arrow command for Linux (amd64,
+# arm64) and macOS (arm64), tests the Linux builds against Redis (standalone
+# and a 3-shard cluster), runs the validation suite and a redis-arrow round
+# trip on each Linux tarball on every distribution Redis Software supports,
+# and attaches the tarballs to the release.
+#
+# The redis-arrow steps are skipped for releases tagged before it existed
+# (no go/cmd/redis-arrow).
 #
 # Runs when a release is published, or by hand for an existing release tag
 # (its assets are replaced). Pull requests that change this file run the
@@ -87,6 +91,16 @@ jobs:
           cache-dependency-path: go/go.sum
       - uses: astral-sh/setup-uv@v10.2.0
 
+      # redis-arrow needs no cgo, so it is statically linked and runs on any
+      # Linux of its architecture.
+      - name: Build redis-arrow
+        if: hashFiles('go/cmd/redis-arrow/main.go') != ''
+        working-directory: go
+        run: |
+          make cli VERSION="$VERSION"
+          file build/redis-arrow
+          file build/redis-arrow | grep -q 'statically linked'
+
       - name: Start Redis
         working-directory: go
         run: |
@@ -116,6 +130,19 @@ jobs:
           name="adbc_driver_redis-$VERSION-linux-$ARCH"
           mkdir -p "dist/$name"
           cp go/build/libadbc_driver_redis.so go/build/libadbc_driver_redis.h README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          rm -r "$name"
+
+      - name: Package redis-arrow
+        if: hashFiles('go/cmd/redis-arrow/main.go') != ''
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name="redis-arrow-$VERSION-linux-$ARCH"
+          mkdir -p "dist/$name"
+          cp go/build/redis-arrow README.md "dist/$name/"
           cd dist
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -176,6 +203,29 @@ jobs:
               cd /work/go/validation
               /uv/uv run -q pytest -q tests/'
 
+      # The redis-arrow tarball: export to a file, import it, then pipe an
+      # export into an import.
+      - name: redis-arrow
+        if: hashFiles('go/cmd/redis-arrow/main.go') != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name="redis-arrow-$VERSION-linux-$ARCH"
+          tar xzf "dist/$name.tar.gz" -C dist
+          docker run --rm --network host \
+            -v "$PWD/dist/$name:/cli:ro" \
+            -e REDIS_URI=redis://localhost:6379/0 "$IMAGE" sh -euc '
+              cd /tmp
+              /cli/redis-arrow export -o one.arrow "SELECT 1 AS id, 2.5 AS x"
+              /cli/redis-arrow import -table release_cli -mode replace one.arrow 2> out
+              grep -qx "1 row ingested into release_cli" out
+              /cli/redis-arrow export "SELECT * FROM release_cli" |
+                /cli/redis-arrow import -table release_cli -mode append 2> out
+              grep -qx "1 row ingested into release_cli" out
+              /cli/redis-arrow export -o all.arrows "SELECT * FROM release_cli" 2> out
+              grep -qx "2 rows" out'
+
   # GitHub's macOS runners can't run the Redis containers, so the macOS
   # library is built and checked to load; the Go unit tests run without a
   # server (integration tests skip).
@@ -195,6 +245,14 @@ jobs:
         working-directory: go
         run: make build VERSION="$VERSION"
 
+      - name: Build redis-arrow
+        if: hashFiles('go/cmd/redis-arrow/main.go') != ''
+        working-directory: go
+        run: |
+          make cli VERSION="$VERSION"
+          file build/redis-arrow | grep -q arm64
+          build/redis-arrow help | grep -q export
+
       - name: Test
         working-directory: go
         run: |
@@ -207,6 +265,17 @@ jobs:
           name="adbc_driver_redis-$VERSION-darwin-arm64"
           mkdir -p "dist/$name"
           cp go/build/libadbc_driver_redis.dylib go/build/libadbc_driver_redis.h README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          rm -r "$name"
+
+      - name: Package redis-arrow
+        if: hashFiles('go/cmd/redis-arrow/main.go') != ''
+        run: |
+          name="redis-arrow-$VERSION-darwin-arm64"
+          mkdir -p "dist/$name"
+          cp go/build/redis-arrow README.md "dist/$name/"
           cd dist
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
