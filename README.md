@@ -1284,6 +1284,29 @@ field, even if later rows have it.
     grouping expressions, matched as a whole (`GROUP BY ROLLUP (UPPER(s))`
     can select `UPPER(s)` but not `s`); this also applies to a plain `GROUP
     BY` that calls `GROUPING()`
+- **Subqueries of a grouped query** (`GROUP BY`, or aggregates or `HAVING`
+  without it) may read only its grouped columns, as in Postgres. That applies
+  where the query computes a value per group: the SELECT list, `HAVING`,
+  `ORDER BY`, `QUALIFY`, `DISTINCT ON` and window definitions, outside
+  aggregate calls, also in nested subqueries. A grouped column is a `GROUP
+  BY` item by itself, so `group by v` lets a subquery read `g.v`, but
+  `group by id + 1` doesn't let it read `g.id`.
+  - **The error** is Postgres's `subquery uses ungrouped column "g.id" from
+    outer query`, for example in `select v from g group by v having exists
+    (select 1 from g x where x.id > g.id)`. Up to v0.0.8 the subquery read
+    one row of each group (#112).
+  - **Not supported:** an aggregate of only the outer query's columns, such
+    as `max(g.id)` in `(select max(g.id) from x)`. Postgres computes it over
+    the outer query's group, and it makes a query without `GROUP BY` an
+    aggregate one. Over an ungrouped column it is `outer-level aggregate of
+    column "g.id" in a subquery is not supported`. Otherwise the driver
+    computes it over the subquery's rows.
+  - **Repeated subqueries:** a subquery in `GROUP BY` counts as grouped
+    where it is the same item, by position or alias (`group by 1`), not
+    where it is written again (Postgres accepts both).
+  - **Outside subqueries,** a column that is neither grouped nor aggregated
+    is still read from the group's first row. Postgres rejects it unless the
+    `GROUP BY` has the table's primary key, which the driver doesn't keep.
 - `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` (`INTERSECT` binds
   tighter; parenthesized branches may have their own `ORDER BY`/`LIMIT`).
   Columns are matched by position and widened to a common type; NULLs count
