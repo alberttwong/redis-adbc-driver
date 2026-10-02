@@ -188,9 +188,30 @@ var funcDefs = []funcDef{
 	{name: "LOG", min: 1, max: 2, impl: implScalar},
 	{name: "LOG10", min: 1, max: 1, impl: implScalar},
 	{name: "EXP", min: 1, max: 1, impl: implScalar},
+	{name: "CBRT", min: 1, max: 1, impl: implScalar},
 	{name: "SIGN", min: 1, max: 1, impl: implScalar},
 	{name: "RANDOM", min: 0, max: 0, impl: implScalar, volatile: true},
 	{name: "ABS", min: 1, max: 1},
+	{name: "PI", min: 0, max: 0, impl: implScalar},
+	// Trigonometric functions, in radians and (the …D ones) in degrees.
+	{name: "SIN", min: 1, max: 1, impl: implScalar},
+	{name: "COS", min: 1, max: 1, impl: implScalar},
+	{name: "TAN", min: 1, max: 1, impl: implScalar},
+	{name: "COT", min: 1, max: 1, impl: implScalar},
+	{name: "ASIN", min: 1, max: 1, impl: implScalar},
+	{name: "ACOS", min: 1, max: 1, impl: implScalar},
+	{name: "ATAN", min: 1, max: 1, impl: implScalar},
+	{name: "ATAN2", min: 2, max: 2, impl: implScalar}, // ATAN2(y, x)
+	{name: "SIND", min: 1, max: 1, impl: implScalar},
+	{name: "COSD", min: 1, max: 1, impl: implScalar},
+	{name: "TAND", min: 1, max: 1, impl: implScalar},
+	{name: "COTD", min: 1, max: 1, impl: implScalar},
+	{name: "ASIND", min: 1, max: 1, impl: implScalar},
+	{name: "ACOSD", min: 1, max: 1, impl: implScalar},
+	{name: "ATAND", min: 1, max: 1, impl: implScalar},
+	{name: "ATAN2D", min: 2, max: 2, impl: implScalar},
+	{name: "RADIANS", min: 1, max: 1, impl: implScalar},
+	{name: "DEGREES", min: 1, max: 1, impl: implScalar},
 
 	// ---- strings (scalar.go, eval.go) ----
 	// SUBSTRING also has the forms SUBSTRING(s FROM a [FOR b]) and

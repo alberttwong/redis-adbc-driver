@@ -200,7 +200,7 @@ func TestSQLAggStatistics(t *testing.T) {
 	schema := h.expectRows(`SELECT VAR_SAMP(v), VARIANCE(v), VAR_POP(v), STDDEV_SAMP(v), STDDEV(v), STDDEV_POP(v) FROM it_agg`,
 		"18.8|18.8|15.04|4.33589667773576|4.33589667773576|3.878143885933063")
 	expectTypeIDs(t, schema, arrow.FLOAT64, arrow.FLOAT64, arrow.FLOAT64, arrow.FLOAT64, arrow.FLOAT64, arrow.FLOAT64)
-	// Decimals are summed exactly too; doubles use Welford's algorithm.
+	// Decimals and doubles are summed exactly too.
 	h.expectRows(`SELECT VAR_SAMP(n), VAR_POP(n), STDDEV_SAMP(n), STDDEV_POP(n) FROM it_agg`,
 		"16.925|13.54|4.1140004861448425|3.6796738985948196")
 	// Welford's last bits depend on the order the rows come in, which on a
@@ -230,8 +230,7 @@ func TestSQLAggStatistics(t *testing.T) {
 	h.exec(`INSERT INTO it_agg_big (x) VALUES (9223372036854775805), (9223372036854775806), (9223372036854775807)`)
 	h.expectRows(`SELECT VAR_SAMP(x), STDDEV_SAMP(x), VAR_POP(x) FROM it_agg_big`, "1|1|0.6666666666666666")
 
-	// As window functions; values leave the sliding frames exactly (integers)
-	// or without subtraction (doubles).
+	// As window functions; values leave the sliding frames exactly.
 	h.expectRows(`SELECT id, VAR_SAMP(v) OVER w, STDDEV_POP(v) OVER w, VAR_SAMP(f) OVER w, STDDEV_POP(f) OVER w,
 			VAR_POP(n) OVER (PARTITION BY g)
 		FROM it_agg WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) ORDER BY id`,

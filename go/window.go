@@ -35,8 +35,8 @@ package redis
 //     frame's bounds only move forward as the current row advances, so an
 //     aggregate adds the rows that enter the frame and removes the rows that
 //     leave it: O(1) amortized per row for COUNT, SUM and AVG, and a monotonic
-//     deque for MIN / MAX. Floating-point sums use a two-stack queue instead
-//     of subtracting, so values leaving the frame cannot cost precision.
+//     deque for MIN / MAX. Sums are exact (exactsum.go), also of doubles, so
+//     subtracting the values that leave the frame costs no precision.
 //
 // NULLs sort last in either direction unless NULLS FIRST is given, as in
 // ORDER BY.
@@ -44,9 +44,6 @@ package redis
 import (
 	"cmp"
 	"fmt"
-	"math"
-	"math/big"
-	"math/bits"
 	"slices"
 	"sort"
 	"strings"
@@ -891,10 +888,7 @@ func (ws *windowSet) compute(env *evalEnv, c windowCall, args [][]Value, keep []
 	case !star:
 		in = args[0]
 	}
-	agg, err := newFrameAgg(f, star, c.typ, in)
-	if err != nil {
-		return err
-	}
+	agg := newFrameAgg(f, star, c.typ, in)
 	if len(args) > 1 {
 		agg.sep = args[1] // STRING_AGG / LISTAGG
 	}
@@ -1351,109 +1345,37 @@ type frameAgg struct {
 	typ  ColType
 	in   []Value // argument of each row
 	sep  []Value // STRING_AGG / LISTAGG: separator of each row
-	mode int     // SUM / AVG accumulator
 	// count of non-NULL arguments (rows, for COUNT(*)) in the frame.
 	count int64
-	trues int64 // BOOL_OR / BOOL_AND: true arguments
-	// 128-bit integer sum.
-	hi int64
-	lo uint64
-	// decimal sum, at scale.
-	dec   *big.Int
-	scale int32
-	fsum  floatQueue
-	stat  *statAcc // variances and standard deviations
+	trues int64     // BOOL_OR / BOOL_AND: true arguments
+	sum   *exactSum // SUM and AVG, and (with squares) the variances
 	// MIN / MAX: a monotonic deque of (position, value). ANY_VALUE,
 	// STRING_AGG and LISTAGG: the frame's non-NULL arguments, in order.
 	deque []dequeEntry
 	head  int
 }
 
-const (
-	sumInt = iota
-	sumDecimal
-	sumFloat
-)
-
 type dequeEntry struct {
 	pos, row int
 	v        Value
 }
 
-func newFrameAgg(f *Func, star bool, typ ColType, in []Value) (*frameAgg, error) {
+func newFrameAgg(f *Func, star bool, typ ColType, in []Value) *frameAgg {
 	a := &frameAgg{name: f.Name, star: star, typ: typ, in: in}
-	if statFuncs[f.Name] {
-		// Exact sums unless there is a double to sum.
-		exact := true
-		for _, v := range in {
-			if !v.Null && v.T.Kind.isFloat() {
-				exact = false
-				break
-			}
-		}
-		a.stat = newStatAcc(exact, true)
-		return a, nil
-	}
-	if f.Name != "SUM" && f.Name != "AVG" {
-		return a, nil
-	}
-	// Integers sum exactly (AVG then divides); decimals sum exactly for SUM;
-	// everything else, and decimal AVG, sums as doubles, as GROUP BY does.
-	a.mode = sumFloat
 	switch {
-	case typ.Kind == KindInt64 && f.Name == "SUM":
-		a.mode = sumInt
-	case typ.Kind == KindDecimal && f.Name == "SUM":
-		a.mode, a.scale = sumDecimal, typ.Scale
-	case f.Name == "AVG":
-		a.mode = sumInt
-		for _, v := range in {
-			if !v.Null && !(v.T.Kind.isInteger() || v.T.Kind == KindBool) {
-				a.mode = sumFloat
-				break
-			}
-		}
+	case statFuncs[f.Name]:
+		a.sum = &exactSum{squares: true}
+	case f.Name == "SUM" || f.Name == "AVG":
+		a.sum = &exactSum{}
 	}
-	// Bring the arguments to the accumulator's type once.
-	a.in = slices.Clone(in)
-	for r, v := range a.in {
-		if v.Null {
-			continue
-		}
-		switch a.mode {
-		case sumInt:
-			if !(v.T.Kind.isInteger() || v.T.Kind == KindBool) {
-				cv, err := Coerce(v, typeInt64)
-				if err != nil {
-					return nil, err
-				}
-				a.in[r] = cv
-			}
-		case sumDecimal:
-			if v.T.Kind != KindDecimal || v.T.Scale != a.scale {
-				cv, err := Coerce(v, decimalType(38, a.scale))
-				if err != nil {
-					return nil, err
-				}
-				a.in[r] = cv
-			}
-		default:
-			fv, _ := v.asFloat()
-			a.in[r] = floatValue(typeFloat64, fv)
-		}
-	}
-	return a, nil
+	return a
 }
 
 func (a *frameAgg) reset() {
-	a.count, a.trues, a.hi, a.lo, a.head = 0, 0, 0, 0, 0
+	a.count, a.trues, a.head = 0, 0, 0
 	a.deque = a.deque[:0]
-	a.fsum.reset()
-	if a.mode == sumDecimal {
-		a.dec = new(big.Int)
-	}
-	if a.stat != nil {
-		a.stat.reset()
+	if a.sum != nil {
+		a.sum.reset()
 	}
 }
 
@@ -1478,16 +1400,6 @@ func (a *frameAgg) add(row, pos int) {
 			a.deque = a.deque[:len(a.deque)-1]
 		}
 		a.deque = append(a.deque, dequeEntry{pos: pos, v: v})
-	case "SUM", "AVG":
-		switch a.mode {
-		case sumInt:
-			lo, carry := bits.Add64(a.lo, uint64(v.I), 0)
-			a.lo, a.hi = lo, a.hi+(v.I>>63)+int64(carry)
-		case sumDecimal:
-			a.dec.Add(a.dec, v.D)
-		default:
-			a.fsum.push(v.F)
-		}
 	case "BOOL_OR", "BOOL_AND", "EVERY":
 		if v.I != 0 {
 			a.trues++
@@ -1495,8 +1407,8 @@ func (a *frameAgg) add(row, pos int) {
 	case "ANY_VALUE", "STRING_AGG", "LISTAGG":
 		a.deque = append(a.deque, dequeEntry{pos: pos, row: row, v: v})
 	default:
-		if a.stat != nil {
-			a.stat.add(v)
+		if a.sum != nil {
+			a.sum.add(v)
 		}
 	}
 }
@@ -1520,23 +1432,13 @@ func (a *frameAgg) remove(row, pos int) {
 				a.deque, a.head = a.deque[:0], 0
 			}
 		}
-	case "SUM", "AVG":
-		switch a.mode {
-		case sumInt:
-			lo, borrow := bits.Sub64(a.lo, uint64(v.I), 0)
-			a.lo, a.hi = lo, a.hi-(v.I>>63)-int64(borrow)
-		case sumDecimal:
-			a.dec.Sub(a.dec, v.D)
-		default:
-			a.fsum.pop()
-		}
 	case "BOOL_OR", "BOOL_AND", "EVERY":
 		if v.I != 0 {
 			a.trues--
 		}
 	default:
-		if a.stat != nil {
-			a.stat.remove(v)
+		if a.sum != nil {
+			a.sum.remove(v)
 		}
 	}
 }
@@ -1565,67 +1467,14 @@ func (a *frameAgg) result() (Value, error) {
 	case "BOOL_OR", "BOOL_AND", "EVERY":
 		return boolResult(a.name != "BOOL_OR", a.count, a.trues), nil
 	}
-	if a.stat != nil {
-		return a.stat.result(a.name), nil
+	if statFuncs[a.name] {
+		return a.sum.varianceValue(a.name), nil
 	}
 	if a.count == 0 {
 		return nullValue(a.typ), nil
 	}
-	fits := int64(a.lo)>>63 == a.hi
-	if a.name == "SUM" {
-		switch a.mode {
-		case sumInt:
-			if !fits {
-				return Value{}, fmt.Errorf("integer overflow in SUM")
-			}
-			return intValue(typeInt64, int64(a.lo)), nil
-		case sumDecimal:
-			return decimalValue(new(big.Int).Set(a.dec), a.typ.Precision, a.scale), nil
-		}
-		return floatValue(typeFloat64, a.fsum.sum()), nil
+	if a.name == "AVG" {
+		return floatValue(typeFloat64, a.sum.mean()), nil
 	}
-	sum := a.fsum.sum()
-	if a.mode == sumInt {
-		sum = float64(int64(a.lo))
-		if !fits {
-			sum = float64(a.hi)*math.Exp2(64) + float64(a.lo)
-		}
-	}
-	return floatValue(typeFloat64, sum/float64(a.count)), nil
-}
-
-// floatQueue sums a first-in, first-out window of doubles without
-// subtracting: in holds the newest values (summed left to right, as an
-// unbounded frame would be); out holds the oldest ones as suffix sums, its
-// top being the sum of all of them.
-type floatQueue struct {
-	in    []float64
-	inSum float64
-	out   []float64
-}
-
-func (q *floatQueue) reset() { q.in, q.inSum, q.out = q.in[:0], 0, q.out[:0] }
-
-func (q *floatQueue) push(f float64) {
-	q.in = append(q.in, f)
-	q.inSum += f
-}
-
-func (q *floatQueue) pop() {
-	if len(q.out) == 0 {
-		s := 0.0
-		for i := len(q.in) - 1; i >= 0; i-- {
-			s = q.in[i] + s
-			q.out = append(q.out, s)
-		}
-		q.in, q.inSum = q.in[:0], 0
-	}
-	q.out = q.out[:len(q.out)-1]
-}
-
-func (q *floatQueue) sum() float64 {
-	if len(q.out) == 0 {
-		return q.inSum
-	}
-	return q.out[len(q.out)-1] + q.inSum
+	return a.sum.sumValue(a.typ)
 }

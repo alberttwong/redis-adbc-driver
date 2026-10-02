@@ -94,7 +94,9 @@ func scalarFuncType(f *Func, args []ColType) (ColType, bool) {
 		return t, true
 	case "MOD":
 		return modType(f, args), true
-	case "POWER", "POW", "SQRT", "LN", "LOG", "LOG10", "EXP", "RANDOM":
+	case "POWER", "POW", "SQRT", "CBRT", "LN", "LOG", "LOG10", "EXP", "RANDOM", "PI",
+		"SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2",
+		"SIND", "COSD", "TAND", "COTD", "ASIND", "ACOSD", "ATAND", "ATAN2D", "RADIANS", "DEGREES":
 		return typeFloat64, true
 	case "SUBSTRING", "SUBSTR":
 		if arg(0).Kind == KindBinary {
@@ -351,8 +353,13 @@ func scalarFunc(f *Func, args []Value) (Value, error) {
 		return floatValue(typeFloat64, float64(cmpFloat(x.F, 0))), nil
 	case "MOD":
 		return modFunc(f, args)
-	case "POWER", "POW", "SQRT", "LN", "LOG", "LOG10", "EXP":
+	case "POWER", "POW", "SQRT", "CBRT", "LN", "LOG", "LOG10", "EXP", "RADIANS", "DEGREES":
 		return floatFunc(f, args)
+	case "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2",
+		"SIND", "COSD", "TAND", "COTD", "ASIND", "ACOSD", "ATAND", "ATAN2D":
+		return trigFunc(f, args)
+	case "PI":
+		return floatValue(typeFloat64, math.Pi), nil
 	case "RANDOM":
 		return floatValue(typeFloat64, rand.Float64()), nil
 
@@ -679,17 +686,25 @@ func modFunc(f *Func, args []Value) (Value, error) {
 	return floatValue(typeFloat64, math.Mod(a.F, b.F)), nil
 }
 
-// floatFunc evaluates the DOUBLE PRECISION functions, with Postgres's
-// domain errors.
-func floatFunc(f *Func, args []Value) (Value, error) {
+// floatArgs converts a math function's arguments to doubles.
+func floatArgs(f *Func, args []Value) ([]float64, error) {
 	xs := make([]float64, len(args))
 	for i, a := range args {
 		v, err := numericArg(f.Name, a)
 		if err != nil {
-			return Value{}, err
+			return nil, err
 		}
-		fv, _ := v.asFloat()
-		xs[i] = fv
+		xs[i], _ = v.asFloat()
+	}
+	return xs, nil
+}
+
+// floatFunc evaluates the DOUBLE PRECISION functions, with Postgres's
+// domain errors.
+func floatFunc(f *Func, args []Value) (Value, error) {
+	xs, err := floatArgs(f, args)
+	if err != nil {
+		return Value{}, err
 	}
 	fail := func(msg string) (Value, error) { return Value{}, fmt.Errorf("%s: %s", f.Name, msg) }
 	logArg := func(v float64) error {
@@ -758,11 +773,181 @@ func floatFunc(f *Func, args []Value) (Value, error) {
 			return fail("a negative number raised to a non-integer power yields a complex result")
 		}
 		r = math.Pow(x, y)
+	case "CBRT":
+		r = math.Cbrt(x)
+	case "RADIANS":
+		r = x * radiansPerDegree
+		if r == 0 && x != 0 {
+			return fail("value out of range: underflow")
+		}
+	case "DEGREES":
+		r = x / radiansPerDegree
 	}
 	if math.IsInf(r, 0) && !math.IsInf(x, 0) && (len(xs) < 2 || !math.IsInf(xs[1], 0)) {
 		return fail("value out of range: overflow")
 	}
 	return floatValue(typeFloat64, r), nil
+}
+
+// radiansPerDegree is Postgres's RADIANS_PER_DEGREE (a variable, so that
+// products with it are rounded like any other).
+var radiansPerDegree = 0.0174532925199432957692
+
+// The constants of Postgres's degree functions, which make them exact at
+// 0, 30, 45, 60 and 90 degrees.
+var (
+	sin30         = math.Sin(30 * radiansPerDegree)
+	oneMinusCos60 = 1 - math.Cos(60*radiansPerDegree)
+	asinHalf      = math.Asin(0.5)
+	acosHalf      = math.Acos(0.5)
+	atanOne       = math.Atan(1)
+	tan45         = sindQ1(45) / cosdQ1(45)
+	cot45         = cosdQ1(45) / sindQ1(45)
+)
+
+// trigFunc evaluates the trigonometric functions as Postgres does (float.c):
+// a NaN argument gives NaN, an infinite one is out of range for the sine,
+// cosine, tangent and cotangent, and so is one beyond [-1, 1] for the
+// inverse sine and cosine. The degree versions reduce their argument to the
+// first quadrant and scale the radian functions so that 0, 30, 45, 60 and
+// 90 degrees give exact results. The float64 conversions keep products
+// from being fused into FMAs, which would round differently.
+func trigFunc(f *Func, args []Value) (Value, error) {
+	xs, err := floatArgs(f, args)
+	if err != nil {
+		return Value{}, err
+	}
+	x := xs[0]
+	if math.IsNaN(x) || (len(xs) > 1 && math.IsNaN(xs[1])) {
+		return floatValue(typeFloat64, math.NaN()), nil
+	}
+	outOfRange := func() (Value, error) { return Value{}, fmt.Errorf("%s: input is out of range", f.Name) }
+	var r float64
+	switch f.Name {
+	case "SIN", "COS", "TAN", "COT", "SIND", "COSD", "TAND", "COTD":
+		if math.IsInf(x, 0) {
+			return outOfRange()
+		}
+	case "ASIN", "ACOS", "ASIND", "ACOSD":
+		if x < -1 || x > 1 {
+			return outOfRange()
+		}
+	}
+	switch f.Name {
+	case "SIN":
+		r = math.Sin(x)
+	case "COS":
+		r = math.Cos(x)
+	case "TAN":
+		r = math.Tan(x)
+	case "COT":
+		r = 1 / math.Tan(x) // cot(0) is Infinity, not an overflow
+	case "ASIN":
+		r = math.Asin(x)
+	case "ACOS":
+		r = math.Acos(x)
+	case "ATAN":
+		r = math.Atan(x)
+	case "ATAN2":
+		r = math.Atan2(x, xs[1])
+	case "SIND", "COSD", "TAND", "COTD":
+		// Reduce the argument to [0, 90] degrees.
+		sign := 1.0
+		x = math.Mod(x, 360)
+		if x < 0 {
+			x = -x // sind(-x) = -sind(x), cosd(-x) = cosd(x), tand(-x) = -tand(x)
+			if f.Name != "COSD" {
+				sign = -sign
+			}
+		}
+		if x > 180 {
+			x = 360 - x // sind(360-x) = -sind(x), cosd(360-x) = cosd(x), …
+			if f.Name != "COSD" {
+				sign = -sign
+			}
+		}
+		if x > 90 {
+			x = 180 - x // sind(180-x) = sind(x), cosd(180-x) = -cosd(x), …
+			if f.Name != "SIND" {
+				sign = -sign
+			}
+		}
+		switch f.Name {
+		case "SIND":
+			r = sign * sindQ1(x)
+		case "COSD":
+			r = sign * cosdQ1(x)
+		case "TAND":
+			r = sign * (sindQ1(x) / cosdQ1(x) / tan45) // tand(90) is Infinity
+		default:
+			r = sign * (cosdQ1(x) / sindQ1(x) / cot45) // cotd(0) is Infinity
+		}
+		if r == 0 {
+			r = 0 // not -0, as in Postgres
+		}
+	case "ASIND":
+		if x >= 0 {
+			r = asindQ1(x)
+		} else {
+			r = -asindQ1(-x)
+		}
+	case "ACOSD":
+		if x >= 0 {
+			r = acosdQ1(x)
+		} else {
+			r = 90 + asindQ1(-x)
+		}
+	case "ATAND":
+		r = math.Atan(x) / atanOne * 45
+	case "ATAN2D":
+		r = math.Atan2(x, xs[1]) / atanOne * 45
+	}
+	return floatValue(typeFloat64, r), nil
+}
+
+// sind0To30 is the sine of x in [0, 30] degrees: exactly 0 at 0 and 0.5 at
+// 30.
+func sind0To30(x float64) float64 {
+	return math.Sin(float64(x*radiansPerDegree)) / sin30 / 2
+}
+
+// cosd0To60 is the cosine of x in [0, 60] degrees: exactly 1 at 0 and 0.5
+// at 60.
+func cosd0To60(x float64) float64 {
+	return 1 - (1-math.Cos(float64(x*radiansPerDegree)))/oneMinusCos60/2
+}
+
+// sindQ1 and cosdQ1 are the sine and cosine of x in [0, 90] degrees,
+// stitched from sind0To30 and cosd0To60 so that they are exact at 0, 30,
+// 60 and 90 and monotonic.
+func sindQ1(x float64) float64 {
+	if x <= 30 {
+		return sind0To30(x)
+	}
+	return cosd0To60(90 - x)
+}
+
+func cosdQ1(x float64) float64 {
+	if x <= 60 {
+		return cosd0To60(x)
+	}
+	return sind0To30(90 - x)
+}
+
+// asindQ1 and acosdQ1 are the inverse sine and cosine of x in [0, 1], in
+// degrees: exactly 30 and 60 at 0.5.
+func asindQ1(x float64) float64 {
+	if x <= 0.5 {
+		return math.Asin(x) / asinHalf * 30
+	}
+	return 90 - float64(math.Acos(x)/acosHalf*60)
+}
+
+func acosdQ1(x float64) float64 {
+	if x <= 0.5 {
+		return 90 - float64(math.Asin(x)/asinHalf*30)
+	}
+	return math.Acos(x) / acosHalf * 60
 }
 
 // ---- strings ----
