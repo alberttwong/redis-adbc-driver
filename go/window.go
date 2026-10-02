@@ -497,16 +497,16 @@ func windowType(w *WindowFunc, cols map[string]ColType, params []ColType) (ColTy
 	case "LAG", "LEAD":
 		t, err := arg(0)
 		if err != nil || len(f.Args) < 3 {
-			return t.withoutLength(), err
+			return t.withoutTypmod(), err
 		}
 		d, err := arg(2)
 		if err != nil {
 			return ColType{}, err
 		}
-		return commonType(t, d).withoutLength(), nil
+		return commonType(t, d).withoutTypmod(), nil
 	case "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE":
 		t, err := arg(0)
-		return t.withoutLength(), err
+		return t.withoutTypmod(), err
 	}
 	if t, ok, err := aggregateType(f, cols, params, true); ok {
 		return t, err

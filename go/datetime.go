@@ -95,6 +95,55 @@ func fromTime(tm time.Time, t ColType) (Value, error) {
 	}
 }
 
+// currentTime is the current time tm (UTC, or a local time as UTC) as a
+// value of type t: read in microseconds, the precision of Postgres's clock,
+// and then rounded to t's fractional digits, as Postgres rounds
+// CURRENT_TIMESTAMP(p) (CURRENT_TIMESTAMP(0) is whole seconds). So all of a
+// statement's current times agree: CURRENT_TIMESTAMP(6) is
+// CURRENT_TIMESTAMP, and CURRENT_TIMESTAMP(2) is CURRENT_TIMESTAMP cast to
+// TIMESTAMPTZ(2).
+func currentTime(tm time.Time, t ColType) (Value, error) {
+	if t.Kind != KindTime && t.Kind != KindTimestamp {
+		return fromTime(tm, t)
+	}
+	us := t
+	us.Unit, us.Precision = arrow.Microsecond, 0
+	v, err := fromTime(tm, us)
+	if err != nil {
+		return Value{}, err
+	}
+	return Coerce(v, t)
+}
+
+// currentTimeFuncs are the functions of the current time that take a
+// precision, by all their names.
+var currentTimeFuncs = map[string]bool{"CURRENT_TIMESTAMP": true, "NOW": true, "TRANSACTION_TIMESTAMP": true,
+	"STATEMENT_TIMESTAMP": true, "LOCALTIMESTAMP": true, "CURRENT_TIME": true, "LOCALTIME": true}
+
+// currentTimeType is the type of a current time function f whose type
+// without a precision argument is t: with one, CURRENT_TIMESTAMP(p), t with
+// p fractional digits.
+func currentTimeType(f *Func, t ColType) ColType {
+	if p, ok := currentTimePrecision(f); ok {
+		return t.withFracDigits(p)
+	}
+	return t
+}
+
+// currentTimePrecision is the precision argument of CURRENT_TIMESTAMP(p),
+// LOCALTIMESTAMP(p), CURRENT_TIME(p), LOCALTIME(p) and NOW(p): an integer
+// constant from 0 to 9 (checkPrecisionArg). ok is false without one.
+func currentTimePrecision(f *Func) (int, bool) {
+	if len(f.Args) != 1 {
+		return 0, false
+	}
+	lit, ok := f.Args[0].(*Literal)
+	if !ok || lit.V.Null || !lit.V.T.Kind.isInteger() || lit.V.I < 0 || lit.V.I > 9 {
+		return 0, false
+	}
+	return int(lit.V.I), true
+}
+
 func epochSeconds(v Value, tm time.Time) float64 {
 	if v.T.Kind == KindTime {
 		// The time of day itself, so that 24:00:00 is 86400.
@@ -631,11 +680,17 @@ func dateTimeFuncType(f *Func, args []ColType) (ColType, bool) {
 	switch f.Name {
 	case "CURRENT_DATE", "MAKE_DATE", "TO_DATE", "LAST_DAY":
 		return typeDate, true
-	case "CURRENT_TIMESTAMP", "NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP", "TO_TIMESTAMP", "MAKE_TIMESTAMPTZ":
+	case "CURRENT_TIMESTAMP", "NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP":
+		return currentTimeType(f, typeTimestampTZ), true
+	case "LOCALTIMESTAMP":
+		return currentTimeType(f, typeTimestamp), true
+	case "CURRENT_TIME", "LOCALTIME":
+		return currentTimeType(f, typeTimeUS), true
+	case "TO_TIMESTAMP", "MAKE_TIMESTAMPTZ":
 		return typeTimestampTZ, true
-	case "LOCALTIMESTAMP", "MAKE_TIMESTAMP":
+	case "MAKE_TIMESTAMP":
 		return typeTimestamp, true
-	case "CURRENT_TIME", "LOCALTIME", "MAKE_TIME":
+	case "MAKE_TIME":
 		return typeTimeUS, true
 	case "YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "DAYOFMONTH", "DAYOFYEAR", "HOUR", "MINUTE", "SECOND",
 		"DATE_DIFF", "DATEDIFF", "TIMESTAMPDIFF", "EPOCH_MS":
@@ -690,6 +745,9 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 	if !ok {
 		return Value{}, false, nil
 	}
+	if !currentTimeFuncs[f.Name] {
+		t = t.withoutTypmod() // as inferFuncType: DATEADD of a TIMESTAMP(2) has 3 digits
+	}
 	intArg := func(v Value) (int, error) {
 		c, err := Coerce(v, typeInt64)
 		if err != nil {
@@ -703,11 +761,10 @@ func (env *evalEnv) evalDateTimeFunc(f *Func, args []Value) (Value, bool, error)
 	local := func(v Value) (time.Time, error) { return localFields(v, z) }
 	switch f.Name {
 	case "CURRENT_TIMESTAMP", "NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP":
-		// An optional precision argument is accepted and ignored.
-		return done(fromTime(env.now(), t))
+		return done(currentTime(env.now(), t))
 	case "CURRENT_DATE", "LOCALTIMESTAMP", "CURRENT_TIME", "LOCALTIME":
 		// The local date and time in the session time zone.
-		return done(fromTime(z.localTime(env.now()), t))
+		return done(currentTime(z.localTime(env.now()), t))
 	case "DATE_PART":
 		if args[1].T.Kind == KindInterval {
 			return done(intervalPart(args[0].Text(), args[1]))

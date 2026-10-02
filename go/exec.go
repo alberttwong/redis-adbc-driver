@@ -365,7 +365,7 @@ func (e *executor) runCreateTableAs(ctx context.Context, st *CreateTableStmt) (i
 		if t.Kind == KindString && t.Length > 0 && !fitsLength(rows, j, t) {
 			// The query's values fit their type's length; should one not,
 			// the column gets none rather than hold it.
-			t = t.withoutLength()
+			t = t.withoutTypmod()
 		}
 		meta.Columns = append(meta.Columns, columnMeta{Name: c.Name, Type: t, Nullable: true})
 	}

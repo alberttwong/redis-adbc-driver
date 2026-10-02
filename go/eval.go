@@ -352,8 +352,8 @@ func (env *evalEnv) branchValue(e, branch Expr) (Value, error) {
 	if t.Kind != KindTimestamp || (v.T.Kind == KindTimestamp && v.T.TZ == t.TZ) {
 		return v, nil
 	}
-	if v.T.Kind == KindTimestamp && unitsPerSecond[v.T.Unit] > unitsPerSecond[t.Unit] {
-		t.Unit = v.T.Unit
+	if v.T.Kind == KindTimestamp {
+		t = finerTime(t, v.T) // nothing is rounded
 	}
 	return coerceIn(v, t, env.zone())
 }
@@ -512,9 +512,10 @@ func (env *evalEnv) evalFunc(f *Func) (Value, error) {
 // padding, as Postgres's pattern matching does.
 var seesPadding = map[string]bool{"LIKE": true, "ILIKE": true, "~": true, "~*": true, "SIMILAR TO": true}
 
-// keepsLength are the functions whose result keeps the length of a string
-// type their arguments share (Postgres keeps their type modifier).
-var keepsLength = map[string]bool{"COALESCE": true, "IFNULL": true, "NVL": true, "NULLIF": true,
+// keepsTypmod are the functions whose result keeps the type modifier of
+// their arguments, as in Postgres: the length of a string type they share,
+// or the fractional digits of their times or timestamps (commonType).
+var keepsTypmod = map[string]bool{"COALESCE": true, "IFNULL": true, "NVL": true, "NULLIF": true,
 	"GREATEST": true, "LEAST": true, "IIF": true}
 
 // padded is the text of a value, with a CHAR value's padding.
@@ -719,10 +720,13 @@ func arithmeticType(op string, a, b ColType) (ColType, error) {
 	return typeInt64, nil
 }
 
+// inferFuncType is the result type of a call: without a type modifier,
+// except for the functions that keep their arguments' (keepsTypmod) and the
+// current times, whose precision argument is one (CURRENT_TIMESTAMP(p)).
 func inferFuncType(f *Func, args []ColType) ColType {
 	t := funcType(f, args)
-	if !keepsLength[f.Name] {
-		t = t.withoutLength()
+	if !keepsTypmod[f.Name] && !currentTimeFuncs[f.Name] {
+		t = t.withoutTypmod()
 	}
 	return t
 }
@@ -887,12 +891,9 @@ func commonType(a, b ColType) ColType {
 		}
 		return t
 	case a.Kind == KindTimestamp && b.Kind == KindTimestamp, a.Kind == KindTime && b.Kind == KindTime:
-		// The finer unit, so that no value is rounded; with a time zone if
-		// either has one, as in Postgres.
-		t := a
-		if unitsPerSecond[b.Unit] > unitsPerSecond[a.Unit] {
-			t.Unit = b.Unit
-		}
+		// The more fractional digits, so that no value is rounded; with a
+		// time zone if either has one, as in Postgres.
+		t := finerTime(a, b)
 		if b.TZ != "" {
 			t.TZ = b.TZ
 		}

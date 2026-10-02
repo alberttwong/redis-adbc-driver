@@ -54,15 +54,19 @@ func hasVolatile(e Expr) bool {
 }
 
 // checkArity checks a call of a scalar function: its argument count, no *
-// or DISTINCT, and the JSON functions' own rules (checkJSONArgs). Binding
-// does this for every call (resolveCall); type inference and evaluation
-// check again for expressions that aren't bound.
+// or DISTINCT, a current time's precision (checkPrecisionArg) and the JSON
+// functions' own rules (checkJSONArgs). Binding does this for every call
+// (resolveCall); type inference and evaluation check again for expressions
+// that aren't bound.
 func checkArity(f *Func) error {
 	d, ok := lookupFunc(f.Name)
 	if !ok || d.kind != scalarKind {
 		return nil
 	}
 	if err := d.argsError(f); err != nil {
+		return err
+	}
+	if err := checkPrecisionArg(f); err != nil {
 		return err
 	}
 	return checkJSONArgs(f)
@@ -227,7 +231,7 @@ func unifiedType(f *Func, args []ColType) ColType {
 		if out.Kind != KindNull {
 			if v.T.Kind == KindString {
 				// The literal has no length, so the result has none.
-				out = out.withoutLength()
+				out = out.withoutTypmod()
 				continue
 			}
 			if v.T.Kind.isNumeric() && out.Kind.isNumeric() {

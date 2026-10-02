@@ -221,13 +221,13 @@ func aggregateType(f *Func, cols map[string]ColType, params []ColType, over bool
 	case name == "BOOL_OR" || name == "BOOL_AND" || name == "EVERY":
 		return typeBool, true, nil
 	case name == "ANY_VALUE":
-		return args[0].withoutLength(), true, nil
+		return args[0].withoutTypmod(), true, nil
 	case statFuncs[name]:
 		return typeFloat64, true, nil
 	case name == "PERCENTILE_CONT":
 		return contType(keys[0]), true, nil
 	case name == "PERCENTILE_DISC" || name == "MODE":
-		return keys[0].withoutLength(), true, nil
+		return keys[0].withoutTypmod(), true, nil
 	case name == "MEDIAN":
 		return contType(args[0]), true, nil
 	}

@@ -194,26 +194,37 @@ func convertUnit(v int64, from, to arrow.TimeUnit) (int64, error) {
 	return floorDiv(v, f/t), nil
 }
 
-// roundUnit converts v from unit `from` to unit `to`. To a coarser unit it
-// rounds half away from epoch (seconds since the Unix epoch), as Postgres
-// rounds a value to a lower precision (AdjustTimestampForTypmod and
-// AdjustTimeForTypmod round half away from zero, and Postgres's timestamps
-// count from 2000-01-01, pgEpoch; times from midnight, 0). A carry moves
-// into the next second, minute, day or year.
-func roundUnit(v int64, from, to arrow.TimeUnit, epoch int64) (int64, error) {
-	f, t := unitsPerSecond[from], unitsPerSecond[to]
-	if t >= f {
+// intPow10 are the powers of ten up to 10⁹.
+var intPow10 = [10]int64{1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000}
+
+// roundUnit converts v from unit `from` to unit `to`, with digits
+// fractional-second digits (at most to's: a TIMESTAMP(2) is in
+// milliseconds, rounded to 2 digits). To fewer digits than from's it
+// rounds, in one step from v, half away from epoch (seconds since the Unix
+// epoch), as Postgres rounds a value to a lower precision
+// (AdjustTimestampForTypmod and AdjustTimeForTypmod round half away from
+// zero, and Postgres's timestamps count from 2000-01-01, pgEpoch; times
+// from midnight, 0). A carry moves into the next second, minute, day or
+// year.
+func roundUnit(v int64, from, to arrow.TimeUnit, digits int, epoch int64) (int64, error) {
+	fd, digits := precisionForUnit(from), min(digits, precisionForUnit(to))
+	if digits >= fd {
 		return convertUnit(v, from, to)
 	}
-	k := f / t
+	k := intPow10[fd-digits]
 	q, r := v/k, v%k
 	if r < 0 {
 		q, r = q-1, r+k
 	}
-	if 2*r > k || (2*r == k && v > epoch*f) {
+	if 2*r > k || (2*r == k && v > epoch*unitsPerSecond[from]) {
 		q++
 	}
-	return q, nil
+	// q counts units of 10^-digits seconds, which `to` holds.
+	m := intPow10[precisionForUnit(to)-digits]
+	if q*m/m != q {
+		return 0, fmt.Errorf("value %d out of range for unit %s", v, unitNames[to])
+	}
+	return q * m, nil
 }
 
 // secondsNanosToUnit combines seconds and nanoseconds into a count of units
@@ -709,7 +720,8 @@ func Coerce(v Value, t ColType) (Value, error) { return coerceIn(v, t, utcZone) 
 // z, a TIMESTAMP WITH TIME ZONE becomes its local time (also as a DATE or a
 // TIME), a DATE is local midnight, text without an offset is read as a
 // local time, and a timestamp with time zone as text has z's offset. A time
-// or timestamp of a lower precision is rounded (roundUnit).
+// or timestamp is rounded to t's fractional digits (roundUnit), so a
+// TIMESTAMP(2) holds milliseconds rounded to 2 digits.
 func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 	if v.Null || t.Kind == KindNull {
 		return nullValue(t), nil
@@ -821,7 +833,7 @@ func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 		}
 	case KindTime:
 		if v.T.Kind == KindTime {
-			i, err := roundUnit(v.I, v.T.Unit, t.Unit, 0)
+			i, err := roundUnit(v.I, v.T.Unit, t.Unit, t.fracDigits(), 0)
 			if err != nil {
 				return Value{}, err
 			}
@@ -835,7 +847,7 @@ func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 				return Value{}, err
 			}
 			per := unitsPerSecond[v.T.Unit] * 86400
-			i, err := roundUnit(local-floorDiv(local, per)*per, v.T.Unit, t.Unit, 0)
+			i, err := roundUnit(local-floorDiv(local, per)*per, v.T.Unit, t.Unit, t.fracDigits(), 0)
 			if err != nil {
 				return Value{}, err
 			}
@@ -856,7 +868,7 @@ func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 				i, err = z.localUnits(i, v.T.Unit)
 			}
 			if err == nil {
-				i, err = roundUnit(i, v.T.Unit, t.Unit, pgEpoch)
+				i, err = roundUnit(i, v.T.Unit, t.Unit, t.fracDigits(), pgEpoch)
 			}
 			if err != nil {
 				return Value{}, err

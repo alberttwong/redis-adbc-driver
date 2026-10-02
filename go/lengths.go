@@ -96,9 +96,15 @@ func (t ColType) pgName() string {
 	return fmt.Sprintf("character varying(%d)", t.Length)
 }
 
-// withoutLength is t without a string length: the type of a computed value.
-func (t ColType) withoutLength() ColType {
+// withoutTypmod is t without a type modifier, the type of a computed value:
+// a string type without a length, and a time or timestamp type with its
+// unit's fractional digits (TIMESTAMP(2) is TIMESTAMP(3)), which hold every
+// value of t.
+func (t ColType) withoutTypmod() ColType {
 	t.Length = 0
+	if t.Kind == KindTime || t.Kind == KindTimestamp {
+		t.Precision = 0
+	}
 	return t
 }
 

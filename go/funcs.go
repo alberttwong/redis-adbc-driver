@@ -264,8 +264,9 @@ var funcDefs = []funcDef{
 	{name: "IIF", min: 3, max: 3, impl: implIIF},
 
 	// ---- date and time (datetime.go) ----
-	// The current date and time take an optional precision, which is
-	// ignored.
+	// The current times take an optional precision p, an integer constant
+	// from 0 to 9 (checkPrecisionArg), and are rounded to it. CURRENT_DATE
+	// accepts one too and ignores it.
 	{name: "CURRENT_DATE", min: 0, max: 1, impl: implDateTime},
 	{name: "CURRENT_TIMESTAMP", aliases: []string{"NOW", "TRANSACTION_TIMESTAMP", "STATEMENT_TIMESTAMP"}, min: 0, max: 1, impl: implDateTime},
 	{name: "LOCALTIMESTAMP", min: 0, max: 1, impl: implDateTime},
@@ -554,7 +555,25 @@ func resolveCall(f *Func, over bool) error {
 	if err := d.argsError(f); err != nil {
 		return err
 	}
+	if err := checkPrecisionArg(f); err != nil {
+		return err
+	}
 	return checkCall(f)
+}
+
+// checkPrecisionArg checks the precision argument of CURRENT_TIMESTAMP(p),
+// LOCALTIMESTAMP(p), CURRENT_TIME(p), LOCALTIME(p) and their aliases (NOW(p)):
+// an integer constant from 0 to 9, as the result has p fractional digits.
+// Postgres's grammar takes only an integer constant, and reduces a p above 6
+// to 6.
+func checkPrecisionArg(f *Func) error {
+	if len(f.Args) != 1 || !currentTimeFuncs[f.Name] {
+		return nil
+	}
+	if _, ok := currentTimePrecision(f); !ok {
+		return errorf(adbc.StatusInvalidArgument, "%s precision must be an integer constant from 0 to 9", f.Name)
+	}
+	return nil
 }
 
 // sigTypeName names an argument type in a function signature, as Postgres
