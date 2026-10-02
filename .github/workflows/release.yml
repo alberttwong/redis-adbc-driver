@@ -22,8 +22,9 @@
 # (no go/cmd/redis-arrow).
 #
 # Runs when a release is published, or by hand for an existing release tag
-# (its assets are replaced). Pull requests that change this file run the
-# builds and tests without uploading anything.
+# (its assets are replaced). A run by hand can skip Go tests that are wrong at
+# that tag (skip, a go test -skip pattern). Pull requests that change this
+# file run the builds and tests without uploading anything.
 name: Release binaries
 
 on:
@@ -34,6 +35,9 @@ on:
       tag:
         description: Existing release tag to build (its assets are replaced)
         required: true
+      skip:
+        description: Go tests to skip (a go test -skip pattern), for a tag whose own test is known to be wrong
+        default: ""
   pull_request:
     paths:
       - .github/workflows/release.yml
@@ -49,6 +53,8 @@ env:
   # The version stamped into the library and used in asset names.
   VERSION: ${{ github.event.release.tag_name || inputs.tag || 'v0.0.0-dev' }}
   REF: ${{ github.event.release.tag_name || inputs.tag || github.sha }}
+  # Go tests to skip; empty (every run but one by hand with skip) skips none.
+  SKIP: ${{ inputs.skip }}
 
 jobs:
   linux:
@@ -112,7 +118,7 @@ jobs:
         env:
           REDIS_URI: redis://localhost:6379/0
         run: |
-          go test -count=1 ./...
+          go test -count=1 -skip "$SKIP" ./...
           cd validation && uv run pytest -q tests/
 
       - name: Test (3-shard cluster)
@@ -120,7 +126,7 @@ jobs:
         env:
           REDIS_URI: redis://localhost:7001/0
         run: |
-          go test -count=1 ./...
+          go test -count=1 -skip "$SKIP" ./...
           cd validation && uv run pytest -q tests/
 
       - name: Package
@@ -256,7 +262,7 @@ jobs:
       - name: Test
         working-directory: go
         run: |
-          go test -count=1 ./...
+          go test -count=1 -skip "$SKIP" ./...
           file build/libadbc_driver_redis.dylib | grep -q arm64
           python3 -c "import ctypes; ctypes.CDLL('build/libadbc_driver_redis.dylib').AdbcDriverInit"
 

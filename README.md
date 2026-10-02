@@ -2572,6 +2572,16 @@ by hand with its tag:
 gh workflow run release.yml -f tag=v0.0.4
 ```
 
+The run builds and tests the tag's own code. If a Go test at that tag is
+wrong on one platform (not the driver), `skip` (a `go test -skip` pattern)
+leaves it out. v0.0.8 and v0.0.9 got their binaries this way: their
+`linux-amd64` jobs failed `TestScalarTrigonometry` and `TestSQLNaNAggregates`
+(fixed after them by #121 and #125).
+
+```bash
+gh workflow run release.yml -f tag=v0.0.8 -f skip=TestScalarTrigonometry
+```
+
 Using the driver from Python:
 
 ```python
