@@ -485,8 +485,14 @@ func reserveNames(ctx context.Context, p goredis.Pipeliner, nm tableNames) {
 func (s *store) foreignIndex(ctx context.Context, nm tableNames) (bool, error) {
 	reply, err := s.searchDo(ctx, nm.index, "FT.INFO", nm.index).Result()
 	if err != nil {
-		if isUnknownIndex(err) {
+		switch {
+		case isUnknownIndex(err):
 			return false, nil
+		case strings.HasPrefix(err.Error(), "NOPERM"):
+			// Redis refuses FT.INFO on an index whose key prefixes the ACL
+			// user may not read, and the names' prefix isn't one of them
+			// (the user is creating a table there): it isn't a leftover.
+			return true, nil
 		}
 		return false, wrapRedis(err, "failed to check the search index "+nm.index)
 	}
