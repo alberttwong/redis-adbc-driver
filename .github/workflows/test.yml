@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs the Go tests on Linux amd64 and arm64 against a standalone Redis.
-# Float results can differ in the last bit between the two (Go fuses
-# multiply-adds on arm64 but not amd64), so both are tested before merge
-# rather than first in the release run. The 3-shard cluster, the validation
-# suite and the other Linux distributions are left to release.yml.
+# Runs the Go tests and the validation suite on Linux amd64 and arm64 against
+# Redis (standalone and a 3-shard cluster), as release.yml's linux job does.
+# Results can differ between the two (Go fuses multiply-adds on arm64 but not
+# amd64, and an amd64 server writes some NaNs as -nan), so both are tested
+# before merge rather than first in the release run, whose failure leaves the
+# release with no binaries. Only the other Linux distributions are left to
+# release.yml.
 #
 # Runs on pull requests that change the driver or this file. A newer push to
 # the same pull request cancels the run in progress.
@@ -53,13 +55,31 @@ jobs:
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      # The validation suite loads go/build/libadbc_driver_redis.so.
+      - name: Build
+        working-directory: go
+        run: make build
 
       - name: Start Redis
         working-directory: go
-        run: docker compose up --detach --wait redis
+        run: |
+          docker compose up --detach --wait redis
+          docker compose --profile cluster up --detach --wait redis-cluster
 
-      - name: Test
+      - name: Test (standalone)
         working-directory: go
         env:
           REDIS_URI: redis://localhost:6379/0
-        run: go test -count=1 ./...
+        run: |
+          go test -count=1 ./...
+          cd validation && uv run pytest -q tests/
+
+      - name: Test (3-shard cluster)
+        working-directory: go
+        env:
+          REDIS_URI: redis://localhost:7001/0
+        run: |
+          go test -count=1 ./...
+          cd validation && uv run pytest -q tests/
