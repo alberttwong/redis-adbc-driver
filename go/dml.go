@@ -433,11 +433,13 @@ func (e *executor) bindMergeClause(ctx context.Context, c *MergeClause, need map
 	return nil
 }
 
-// mergeScopeHint explains an unknown column in a WHEN NOT MATCHED clause,
-// which may refer to the source only (or, BY SOURCE, the target only).
+// mergeScopeHint explains an unknown column or table in a WHEN NOT MATCHED
+// clause, which may refer to the source only (or, BY SOURCE, the target
+// only).
 func mergeScopeHint(err error, m MergeMatch) error {
 	var ae adbc.Error
-	if m == MergeMatched || !errors.As(err, &ae) || !strings.HasPrefix(ae.Msg, "[redis] column ") {
+	if m == MergeMatched || !errors.As(err, &ae) || !(strings.HasPrefix(ae.Msg, "[redis] column ") ||
+		strings.HasPrefix(ae.Msg, "[redis] missing FROM-clause entry ") || strings.HasPrefix(ae.Msg, "[redis] invalid reference to FROM-clause entry ")) {
 		return err
 	}
 	if m == MergeNotMatched {

@@ -139,7 +139,7 @@ func TestSQLReturningInsert(t *testing.T) {
 	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING COUNT(*)`, "aggregate functions are not allowed in RETURNING")
 	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING ROW_NUMBER() OVER ()`, "window functions are not allowed in RETURNING")
 	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING nope`, `column "nope" does not exist`)
-	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING s.id`, `column "s.id" does not exist`)
+	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING s.id`, `missing FROM-clause entry for table "s"`)
 	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING s.*`, `missing FROM-clause entry for table "s"`)
 	h.expectError(`INSERT INTO it_ret_t (id) VALUES (70) RETURNING merge_action()`,
 		"MERGE_ACTION() can only be used in the RETURNING list of a MERGE command")

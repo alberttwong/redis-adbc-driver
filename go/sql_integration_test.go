@@ -337,7 +337,7 @@ func TestSQLSubqueries(t *testing.T) {
 			AND o.qty > (SELECT MIN(o2.qty) FROM it_orders o2 WHERE o2.customer_id = c.id))
 		ORDER BY name`,
 		"Ada", "Bo")
-	h.expectError(`SELECT id FROM it_orders WHERE nope.id = 1`, "does not exist")
+	h.expectError(`SELECT id FROM it_orders WHERE nope.id = 1`, `missing FROM-clause entry for table "nope"`)
 }
 
 func TestSQLDerivedTablesAndCTEs(t *testing.T) {

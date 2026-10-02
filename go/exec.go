@@ -931,6 +931,9 @@ func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) (
 		}
 		return cols, nil
 	}
+	if alias, ok := aliasOf(rels, name); ok && len(qual) == 1 {
+		return nil, errInvalidFromEntry(name, alias)
+	}
 	return nil, errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", strings.Join(qual, "."))
 }
 

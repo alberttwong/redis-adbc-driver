@@ -436,8 +436,8 @@ func TestSQLLateral(t *testing.T) {
 		`invalid reference to FROM-clause entry for table "g": the combining JOIN type must be INNER or LEFT for a LATERAL reference`)
 	h.expectError(`SELECT * FROM it_qf_g g FULL JOIN generate_series(1, g.id) s ON TRUE`,
 		"the combining JOIN type must be INNER or LEFT for a LATERAL reference")
-	h.expectError(`SELECT * FROM LATERAL (SELECT y.id) t, it_qf_g y`, `column "y.id" does not exist`)
-	h.expectError(`SELECT * FROM it_qf_g g, (SELECT g.id) t`, `column "g.id" does not exist`)
+	h.expectError(`SELECT * FROM LATERAL (SELECT y.id) t, it_qf_g y`, `missing FROM-clause entry for table "y"`)
+	h.expectError(`SELECT * FROM it_qf_g g, (SELECT g.id) t`, `missing FROM-clause entry for table "g"`)
 	h.expectError(`SELECT * FROM it_qf_g g, LATERAL (SELECT 1)`, "must have an alias")
 	h.expectError(`SELECT * FROM it_qf_g, LATERAL it_qf_g2`, "LATERAL must be followed by a subquery or a function call")
 }
