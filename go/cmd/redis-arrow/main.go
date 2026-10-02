@@ -55,6 +55,7 @@ Commands:
   check    check an existing HASH collection: guess its columns, and list
            what Arrow IPC and SQL need
   scan     read an existing HASH collection as an Arrow IPC file or stream
+  adopt    make an existing HASH collection a driver table, in place
 
 Run "redis-arrow <command> -h" for a command's flags.
 `
@@ -94,6 +95,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runCheck(ctx, args[1:], stdout, stderr)
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
+	case "adopt":
+		return runAdopt(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "-help", "--help":
 		fmt.Fprint(stdout, usage)
 		return nil

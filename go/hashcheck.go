@@ -106,6 +106,8 @@ type HashColumn struct {
 	// Type is the column's SQL type, and ArrowType its type in Arrow IPC.
 	Type      string `json:"type"`
 	ArrowType string `json:"arrow_type"`
+	// InPlaceType is its type in a table adopted in place.
+	InPlaceType string `json:"in_place_type,omitempty"`
 	// Present is how many sampled HASHes have the field.
 	Present int      `json:"present"`
 	Notes   []string `json:"notes,omitempty"`
@@ -235,12 +237,21 @@ func InspectHashes(ctx context.Context, options map[string]string, o HashInspect
 	if err != nil {
 		return nil, err
 	}
+	var stats keyStats
 	for {
 		keys, done, err := ks.next(ctx)
 		if err != nil {
 			return nil, err
 		}
 		r.Keys += int64(len(keys))
+		ids, err := c.rowIDs(ctx, keys)
+		if err != nil {
+			return nil, err
+		}
+		for i, k := range keys {
+			v := ids[i]
+			stats.add(k, o.Prefix, deref(v), v != nil)
+		}
 		for _, k := range keys {
 			if (sample < 0 || len(sampled) < sample) && !inSample[k] {
 				inSample[k] = true
@@ -257,13 +268,24 @@ func InspectHashes(ctx context.Context, options map[string]string, o HashInspect
 		return nil, err
 	}
 	r.Sampled = len(rows)
-	cols, skipped, err := guessTable(rows, guessOptions{keyColumn: o.KeyColumn, types: o.Types, renames: o.Renames})
+	gopts := guessOptions{keyColumn: o.KeyColumn, types: o.Types, renames: o.Renames}
+	gs, err := newGuesserFor(gopts)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		gs.add(row)
+	}
+	cols, skipped, err := gs.columns(gopts)
 	if err != nil {
 		return nil, err
 	}
 	r.Skipped = skipped
 	for _, col := range cols {
 		hc := HashColumn{Name: col.name, Field: col.field, Type: col.t.SQLName(), ArrowType: col.t.ArrowType().String(), Notes: col.notes}
+		if col.field != "" {
+			hc.InPlaceType = col.inPlace.SQLName()
+		}
 		if col.guess != nil {
 			hc.Present = col.guess.present
 		} else {
@@ -285,7 +307,19 @@ func InspectHashes(ctx context.Context, options map[string]string, o HashInspect
 	if err != nil {
 		return nil, err
 	}
-	r.Checks = []Checklist{ipc, cp}
+	t := inPlaceTarget{prefix: o.Prefix, schema: r.Schema, table: r.Table, sampled: r.Sampled,
+		command: adoptCommand(o.Prefix, r.Schema, r.Table, c.db.schema, o.Types, o.Renames)}
+	for _, tm := range tables {
+		if tm.Adopted && tm.prefix() == o.Prefix {
+			t.existing = tm
+			t.command = adoptCommand(o.Prefix, tm.Schema, tm.Name, c.db.schema, nil, nil)
+		}
+	}
+	ip, err := c.checkInPlace(ctx, r, cols, &stats, tables, indexes, t)
+	if err != nil {
+		return nil, err
+	}
+	r.Checks = []Checklist{ipc, cp, ip}
 	return r, nil
 }
 
@@ -772,6 +806,28 @@ func shellQuote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// adoptCommand is the redis-arrow adopt command line.
+func adoptCommand(prefix, schema, table, defaultSchema string, types, renames map[string]string) string {
+	args := []string{"redis-arrow", "adopt", "-prefix", shellQuote(prefix), "-table", shellQuote(table)}
+	if schema != defaultSchema {
+		args = append(args, "-schema", shellQuote(schema))
+	}
+	for _, k := range sortedKeys(types) {
+		args = append(args, "-type", shellQuote(k+"="+types[k]))
+	}
+	for _, k := range sortedKeys(renames) {
+		args = append(args, "-rename", shellQuote(k+"="+renames[k]))
+	}
+	return strings.Join(args, " ")
 }
 
 // scanCommand is the redis-arrow scan command line for the options.

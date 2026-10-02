@@ -113,6 +113,8 @@ func TestCheckScanImport(t *testing.T) {
 		"run: redis-arrow scan -prefix it:cli:user: -o it_cli_user.arrow",
 		"SQL, copied into a driver table (redis-arrow scan | redis-arrow import): READY",
 		"run: redis-arrow scan -prefix it:cli:user: | redis-arrow import -table it_cli_user",
+		"SQL, adopted in place (redis-arrow adopt): READY",
+		"run: redis-arrow adopt -prefix it:cli:user: -table it_cli_user",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("check output lacks %q:\n%s", want, out)
@@ -123,7 +125,7 @@ func TestCheckScanImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	var r redis.HashReport
-	if err := json.Unmarshal([]byte(out), &r); err != nil || r.Keys != 20 || len(r.Checks) != 2 || !r.Checks[1].Ready {
+	if err := json.Unmarshal([]byte(out), &r); err != nil || r.Keys != 20 || len(r.Checks) != 3 || !r.Checks[1].Ready || !r.Checks[2].Ready {
 		t.Errorf("check -json: %v, %+v", err, r)
 	}
 
@@ -147,5 +149,67 @@ func TestCheckScanImport(t *testing.T) {
 	// i = 2, 4, 6, 8: ages 22 + 24 + 26 + 28.
 	if s := rec.Column(0).(*array.Int64).Value(0); s != 100 {
 		t.Errorf("SUM(age) = %d", s)
+	}
+}
+
+// adopt prints what it would do, then -apply does it.
+func TestAdoptCommand(t *testing.T) {
+	uri := os.Getenv("REDIS_URI")
+	if uri == "" {
+		t.Skip("set REDIS_URI to run the redis-arrow integration test")
+	}
+	const prefix, table = "it:cli:ad:", "it_cli_ad"
+	c := rawClient(t, uri)
+	ctx := context.Background()
+	cleanup := func() {
+		execSQL(t, uri, "DROP TABLE IF EXISTS "+table)
+		deleteKeys(t, c, prefix)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	for i := 1; i <= 5; i++ {
+		if err := c.HSet(ctx, fmt.Sprintf("%s%d", prefix, i), "name", fmt.Sprintf("u%d", i), "n", i).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, _, err := runCmd(t, "adopt", "-uri", uri, "-prefix", prefix, "-table", table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"SQL, adopted in place (redis-arrow adopt): READY",
+		"[missing] 5 HASHes have no __rowid field",
+		"run: redis-arrow adopt -prefix it:cli:ad: -table it_cli_ad -apply",
+		"Nothing was changed. With -apply, adopt would:",
+		"FT.CREATE idx:public:it_cli_ad:adopted ON HASH PREFIX 1 it:cli:ad:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("adopt output lacks %q:\n%s", want, out)
+		}
+	}
+	out, _, err = runCmd(t, "adopt", "-uri", uri, "-prefix", prefix, "-table", table, "-apply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "Adopted: public.it_cli_ad now reads the HASHes under it:cli:ad: (index idx:public:it_cli_ad:adopted; wrote __rowid into 5 HASHes)."; !strings.Contains(out, want) {
+		t.Errorf("adopt -apply output lacks %q:\n%s", want, out)
+	}
+	if n := count(t, uri, table); n != 5 {
+		t.Errorf("%d rows", n)
+	}
+	// A HASH the application adds, then -refresh.
+	if err := c.HSet(ctx, prefix+"6", "name", "u6", "n", 6).Err(); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = runCmd(t, "adopt", "-uri", uri, "-prefix", prefix, "-refresh", "-apply")
+	if err != nil || !strings.Contains(out, "Wrote __rowid into 1 HASH, which SQL now reads.") {
+		t.Errorf("adopt -refresh -apply: %v\n%s", err, out)
+	}
+	if n := count(t, uri, table); n != 6 {
+		t.Errorf("%d rows after -refresh", n)
+	}
+	execSQL(t, uri, "DROP TABLE "+table)
+	if n, err := c.Exists(ctx, prefix+"1").Result(); err != nil || n != 1 {
+		t.Errorf("DROP TABLE of the adopted table deleted the HASHes: %d, %v", n, err)
 	}
 }

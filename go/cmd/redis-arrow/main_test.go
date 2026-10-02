@@ -90,6 +90,8 @@ func TestCommandLineErrors(t *testing.T) {
 		{[]string{"scan", "-prefix", "u:", "-format", "csv"}, "unknown -format"},
 		{[]string{"scan", "-prefix", "u:", "-type", "age"}, "want key=value"},
 		{[]string{"check", "u:"}, "unexpected arguments"},
+		{[]string{"adopt"}, "-prefix is required"},
+		{[]string{"adopt", "-prefix", "u:", "x"}, "unexpected arguments"},
 		{[]string{"merge"}, `unknown command "merge"`},
 	} {
 		err := run(ctx, c.args, strings.NewReader(""), io.Discard, io.Discard)
