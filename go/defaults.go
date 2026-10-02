@@ -50,7 +50,8 @@ package redis
 //     satisfies is widened to the rows with __rowid <= MissingThrough in the
 //     index and re-checked on the rows (widenMissing in query.go), and the
 //     index never sorts or aggregates such a column.
-//   - TRUNCATE drops the missing values together with the rows.
+//   - TRUNCATE drops the missing values together with the rows: the table
+//     moves to a new key prefix (truncateTables), where every row is new.
 
 import (
 	"context"
@@ -113,25 +114,6 @@ func addedMissing(meta *tableMeta, raw string) []any {
 		}
 	}
 	return out
-}
-
-// dropMissingValues forgets the missing values of a table whose rows have
-// all been deleted (TRUNCATE): rows inserted later, which may reuse the old
-// row ids after RESTART IDENTITY, must read an absent field as NULL.
-func (s *store) dropMissingValues(ctx context.Context, meta *tableMeta) error {
-	has := false
-	for _, c := range meta.Columns {
-		has = has || c.MissingThrough > 0
-	}
-	if !has {
-		return nil
-	}
-	return s.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
-		for i := range m.Columns {
-			m.Columns[i].Missing, m.Columns[i].MissingThrough = "", 0
-		}
-		return nil
-	}, nil)
 }
 
 // checkDefault checks the DEFAULT of a column definition (see the top of

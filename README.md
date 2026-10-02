@@ -77,9 +77,10 @@ requirement is the Query Engine.
 
 - `CREATE TABLE` and bulk ingest create the table's index
   (`FT.CREATE idx:<schema>:<table> …`) and its metadata keys. `DROP TABLE`
-  removes the index and all of the table's rows (a statement still writing
-  to the table then deletes what it writes; see "Key prefixes" in the
-  architecture section).
+  removes the index and all of the table's rows, and `TRUNCATE` moves the
+  table to a new, empty index and key prefix and then deletes the old rows
+  the same way (a statement still writing to the table then deletes what
+  it writes; see "Key prefixes" in the architecture section).
 - Every filterable column is indexed by default. Narrow this with `NOINDEX`
   in `CREATE TABLE` or `adbc.redis.ingest.index_columns` on ingest. Queries
   still work on columns that aren't indexed: the driver scans the table's
@@ -504,9 +505,9 @@ DROP TABLE events;
 
 Each row is a plain HASH, and each table has one RediSearch index. A renamed
 table keeps its key names unless `adbc.redis.rename_rekey` is set (see
-`ALTER TABLE` below), and a table created again after `DROP TABLE` gets new
-ones (`public:sales~2:`, see "Key prefixes" below);
-`information_schema.tables` shows each table's `key_prefix` and
+`ALTER TABLE` below), and a table created again after `DROP TABLE`, or
+emptied by `TRUNCATE`, gets new ones (`public:sales~2:`, see "Key prefixes"
+below); `information_schema.tables` shows each table's `key_prefix` and
 `index_name`:
 
 ```bash
@@ -546,8 +547,8 @@ Stop Redis with `docker compose down`.
 - **Rows** are flat HASHes `<schema>:<table>:<rowid>` holding every column
   (NULL = field absent, except for missing values, below; a hidden `__rowid`
   field keeps all-NULL rows alive). A table that isn't the first of its
-  name has the prefix `<schema>:<table>~N:` and the index
-  `idx:<schema>:<table>~N` (see "Key prefixes" below).
+  name, or that has been truncated, has the prefix `<schema>:<table>~N:`
+  and the index `idx:<schema>:<table>~N` (see "Key prefixes" below).
 - **Selective index**: `FT.CREATE idx:<schema>:<table> ON HASH PREFIX 1
   <schema>:<table>:` covering only filterable columns: numeric, boolean,
   decimal, date/time and timestamp columns as `NUMERIC SORTABLE`, strings as
@@ -607,54 +608,67 @@ Stop Redis with `docker compose down`.
   connection) shows that the connection doing one is alive. A record taken
   over from a connection that went away is marked `recovering`.
   `adbc:{meta}:released` counts how often each key prefix was released (by
-  `DROP TABLE` or a re-keying rename), one field per prefix that was ever
-  released; a statement checks it and `adbc:{meta}:prefixes` to tell when
-  its table's rows have moved away. Metadata written by
+  `DROP TABLE`, `TRUNCATE` or a re-keying rename), one field per prefix
+  that was ever released; a statement checks it and `adbc:{meta}:prefixes`
+  to tell when its table's rows have moved away. Metadata written by
   v0.0.1 (`adbc:meta:*`, `adbc:schemas`, …) is migrated automatically on
   the first connection.
 - **Key prefixes are never reused.** A table takes the first of
   `<schema>:<table>:`, `<schema>:<table>~2:`, … that no table has had
   before, with the index name of the same N (`idx:<schema>:<table>~2`).
-  So a table created again after `DROP TABLE` gets new keys, and so does a
-  re-keying rename onto a name that a table had before. The reason is
-  writes still running when a table is dropped: a statement that read the
-  table's metadata before the `DROP` goes on writing rows under the old
-  prefix until it finds out, and those rows outlive the `DROP`, which only
-  deletes the rows its index knows about. Up to v0.0.7 the next table of
-  that name took the same prefix, and its row ids started at 1 again, so
-  its rows were written into those leftover HASHes: a column that should
-  have been NULL read the dropped table's value. Now:
+  So a table created again after `DROP TABLE` gets new keys, and so do a
+  table emptied by `TRUNCATE` and a re-keying rename onto a name that a
+  table had before. The reason is writes still running when a table is
+  dropped: a statement that read the table's metadata before the `DROP`
+  goes on writing rows under the old prefix until it finds out, and those
+  rows outlive the `DROP`, which only deletes the rows its index knows
+  about. Up to v0.0.7 the next table of that name took the same prefix,
+  and its row ids started at 1 again, so its rows were written into those
+  leftover HASHes: a column that should have been NULL read the dropped
+  table's value. Now:
+  - **`TRUNCATE`** moves the table to new names, as if it were dropped and
+    created again with the same metadata (see `TRUNCATE` in "Supported
+    SQL"), so the checks below apply to statements still writing to it.
+    Up to v0.0.7 it kept the prefix: rows such a statement wrote after the
+    `TRUNCATE` stayed in the table (some not indexed, until an `ADD COLUMN`
+    indexed them), and after `RESTART IDENTITY` the row ids started at 1
+    again, so later inserts were written into those rows' HASHes. Rows were
+    lost, and new rows read the writer's values for their NULL columns.
   - An insert reads the table's metadata again in the `MULTI` that
     allocates its row ids (each Arrow batch, in bulk ingest), at no extra
-    cost. If the table was dropped, renamed or created again since the
-    statement started, it writes nothing.
+    cost. If the table was dropped, truncated, renamed or created again
+    since the statement started, it writes nothing.
   - A write of more than 1,000 rows (`CREATE TABLE … AS`, `INSERT …
     SELECT`, bulk ingest, a large `UPDATE`) also checks that the table
     still has its keys: between pipelines of 1,000 rows once 100 ms have
     passed since the last check, and always after its last pipeline (one
     round trip each). Smaller writes check at the end only when 100 ms have
     passed since they read the metadata, as before.
-  - A statement whose table was dropped (or whose rows a re-keying rename
-    moved away) stops and fails: "table … was renamed with its rows moved to
-    new keys, or dropped, while this statement was writing to it; some of
-    its changes may be lost or have gone to another table". If no table has
-    the old prefix any more, it first deletes every key it wrote there
-    (one pipelined `DEL` per 1,000 keys).
-  - Keys can still be left under a dropped table's prefix, where no table or
-    query reads them: when the writing process exits before it finds out,
-    and when a write of 1,000 rows or fewer that read the metadata within
-    100 ms of the `DROP` reaches Redis after it (it doesn't check, and
-    succeeds, as if it had run before the `DROP`). To remove them, check
-    that no table has the prefix (`information_schema.tables.key_prefix`,
-    or `SISMEMBER adbc:{meta}:prefixes '<prefix>'` returns 0), then delete
-    its keys, on every primary of a cluster: `redis-cli --scan --pattern
-    '<prefix>*' | xargs redis-cli unlink`.
-  - **Upgrading:** tables created by earlier versions keep their names and
-    work as before. Prefixes released by v0.0.6 and v0.0.7 are recorded in
-    `adbc:{meta}:released` and are skipped too, so rows they left behind
-    can't reach a new table; v0.0.5 and earlier didn't record releases.
-    Upgrade every client that writes to the database: an earlier version
-    still gives a dropped table's prefix to the next table of that name.
+  - A statement whose table was dropped or truncated (or whose rows a
+    re-keying rename moved away) stops and fails: "table … was renamed with
+    its rows moved to new keys, truncated or dropped, while this statement
+    was writing to it; some of its changes may be lost or have gone to
+    another table". If no table has the old prefix any more, it first
+    deletes every key it wrote there (one pipelined `DEL` per 1,000 keys).
+  - Keys can still be left under the old prefix of a dropped or truncated
+    table, where no table or query reads them: when the writing process
+    exits before it finds out, and when a write of 1,000 rows or fewer that
+    read the metadata within 100 ms of the `DROP` or `TRUNCATE` reaches
+    Redis after it (it doesn't check, and succeeds, as if it had run
+    before). To remove them, check that no table has the prefix
+    (`information_schema.tables.key_prefix`, or `SISMEMBER
+    adbc:{meta}:prefixes '<prefix>'` returns 0), then delete its keys, on
+    every primary of a cluster: `redis-cli --scan --pattern '<prefix>*' |
+    xargs redis-cli unlink`.
+  - **Upgrading:** tables created by earlier versions keep their names
+    (until a `TRUNCATE` gives them new ones) and work as before. Prefixes
+    released by v0.0.6 and v0.0.7 are recorded in `adbc:{meta}:released`
+    and are skipped too, so rows they left behind can't reach a new table;
+    v0.0.5 and earlier didn't record releases. Upgrade every client that
+    writes to the database: an earlier version still gives a dropped
+    table's prefix to the next table of that name, and empties a table in
+    place, so its `TRUNCATE … RESTART IDENTITY` can still lose rows that
+    another connection is writing.
 - **Missing values**: `ALTER TABLE … ADD COLUMN c … DEFAULT v` doesn't
   rewrite the existing rows. As with Postgres's "missing value", the
   column's metadata records `v` and the row id high-water mark (the
@@ -706,7 +720,7 @@ How SQL is executed:
 | `SELECT DISTINCT` | Over plain expressions it is the same as `GROUP BY` them, so it runs in the index (`FT.AGGREGATE … GROUPBY`) when they're indexed columns. Otherwise (stars, aggregates, window functions, `DISTINCT ON`) the driver removes duplicate rows after the rest of the query, NULLs counting as equal. `LIMIT` / `OFFSET` apply afterwards and never run in the index. As in Postgres, `ORDER BY` must use the select list, and `DISTINCT ON` keys must match the leading `ORDER BY` expressions |
 | Window functions | Computed by the driver once the rows are known: after WHERE, GROUP BY and HAVING (which still run in the index when they can), before QUALIFY, ORDER BY and LIMIT. Rows are hashed into partitions and each partition is sorted once per distinct PARTITION BY / ORDER BY; frame aggregates add and remove rows as the frame slides (O(1) amortized per row; integer and decimal variances add and subtract exact sums, floating-point ones use a queue of Welford states). With `EXCLUDE CURRENT ROW / GROUP / TIES` the frame has a hole, so each row's frame is aggregated afresh (O(frame) per row), as PostgreSQL does; `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` stay O(1), also with `IGNORE NULLS`. A query with window functions never pushes its LIMIT into the index |
 | `CREATE TEMP TABLE` / `VIEW` | Same as a permanent table or view, in the connection's `pg_temp_<id>` schema. Unqualified names are looked up there first (in memory, no extra round trip) |
-| `TRUNCATE` | `FT.DROPINDEX … DD` (deletes every row the index knows about, as `DROP TABLE` does), then `FT.CREATE` with the same key prefix and index name. Not isolated from concurrent writes to the same table |
+| `TRUNCATE` | Like `DROP TABLE` and `CREATE TABLE` with the same metadata: reserves a new key prefix and index name and runs `FT.CREATE` for each table, switches the metadata of every table of the statement to the new names in one `WATCH`/`MULTI` (which also releases the old names), then runs `FT.DROPINDEX <old> DD`, which deletes every row the old index knows about. Statements still writing to the table find out and fail (see "Key prefixes are never reused") |
 | `ALTER TABLE` | Metadata only (optimistic `WATCH`/`MULTI` on the table's metadata, one for all the actions of a statement), plus `FT.INFO` and one `FT.ALTER` for the added columns and a background `HDEL` pass for `DROP COLUMN`. `ADD COLUMN … DEFAULT` records a missing value instead of writing the rows. Adding a `CHECK` (`ADD COLUMN … CHECK`, `ADD CONSTRAINT … CHECK`) first reads the columns it uses from every row, with one `FT.AGGREGATE` cursor scan for all the statement's new `CHECK`s, to check them. With `adbc.redis.rename_rekey`, `RENAME TO` also creates the new name's index, copies every row the old index lists with pipelined `DUMP` / `RESTORE … REPLACE` (a cursor page at a time; one key per command, so it works on a cluster), switches the metadata in one transaction, then runs `FT.DROPINDEX <old> DD` |
 | Views | `CREATE VIEW` plans the body without running it, which checks its tables, columns and function calls. Single-table views without GROUP BY/aggregates/window functions/LIMIT are expanded in place: the outer query's filters are rewritten over the base table and run in its index. Other views are computed once per query, like a derived table |
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING`. An item whose `ON` can never be true (`ON false`), or that has no rows, isn't read when that settles the result: an inner join is then empty and reads no item, a `LEFT JOIN` keeps the left rows with NULLs for the item, and a `RIGHT JOIN` returns the item's rows without reading the items before it |
@@ -813,9 +827,35 @@ field, even if later rows have it.
   that read the object (such a view fails when queried, as it does after a
   plain `DROP`)
 - `TRUNCATE [TABLE] [ONLY] t [, …] [RESTART IDENTITY | CONTINUE IDENTITY]
-  [CASCADE | RESTRICT]` removes every row and keeps the table (metadata, key
-  prefix, index). Row ids continue unless `RESTART IDENTITY` is given. All
-  names are checked before any table is emptied
+  [CASCADE | RESTRICT]` removes every row and keeps the table: its columns,
+  defaults, `CHECK` constraints and comments. Row ids (`__rowid`) continue
+  unless `RESTART IDENTITY` is given; the driver has no identity or serial
+  columns, so the row id counter is all it restarts. There are no foreign
+  keys, so `CASCADE` and `RESTRICT` do the same:
+  - **New keys:** the table moves to a new key prefix and index,
+    `<schema>:<table>~N:` and `idx:<schema>:<table>~N` with a new N (see
+    "Key prefixes are never reused" in the architecture section), as if it
+    were dropped and created again. Then `FT.DROPINDEX … DD` on the old
+    index deletes the old rows. `information_schema.tables.key_prefix` and
+    `index_name` show the new names.
+  - **All or none:** the tables of one statement switch to their new names
+    in one transaction, so either every table is emptied or none is. A
+    table named twice is emptied once.
+  - **Concurrent writes:** there are no locks, so another connection may
+    still be writing to the table (in Postgres, `TRUNCATE` would wait for
+    it). Such a statement fails as after `DROP TABLE` ("… truncated or
+    dropped, while this statement was writing to it …") and deletes what it
+    wrote, so the table is empty afterwards. A small write that doesn't
+    check may succeed, with its rows left under the old prefix, where no
+    table reads them. Up to v0.0.7 the rows such a statement wrote after
+    the `TRUNCATE` stayed in the table, and `RESTART IDENTITY` could lose
+    them (see "Key prefixes" in the architecture section).
+  - **Concurrent reads and `ALTER`s:** a statement that reads the table for
+    100 ms or more across a `TRUNCATE` fails ("try again"), as across a
+    `DROP TABLE`. An `ALTER TABLE … ADD COLUMN` that commits while a
+    `TRUNCATE` runs is added to the new index too; one that had changed
+    the old index and commits after it fails ("changed concurrently; try
+    again")
 - `ALTER TABLE [IF EXISTS] t` with `RENAME TO u`, with
   `RENAME [COLUMN] a TO b`, or with one or more of these, separated by commas:
   `ADD [COLUMN] [IF NOT EXISTS] c TYPE [column_constraint …] [NOINDEX] [COMMENT 'text']`,
@@ -896,11 +936,11 @@ field, even if later rows have it.
       started may still be running, so the copy waits 100 ms first. A write
       statement that took longer than that, from reading the metadata to its
       last write, checks afterwards whether the table was being moved (or
-      was moved, or dropped), and if so fails with "some of its changes may
-      be lost or have gone to another table": like a write that fails
-      part-way, some of them may have been applied. Faster statements don't
-      pay for the check, unless they write more than 1,000 rows (see "Key
-      prefixes" in the architecture section).
+      was moved, truncated or dropped), and if so fails with "some of its
+      changes may be lost or have gone to another table": like a write that
+      fails part-way, some of them may have been applied. Faster statements
+      don't pay for the check, unless they write more than 1,000 rows (see
+      "Key prefixes" in the architecture section).
     - If the renaming process exits, the table is unchanged under its old
       name and refuses changes until the move's 30-second lease has
       expired. Until then the refusal says to try again when the rename

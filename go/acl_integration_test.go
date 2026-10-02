@@ -343,7 +343,7 @@ func TestACLReadOnlyUser(t *testing.T) {
 		{`INSERT INTO it_acl_ro VALUES (4, 'c')`, "failed to allocate row ids: " + noperm("multi")},
 		{`UPDATE it_acl_ro SET label = 'x'`, "failed to update rows: " + noperm("hset")},
 		{`DELETE FROM it_acl_ro`, "failed to delete rows: " + noperm("del")},
-		{`TRUNCATE it_acl_ro`, "failed to truncate table: " + noperm("FT.DROPINDEX")},
+		{`TRUNCATE it_acl_ro`, "failed to reserve a key prefix: " + noperm("sadd")},
 		{`DROP TABLE it_acl_ro`, "failed to drop search index: " + noperm("FT.DROPINDEX")},
 		{`CREATE TABLE it_acl_ro2 (id INTEGER)`, "failed to reserve a key prefix: " + noperm("sadd")},
 		{`CREATE VIEW it_acl_rov2 AS SELECT 1 AS x`, "failed to create view: " + noperm("watch")},

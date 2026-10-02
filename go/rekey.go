@@ -47,11 +47,11 @@ package redis
 // (nothing is cached between statements), so a statement that overlaps a
 // re-key may still use the old names after they were released. Every key
 // prefix has a generation, the number of times it was released
-// (adbc:{meta}:released, bumped by DROP TABLE and by step 4), and a table's
-// metadata records the generation of its prefix (prefix_gen), so that a
-// statement can tell its table's rows moved away (checkKeys). A released
-// prefix is never taken again (claimNames), so prefix_gen is 0 for tables
-// created since; earlier versions reused prefixes.
+// (adbc:{meta}:released, bumped by DROP TABLE, TRUNCATE and step 4), and a
+// table's metadata records the generation of its prefix (prefix_gen), so
+// that a statement can tell its table's rows moved away (checkKeys). A
+// released prefix is never taken again (claimNames), so prefix_gen is 0 for
+// tables created since; earlier versions reused prefixes.
 //
 //   - Writers that read the metadata after step 1 are refused. One that
 //     read it just before may still be writing, so the copy waits until
@@ -1004,10 +1004,11 @@ func (s *store) checkReads(ctx context.Context, metas []*tableMeta) error {
 }
 
 // checkKeys fails if a table's rows may have moved away since its metadata
-// was read: its prefix was released (the table was re-keyed or dropped, even
-// if an earlier version of the driver gave the prefix to another table
-// since), or is being moved by a re-key (which only matters to readers once
-// it has switched). Otherwise the metadata counts as read again now.
+// was read: its prefix was released (the table was re-keyed, truncated or
+// dropped, even if an earlier version of the driver gave the prefix to
+// another table since), or is being moved by a re-key (which only matters
+// to readers once it has switched). Otherwise the metadata counts as read
+// again now.
 func (s *store) checkKeys(ctx context.Context, meta *tableMeta, writing bool) error {
 	sent := time.Now()
 	pipe := s.client.Pipeline()
@@ -1039,14 +1040,14 @@ func (s *store) checkKeys(ctx context.Context, meta *tableMeta, writing bool) er
 		}
 		return writeMovedErr(meta)
 	}
-	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, or dropped, while this statement was reading it; try again",
+	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, truncated or dropped, while this statement was reading it; try again",
 		displaySchema(meta.Schema), meta.Name)
 }
 
 // writeMovedErr is the error of a statement whose table's rows moved away,
-// or that was dropped, while it was writing to it.
+// or that was truncated or dropped, while it was writing to it.
 func writeMovedErr(meta *tableMeta) error {
-	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table",
+	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, truncated or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table",
 		displaySchema(meta.Schema), meta.Name)
 }
 

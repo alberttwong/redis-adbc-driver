@@ -37,7 +37,7 @@ import (
 // pipelines.
 const srRows = 3 * pipelineChunk
 
-const srWriteErr = "was renamed with its rows moved to new keys, or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table"
+const srWriteErr = "was renamed with its rows moved to new keys, truncated or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table"
 
 // namesN checks that a table's key prefix and index name are those of
 // the name named with some N (namesFor), and returns N. N depends on the

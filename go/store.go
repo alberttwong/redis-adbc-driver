@@ -53,13 +53,14 @@ package redis
 // name cannot make two tables share a key prefix, and '{' / '}' cannot form
 // a hash tag.
 //
-// Key prefixes are never reused. A table that is created, or that a
-// re-keying rename moves (rekey.go), takes the first <schema>:<table>: or
-// <schema>:<table>~N: (and the index name idx:<schema>:<table>[~N]) that no
-// table has ever had: a statement that read a dropped table's metadata may
-// still be writing rows under its prefix, and rows left there must not
-// become another table's. adbc:{meta}:names:next (HASH) holds the last N
-// handed out for each name. See claimNames.
+// Key prefixes are never reused. A table that is created, truncated
+// (truncateTables), or moved by a re-keying rename (rekey.go) takes the
+// first <schema>:<table>: or <schema>:<table>~N: (and the index name
+// idx:<schema>:<table>[~N]) that no table has ever had: a statement that
+// read a dropped table's metadata may still be writing rows under its
+// prefix, and rows left there must not become another table's.
+// adbc:{meta}:names:next (HASH) holds the last N handed out for each name.
+// See claimNames.
 
 import (
 	"context"
@@ -854,71 +855,261 @@ func indexCreateArgs(meta *tableMeta) []any {
 	return args
 }
 
-// truncateTable removes every row but keeps the table: its metadata, key
-// prefix and index name. Dropping the index with DD deletes every document
-// it knows about (as DROP TABLE does), and it is then recreated empty. Rows
-// written by another connection while this runs may be left unindexed.
-func (s *store) truncateTable(ctx context.Context, schema, table string, restartIdentity bool) error {
-	meta, err := s.getTable(ctx, schema, table)
-	if err != nil {
-		return err
-	}
-	if err := s.checkWritable(ctx, meta); err != nil {
-		return err
-	}
-	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
-		!isUnknownIndex(err) {
-		return wrapRedis(err, "failed to truncate table")
-	}
-	if err := s.searchDo(ctx, meta.index(), indexCreateArgs(meta)...).Err(); err != nil {
-		return wrapRedis(err, "failed to recreate search index")
-	}
-	if err := s.dropMissingValues(ctx, meta); err != nil {
-		return err
-	}
-	if restartIdentity {
-		if err := s.client.Del(ctx, seqKey(schema, table)).Err(); err != nil {
-			return wrapRedis(err, "failed to restart the row id sequence")
-		}
-	}
-	return s.checkWritten(ctx, meta)
+// truncation is one table that a TRUNCATE empties.
+type truncation struct {
+	meta  *tableMeta // as the statement read it
+	names tableNames // the new key prefix and index name
+	// attrs are the new index's attributes (field → definition).
+	attrs   map[string]string
+	created bool
+	// The names the table had when it switched, released then.
+	oldPrefix, oldIndex string
 }
 
-// dropTable removes the index, every row, and the table metadata.
-func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bool) error {
-	meta, err := s.getTable(ctx, schema, table)
-	if err != nil {
-		var ae adbc.Error
-		if ifExists && asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
-			return nil
+// testHookTruncating, when set by a test, runs once truncateTables has
+// created the new indexes, before it switches the tables to them.
+var testHookTruncating func()
+
+// truncateTables empties tables, all of them or none. Each table moves to a
+// key prefix and index name that no table has had (claimNames), as if it
+// were dropped and created again with the same metadata:
+//
+//  1. Reserve the new names and create the new, empty index.
+//  2. One transaction, for every table, points the metadata to the new
+//     names and releases the old ones, as DROP TABLE does. The new prefix
+//     has no rows, so the missing values and dropped-column cleanups go,
+//     and with RESTART IDENTITY the row id counter starts again at 1.
+//  3. FT.DROPINDEX … DD on the old index deletes the old rows.
+//
+// A statement that is still writing through the old metadata finds out as
+// it does after DROP TABLE (sameKeys, checkKeys): it stops, deletes what it
+// wrote, and fails, and what it still writes goes to a prefix that no table
+// has. When TRUNCATE kept the prefix, such rows stayed in the table (some
+// of them not indexed), and after RESTART IDENTITY new rows took their keys
+// and were merged into them.
+func (s *store) truncateTables(ctx context.Context, metas []*tableMeta, restartIdentity bool) error {
+	ts := make([]*truncation, len(metas))
+	for i, meta := range metas {
+		if err := s.checkWritable(ctx, meta); err != nil {
+			return err
 		}
-		return err
+		ts[i] = &truncation{meta: meta}
 	}
-	// DROP TABLE isn't refused while a re-key moves the table's rows (the
-	// re-key then fails). One that its connection abandoned is rolled back
-	// first, so that it doesn't outlive the table (see rekey.go).
-	if meta.RekeyTo != "" {
-		s.recoverStale(ctx, meta.prefix())
+	// release gives back the new names, unless the switch has happened.
+	release := func() {
+		bg := context.WithoutCancel(ctx)
+		for _, t := range ts {
+			if t.created {
+				_ = s.searchDo(bg, t.names.index, "FT.DROPINDEX", t.names.index, "DD").Err()
+			}
+			if t.names.prefix != "" {
+				pipe := s.client.Pipeline()
+				pipe.SRem(bg, prefixesKey, t.names.prefix)
+				pipe.SRem(bg, indexesKey, t.names.index)
+				_, _ = pipe.Exec(bg)
+			}
+		}
 	}
-	// DD deletes every document the index knows about.
-	if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
-		!isUnknownIndex(err) {
-		return wrapRedis(err, "failed to drop search index")
+	for _, t := range ts {
+		nm, err := s.claimNames(ctx, t.meta.Schema, t.meta.Name)
+		if err != nil {
+			release()
+			return err
+		}
+		t.names = nm
+		next := *t.meta
+		next.KeyPrefix, next.IndexName = nm.prefix, nm.index
+		// The index name was free in the registry, so an index with that
+		// name is left over from an interrupted CREATE/DROP and can be
+		// discarded.
+		_ = s.searchDo(ctx, nm.index, "FT.DROPINDEX", nm.index, "DD").Err()
+		if err := s.searchDo(ctx, nm.index, indexCreateArgs(&next)...).Err(); err != nil {
+			release()
+			return wrapRedis(err, "failed to create search index")
+		}
+		t.created = true
+		t.attrs = map[string]string{}
+		for _, c := range t.meta.Columns {
+			if c.Indexed {
+				t.attrs[c.field()] = fmt.Sprint(indexAttrArgs(c))
+			}
+		}
 	}
-	pipe := s.client.TxPipeline()
-	pipe.Del(ctx, metaKey(schema, table), seqKey(schema, table))
-	pipe.SRem(ctx, tablesKey(schema), table)
-	pipe.SRem(ctx, prefixesKey, meta.prefix())
-	pipe.SRem(ctx, indexesKey, meta.index())
-	if !isTempSchema(schema) {
-		pipe.HIncrBy(ctx, releasedKey, meta.prefix(), 1) // see rekey.go
+	if testHookTruncating != nil {
+		testHookTruncating()
 	}
-	pipe.SRem(ctx, cleanupKey, cleanupMember(schema, table))
-	if _, err := pipe.Exec(ctx); err != nil {
-		return wrapRedis(err, "failed to drop table")
+
+	keys := make([]string, len(ts))
+	for i, t := range ts {
+		keys[i] = metaKey(t.meta.Schema, t.meta.Name)
 	}
-	s.trackTemp(schema, table, false)
+	var err error
+	sent := false
+	for attempt := 0; attempt < 20; attempt++ {
+		sent = false
+		err = s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			raws := make([][]byte, len(ts))
+			for i, t := range ts {
+				cur, err := s.getTableWith(ctx, tx, t.meta.Schema, t.meta.Name)
+				if err != nil {
+					return err
+				}
+				if err := movingErr(cur); err != nil {
+					return err
+				}
+				if err := s.addIndexedColumns(ctx, t, cur); err != nil {
+					return err
+				}
+				// cur may be a table created again since the statement read
+				// it: then that one is emptied.
+				t.oldPrefix, t.oldIndex = cur.prefix(), cur.index()
+				cur.KeyPrefix, cur.IndexName, cur.PrefixGen = t.names.prefix, t.names.index, 0
+				for j := range cur.Columns {
+					cur.Columns[j].Missing, cur.Columns[j].MissingThrough = "", 0
+				}
+				cur.PendingCleanup = nil
+				if raws[i], err = marshalMeta(cur); err != nil {
+					return err
+				}
+			}
+			sent = true
+			_, err := tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				for i, t := range ts {
+					schema, name := t.meta.Schema, t.meta.Name
+					p.Set(ctx, keys[i], raws[i], 0)
+					if restartIdentity {
+						p.Del(ctx, seqKey(schema, name))
+					}
+					p.SRem(ctx, prefixesKey, t.oldPrefix)
+					p.SRem(ctx, indexesKey, t.oldIndex)
+					if !isTempSchema(schema) {
+						p.HIncrBy(ctx, releasedKey, t.oldPrefix, 1) // see rekey.go
+					}
+					p.SRem(ctx, cleanupKey, cleanupMember(schema, name))
+				}
+				return nil
+			})
+			return err
+		}, keys...)
+		if !errors.Is(err, goredis.TxFailedErr) {
+			break
+		}
+	}
+	if err != nil {
+		// Nothing switched, unless EXEC was sent and its reply was lost: then
+		// the new names may be in use, and are kept.
+		if !sent || errors.Is(err, goredis.TxFailedErr) {
+			release()
+		}
+		if errors.Is(err, goredis.TxFailedErr) {
+			return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again",
+				displaySchema(ts[0].meta.Schema), ts[0].meta.Name)
+		}
+		return wrapRedis(err, "failed to truncate table")
+	}
+
+	var first error
+	for _, t := range ts {
+		if err := s.searchDo(ctx, t.oldIndex, "FT.DROPINDEX", t.oldIndex, "DD").Err(); err != nil &&
+			!isUnknownIndex(err) && first == nil {
+			first = errorf(adbc.StatusIO, "table %q.%q is empty, but deleting its old rows failed: %v; they are left under the key prefix %q, which no table has any more",
+				displaySchema(t.meta.Schema), t.meta.Name, err, t.oldPrefix)
+		}
+	}
+	return first
+}
+
+// addIndexedColumns adds to a truncated table's new index the indexed
+// columns that the table's current metadata has and the index doesn't: an
+// ADD COLUMN that committed after TRUNCATE read the metadata added them to
+// the old index only.
+func (s *store) addIndexedColumns(ctx context.Context, t *truncation, cur *tableMeta) error {
+	for _, c := range cur.Columns {
+		if !c.Indexed {
+			continue
+		}
+		def := fmt.Sprint(indexAttrArgs(c))
+		have, ok := t.attrs[c.field()]
+		if ok && have != def {
+			// The table was dropped and created again with another type.
+			return errorf(adbc.StatusIO, "table %q.%q was changed concurrently; try again", displaySchema(cur.Schema), cur.Name)
+		}
+		if ok {
+			continue
+		}
+		args := append([]any{"FT.ALTER", t.names.index, "SCHEMA", "ADD"}, indexAttrArgs(c)...)
+		if err := s.searchDo(ctx, t.names.index, args...).Err(); err != nil {
+			return wrapRedis(err, "failed to add a column to the new search index")
+		}
+		t.attrs[c.field()] = def
+	}
 	return nil
+}
+
+// testHookDropping, when set by a test, runs once dropTable has dropped the
+// table's index, before it removes the metadata.
+var testHookDropping func()
+
+// dropTable removes the index, every row, and the table metadata. The
+// metadata goes only if the table still has the keys whose index was
+// dropped: otherwise (a TRUNCATE moved it to new ones meanwhile) it starts
+// again, so that the new index and key prefix don't outlive the table.
+func (s *store) dropTable(ctx context.Context, schema, table string, ifExists bool) error {
+	key := metaKey(schema, table)
+	for attempt := 0; attempt < 20; attempt++ {
+		meta, err := s.getTable(ctx, schema, table)
+		if err != nil {
+			var ae adbc.Error
+			if ifExists && asAdbc(err, &ae) && ae.Code == adbc.StatusNotFound {
+				return nil
+			}
+			return err
+		}
+		// DROP TABLE isn't refused while a re-key moves the table's rows (the
+		// re-key then fails). One that its connection abandoned is rolled
+		// back first, so that it doesn't outlive the table (see rekey.go).
+		if meta.RekeyTo != "" {
+			s.recoverStale(ctx, meta.prefix())
+		}
+		// DD deletes every document the index knows about.
+		if err := s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err(); err != nil &&
+			!isUnknownIndex(err) {
+			return wrapRedis(err, "failed to drop search index")
+		}
+		if testHookDropping != nil {
+			testHookDropping()
+		}
+		err = s.client.Watch(ctx, func(tx *goredis.Tx) error {
+			raw, err := tx.Get(ctx, key).Result()
+			if err != nil && !errors.Is(err, goredis.Nil) {
+				return err
+			}
+			if !sameKeys(meta, raw) {
+				return goredis.TxFailedErr // read it again
+			}
+			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+				p.Del(ctx, key, seqKey(schema, table))
+				p.SRem(ctx, tablesKey(schema), table)
+				p.SRem(ctx, prefixesKey, meta.prefix())
+				p.SRem(ctx, indexesKey, meta.index())
+				if !isTempSchema(schema) {
+					p.HIncrBy(ctx, releasedKey, meta.prefix(), 1) // see rekey.go
+				}
+				p.SRem(ctx, cleanupKey, cleanupMember(schema, table))
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, goredis.TxFailedErr) {
+			continue
+		}
+		if err != nil {
+			return wrapRedis(err, "failed to drop table")
+		}
+		s.trackTemp(schema, table, false)
+		return nil
+	}
+	return errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", displaySchema(schema), table)
 }
 
 func isUnknownIndex(err error) bool {
