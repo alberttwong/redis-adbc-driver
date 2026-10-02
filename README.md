@@ -527,6 +527,60 @@ docker exec -it redis-adbc-test redis-cli MONITOR
 
 Stop Redis with `docker compose down`.
 
+## Arrow IPC files: `redis-arrow`
+
+`redis-arrow` writes a query's result as an
+[Arrow IPC](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
+file or stream, and bulk-ingests an IPC file or stream into a table. It links
+the driver as a Go library, so it needs neither cgo nor the shared library.
+Build it from `go`:
+
+```bash
+make cli
+```
+
+**Export.** `-o` names the output file. The result is in the IPC file format
+(`.arrow`, also read as Feather v2), except for `.arrows` files and stdout,
+which get the stream format. `-format file|stream` overrides this, and
+`-compression lz4|zstd` compresses the batches.
+
+```bash
+build/redis-arrow export -o sales.arrow "SELECT * FROM sales WHERE status = 'shipped'"
+```
+
+```bash
+build/redis-arrow export "SELECT country, COUNT(*) AS orders FROM sales GROUP BY country" | python -c "import sys, pyarrow.ipc; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())"
+```
+
+**Import.** The input is a path, or stdin when none is given. File and stream
+are told apart by the file format's magic bytes. `-mode` is `create` (the
+default), `append`, `replace` or `create_append`, as in ADBC bulk ingest.
+`-schema` and `-index-columns` (`adbc.redis.ingest.index_columns`) are
+optional.
+
+```bash
+build/redis-arrow import -table sales_copy -mode replace sales.arrow
+```
+
+```bash
+build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table sales_copy -mode replace
+```
+
+- **Connecting:** `-uri`, else `$REDIS_URI`, else `redis://localhost:6379/0`.
+  Set a password in `$REDIS_URI` rather than in `-uri`, where other users
+  of the machine can see it in the process list. `-option key=value`
+  (repeatable) sets a database option, such as
+  `-option adbc.redis.read_timeout=30m`.
+- **Flags go before the query or the path.**
+- **Statements without a result set** (DDL, or DML without `RETURNING`)
+  still run, but `export` then fails and writes nothing. A failed export
+  leaves no partial file: it writes a temporary file next to the target and
+  renames it at the end.
+- **Memory:** the driver builds a query's whole result before it returns
+  the first batch, so exporting a large table needs memory for all of it.
+  Import reads a stream batch by batch, but reads a file on stdin into
+  memory first, since the file format's footer is at its end.
+
 ## Architecture: hybrid index-row layout
 
 ```
