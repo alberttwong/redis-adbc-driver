@@ -42,8 +42,12 @@ $(CLI): $(wildcard *.go) $(wildcard cmd/redis-arrow/*.go) go.mod go.sum
 	mkdir -p build
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/redis-arrow
 
+# One package at a time: with REDIS_URI set, the driver's and redis-arrow's
+# integration tests share the server, and any connection that opens rolls
+# back an abandoned move (adbc.redis.rename_rekey), including the ones the
+# driver's tests set up and expect to find.
 test:
-	go test -v ./...
+	go test -v -p 1 ./...
 
 redis-up:
 	docker compose up --detach --wait redis

@@ -257,8 +257,11 @@ func TestSQLGroupedSubqueryOuterAggregates(t *testing.T) {
 	h.expectRows(`select v, (select max(g.id) filter (where g.v > 0) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
 		"10|2", "20|3")
 	h.expectRows(`select v, (select sum(g.id)) from it_gq.g group by v order by v`, "10|3", "20|3")
-	h.expectRows(`select v, (select x.id from it_gq.g x order by max(g.id) limit 1) from it_gq.g group by v order by v`,
-		"10|1", "20|1")
+	// In the subquery, max(g.id) is a constant, so ordering by it alone
+	// leaves the row LIMIT picks to the scan order, which a cluster's
+	// shards don't keep.
+	h.expectRows(`select v, (select x.id from it_gq.g x order by abs(x.id - max(g.id)) limit 1) from it_gq.g group by v order by v`,
+		"10|2", "20|3")
 	h.expectRows(`select count(*), (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`, "3|3")
 	// An aggregate that also reads the subquery's own columns is the
 	// subquery's.
