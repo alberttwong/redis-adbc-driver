@@ -33,13 +33,19 @@ var zoneTestNow = time.Date(2024, 1, 10, 5, 0, 0, 0, time.UTC)
 // in that zone.
 func evalInZone(t *testing.T, zone, expr string) (string, string, error) {
 	t.Helper()
+	return evalInZoneAt(t, zone, zoneTestNow, expr)
+}
+
+// evalInZoneAt is evalInZone with the current time now.
+func evalInZoneAt(t *testing.T, zone string, now time.Time, expr string) (string, string, error) {
+	t.Helper()
 	tz, err := timeZoneParam(zone)
 	if err != nil {
 		t.Fatalf("zone %q: %v", zone, err)
 	}
 	sess := newSession(defaultSchema)
 	sess.vals["timezone"] = tz
-	e := &executor{sess: sess, cache: newExecCache(), now: zoneTestNow}
+	e := &executor{sess: sess, cache: newExecCache(), now: now}
 	x := parseTestExpr(t, expr)
 	typ, err := inferType(x, nil, nil)
 	if err != nil {
@@ -61,8 +67,14 @@ func evalInZone(t *testing.T, zone, expr string) (string, string, error) {
 
 func runZoneCases(t *testing.T, zone string, cases []scalarCase) {
 	t.Helper()
+	runZoneCasesAt(t, zone, zoneTestNow, cases)
+}
+
+// runZoneCasesAt is runZoneCases with the current time now.
+func runZoneCasesAt(t *testing.T, zone string, now time.Time, cases []scalarCase) {
+	t.Helper()
 	for _, c := range cases {
-		got, typ, err := evalInZone(t, zone, c.expr)
+		got, typ, err := evalInZoneAt(t, zone, now, c.expr)
 		if err != nil {
 			if c.want != "error: "+errText(err) {
 				t.Errorf("%s: %s: %v", zone, c.expr, err)

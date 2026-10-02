@@ -1638,8 +1638,8 @@ field, even if later rows have it.
   while computing `x`, and a cast between types that never convert (`DATE`
   to `BOOLEAN`), are still errors. A cast to `VARCHAR(n)` or `CHAR(n)` cuts
   the text to `n` characters, and `CHAR(n)` pads it (see String lengths). A
-  cast to a `TIME(p)` or `TIMESTAMP(p)` of a lower precision rounds (see
-  Fractional seconds under Types), and casts between `TIMESTAMP`,
+  cast to a `TIME(p)` or `TIMESTAMP(p)` of a lower precision rounds to `p`
+  digits (see Fractional seconds under Types), and casts between `TIMESTAMP`,
   `TIMESTAMP WITH TIME ZONE`, `DATE`, `TIME` and text use the session time
   zone (see Session time zone)
 - Math functions: `ROUND(x [, n])` and `TRUNC(x [, n])` (`n` may be
@@ -1753,7 +1753,14 @@ field, even if later rows have it.
   its local time in the session time zone (see Session time zone), and the
   current time is fixed once per statement:
   - `CURRENT_DATE`, `CURRENT_TIMESTAMP` / `NOW()`, `CURRENT_TIME`,
-    `LOCALTIMESTAMP`, `LOCALTIME` (the date and times are local)
+    `LOCALTIMESTAMP`, `LOCALTIME` (the date and times are local), read in
+    microseconds, as Postgres's clock is. With a precision,
+    `CURRENT_TIMESTAMP(p)`, `LOCALTIMESTAMP(p)`, `CURRENT_TIME(p)`,
+    `LOCALTIME(p)` and `NOW(p)` are rounded to `p` digits, as in Postgres
+    (`CURRENT_TIMESTAMP(0)` is whole seconds, and `CURRENT_TIMESTAMP(2)` is
+    `CAST(CURRENT_TIMESTAMP AS TIMESTAMPTZ(2))`), and have type
+    `TIMESTAMP(p) WITH TIME ZONE`, `TIMESTAMP(p)` or `TIME(p)`; `p` is an
+    integer constant from 0 to 9
   - `EXTRACT(field FROM x)` / `DATE_PART('field', x)` for `year`, `isoyear`,
     `quarter`, `month`, `week` (ISO), `day`, `dow` (0 = Sunday), `isodow`,
     `doy`, `hour`, `minute`, `second`, `milliseconds`, `microseconds`, `epoch`,
@@ -2050,7 +2057,12 @@ field, even if later rows have it.
   `numeric_scale`, `datetime_precision`, `is_indexed` and `comment`), `views`
   (`view_definition`), and `routines`, the driver's functions (see "Function
   calls" above). `comment` is the `COMMENT ON` text, NULL without
-  one. Any SQL works on them, including joins
+  one. `data_type` is the driver's name of the type, with its length or
+  precision (`VARCHAR(3)`, `TIMESTAMP(2)`, `TIMESTAMP(6) WITH TIME ZONE`),
+  where Postgres writes `character varying` or `timestamp without time
+  zone` and keeps the number in `character_maximum_length` or
+  `datetime_precision`, which have it here too. Any SQL works on them,
+  including joins
 - `[WITH …] UPDATE t [[AS] a] SET col = …, … [FROM item, …] [WHERE …]` and
   `[WITH …] DELETE FROM t [[AS] a] [USING item, …] [WHERE …]` (the Postgres
   forms). The FROM / USING items are written like a SELECT's FROM clause
@@ -2200,34 +2212,57 @@ field, even if later rows have it.
     NaN to NUMERIC(10,2): NUMERIC values can't be NaN or infinite`, and
     nothing is written. A value beyond `REAL`'s range is an infinity
     (Postgres raises `value out of range: overflow`)
-  - **Fractional seconds:** `TIME(p)` and `TIMESTAMP(p)` hold 0, 3, 6 or 9
-    digits, the Arrow units: a `p` of 1 or 2 is 3, 4 or 5 is 6, and 7 or 8
-    is 9 (Postgres keeps any `p` up to 6). A value with more digits is
-    rounded half away from zero, as Postgres rounds, when it is cast to the
-    type or written to a column of it: `INSERT`, `UPDATE`, `MERGE`,
-    `CREATE TABLE … AS`, defaults and bulk ingest. The rounding carries into
-    the next second, minute, day or year (`'2024-12-31 23:59:59.5'` is
-    `2025-01-01 00:00:00` in a `TIMESTAMP(0)`), and a `TIME(0)` of
-    `23:59:59.9` is `24:00:00`, which Postgres allows (its Arrow value is
-    86,400 seconds, one past the end of Arrow's range for a time of day;
-    pyarrow reads it as 00:00:00). As in Postgres, whose timestamps count
-    from 2000-01-01, a timestamp before 2000 exactly halfway rounds down
-    (`'1999-12-31 23:59:59.5'` is `23:59:59`). The text, the Arrow value and
-    what index queries compare with are the rounded value
+  - **Fractional seconds:** `TIME(p)` and `TIMESTAMP(p)` hold `p` digits,
+    from 0 to 9 (6 without `p`; a `p` above 9 is 9, where Postgres reduces
+    a `p` above 6 to 6; a negative `p` is an error, as in Postgres). Their
+    Arrow unit is the one with the next number of digits: seconds for 0,
+    milliseconds for 1 to 3, microseconds for 4 to 6 and nanoseconds for 7
+    to 9, so a `TIMESTAMP(2)` is an Arrow `timestamp[ms]` whose values are
+    whole hundredths. A value with more digits is rounded half away from
+    zero, as Postgres rounds, in one step (`.1245` is `.12` in a
+    `TIMESTAMP(2)`), when it is cast to the type or written to a column of
+    it: `INSERT`, `UPDATE`, `MERGE`, `CREATE TABLE … AS`, defaults and bulk
+    ingest (`'… 10:00:00.123456'` is stored as `.12` in a `TIMESTAMP(2)`).
+    The rounding carries into the next second, minute, day or year
+    (`'2024-12-31 23:59:59.5'` is `2025-01-01 00:00:00` in a
+    `TIMESTAMP(0)`), and a `TIME(0)` of `23:59:59.9` is `24:00:00`, which
+    Postgres allows (its Arrow value is 86,400 seconds, one past the end of
+    Arrow's range for a time of day; pyarrow reads it as 00:00:00). As in
+    Postgres, whose timestamps count from 2000-01-01, a timestamp before
+    2000 exactly halfway rounds down (`'1999-12-31 23:59:59.5'` is
+    `23:59:59`). The text, the Arrow value and what index queries compare
+    with are the rounded value
+    - **The type** keeps `p`: in the table's metadata, `information_schema`
+      (`data_type` `TIMESTAMP(2)`, `datetime_precision` 2) and `GetObjects`
+      (`xdbc_type_name` `TIMESTAMP(2)`, `xdbc_decimal_digits` 2). A column,
+      a cast, a scalar subquery, and `CASE`, `COALESCE`, `NULLIF`,
+      `GREATEST`, `LEAST` and set operations keep it, with the most digits
+      of their inputs, so that no value is rounded (Postgres's type has no
+      precision, which is 6, when they differ). So `CREATE TABLE … AS` and
+      views keep the precision of a column or cast they select. Arithmetic
+      (`ts + INTERVAL '1 second'`), functions, aggregates and a text
+      literal in `COALESCE` have none, as in Postgres, and have the unit's
+      digits (a `TIMESTAMP(3)` for a `TIMESTAMP(2)`)
+    - `TIMESTAMP(p) '…'`, `TIMESTAMP(p) WITH TIME ZONE '…'`,
+      `TIMESTAMPTZ(p) '…'` and `TIME(p) '…'` are the text cast to the type
     - Text with more than 6 digits read into a type of 6 or fewer is read
       as Postgres reads it, in microseconds with an exact half rounded to
       even, before it is rounded to the type (`'… 10:00:00.1234565'` is
       `.123456` in a `TIMESTAMP`, `'… 10:00:00.4999995'` is `10:00:01` in a
-      `TIMESTAMP(0)`). Read into `TIME(9)` / `TIMESTAMP(9)`, and as a literal
-      (`TIMESTAMP '… .1234565'`), it is nanoseconds, which round half away
-      from zero like any other value; outside the nanoseconds' range (1677
-      to 2262) it is microseconds, read as Postgres reads them
+      `TIMESTAMP(0)`). Read into a type of 7 to 9 digits, and as a literal
+      (`TIMESTAMP '… .1234565'`, a `TIMESTAMP(9)`), it is nanoseconds, which
+      round half away from zero like any other value; outside the
+      nanoseconds' range (1677 to 2262) it is microseconds, read as Postgres
+      reads them
     - Text compared with a time or timestamp is read with the digits
       written (in microseconds unless the other side is in nanoseconds), as
       Postgres compares at full precision, so a `TIMESTAMP(0)` of `10:00:01`
       equals `'… 10:00:01'` but not `'… 10:00:00.5'`
     - Earlier versions truncated (`10:00:00.5` was `10:00:00` in a
-      `TIMESTAMP(0)`); the values they stored don't change
+      `TIMESTAMP(0)`); the values they stored don't change. v0.0.8 and
+      earlier also kept 3, 6 or 9 digits for a `p` of 1 or 2, 4 or 5, 7 or
+      8, and the column's type in their metadata is that: a `TIMESTAMP(2)`
+      column they created stays a `TIMESTAMP(3)`, values and type
 
 Tables can be qualified as `schema.table` or `redis.schema.table`, and
 `pg_temp.table` is the connection's temporary table. Strings are written

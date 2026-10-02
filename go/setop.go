@@ -54,10 +54,7 @@ func setOpType(a, b ColType) (ColType, bool) {
 	case a.Kind.isNumeric() && b.Kind.isNumeric():
 		return commonType(a, b), true
 	case a.Kind == b.Kind && (a.Kind == KindTime || a.Kind == KindTimestamp):
-		t := a
-		if unitsPerSecond[b.Unit] > unitsPerSecond[a.Unit] {
-			t.Unit = b.Unit
-		}
+		t := finerTime(a, b)
 		if a.TZ != "" || b.TZ != "" {
 			t.TZ = "UTC"
 		}

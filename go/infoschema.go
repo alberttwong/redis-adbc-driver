@@ -152,7 +152,7 @@ func columnRow(schema, table string, pos int, c columnMeta) []Value {
 	case KindDate:
 		dtPrec = optInt(0, true)
 	case KindTime, KindTimestamp:
-		dtPrec = optInt(int32(precisionForUnit(t.Unit)), true)
+		dtPrec = optInt(int32(t.fracDigits()), true)
 	}
 	return []Value{
 		stringValue(catalogName), stringValue(schema), stringValue(table),

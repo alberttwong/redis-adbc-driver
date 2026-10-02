@@ -382,6 +382,11 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 					size, octets := n, 4*n
 					ci.XdbcColumnSize, ci.XdbcCharOctetLength = &size, &octets
 				}
+				if k := col.Type.Kind; k == KindTime || k == KindTimestamp {
+					// The fractional-second digits, TIMESTAMP(p)'s p.
+					digits := int16(col.Type.fracDigits())
+					ci.XdbcDecimalDigits = &digits
+				}
 				if col.Default != "" {
 					def := col.Default
 					ci.XdbcColumnDef = &def

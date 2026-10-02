@@ -400,7 +400,9 @@ func timeOfDay(v Value) int64 {
 }
 
 // temporalType is the result type of a date/time arithmetic operator, or ok
-// = false if the operands are not a date/time combination.
+// = false if the operands are not a date/time combination. As in Postgres,
+// a time or timestamp result doesn't keep its operand's declared precision
+// (withoutTypmod): TIMESTAMP(2) + INTERVAL is a TIMESTAMP(3).
 func temporalType(op string, a, b ColType) (ColType, bool, error) {
 	ak, bk := a.Kind, b.Kind
 	isInt := func(k Kind) bool { return k.isInteger() }
@@ -417,17 +419,17 @@ func temporalType(op string, a, b ColType) (ColType, bool, error) {
 	case "+":
 		switch {
 		case ak == KindTimestamp && bk == iv:
-			return a, true, nil
+			return a.withoutTypmod(), true, nil
 		case ak == iv && bk == KindTimestamp:
-			return b, true, nil
+			return b.withoutTypmod(), true, nil
 		case (ak == KindDate && bk == iv) || (ak == iv && bk == KindDate):
 			return typeTimestamp, true, nil
 		case ak == KindDate && isInt(bk), isInt(ak) && bk == KindDate:
 			return typeDate, true, nil
 		case ak == KindTime && bk == iv:
-			return a, true, nil
+			return a.withoutTypmod(), true, nil
 		case ak == iv && bk == KindTime:
-			return b, true, nil
+			return b.withoutTypmod(), true, nil
 		case ak == iv && bk == iv:
 			return typeInterval, true, nil
 		case ak == KindDate && bk == KindTime:
@@ -436,7 +438,7 @@ func temporalType(op string, a, b ColType) (ColType, bool, error) {
 	case "-":
 		switch {
 		case ak == KindTimestamp && bk == iv:
-			return a, true, nil
+			return a.withoutTypmod(), true, nil
 		case ak == KindDate && bk == iv:
 			return typeTimestamp, true, nil
 		case ak == KindDate && isInt(bk):
@@ -446,7 +448,7 @@ func temporalType(op string, a, b ColType) (ColType, bool, error) {
 		case (ak == KindTimestamp || ak == KindDate) && (bk == KindTimestamp || bk == KindDate):
 			return typeInterval, true, nil
 		case ak == KindTime && bk == iv:
-			return a, true, nil
+			return a.withoutTypmod(), true, nil
 		case ak == KindTime && bk == KindTime:
 			return typeInterval, true, nil
 		case ak == iv && bk == iv:
@@ -464,9 +466,9 @@ func temporalType(op string, a, b ColType) (ColType, bool, error) {
 	if ak == KindNull || bk == KindNull {
 		// NULL with a date/time operand: the type of the other side.
 		if ak == KindNull {
-			return b, true, nil
+			return b.withoutTypmod(), true, nil
 		}
-		return a, true, nil
+		return a.withoutTypmod(), true, nil
 	}
 	return bad()
 }

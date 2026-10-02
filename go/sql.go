@@ -2845,6 +2845,10 @@ func (p *parser) parseColumnList() ([]string, error) {
 	return cols, nil
 }
 
+// maxTypeParam stands for MAX in VARCHAR(MAX) while a type is parsed; it is
+// then dropped. (A written -1 stays, so TIMESTAMP(-1) is an error.)
+const maxTypeParam = -1 << 31
+
 // parseTypeSpec parses a SQL type such as DOUBLE PRECISION, VARCHAR(10),
 // NUMERIC(10, 2) or TIMESTAMP(3) WITH TIME ZONE.
 func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
@@ -2870,7 +2874,7 @@ func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
 		for {
 			t := p.next()
 			if t.kind == tokIdent && strings.EqualFold(t.text, "MAX") {
-				spec.Params = append(spec.Params, -1)
+				spec.Params = append(spec.Params, maxTypeParam)
 			} else {
 				neg := false
 				if t.kind == tokOp && t.text == "-" {
@@ -2920,7 +2924,7 @@ func (p *parser) parseTypeSpec() (sqlTypeSpec, error) {
 	// VARCHAR(MAX) etc: drop sentinel parameters.
 	params := spec.Params[:0]
 	for _, v := range spec.Params {
-		if v != -1 {
+		if v != maxTypeParam {
 			params = append(params, v)
 		}
 	}
@@ -3621,10 +3625,19 @@ func (p *parser) parsePrimary() (Expr, error) {
 				return p.parseSQLJSONFunc(upper)
 			}
 		case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "DATETIME":
-			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...'
+			// Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...',
+			// TIMESTAMP(p) '...'
 			save := p.pos
 			p.pos++
 			withTZ := upper == "TIMESTAMPTZ"
+			var params []int
+			if upper != "DATE" && p.isOp("(") && p.peekAt(1).kind == tokNumber && p.peekAt(2).kind == tokOp &&
+				p.peekAt(2).text == ")" {
+				if n, err := strconv.Atoi(p.peekAt(1).text); err == nil {
+					params = []int{n}
+					p.pos += 3
+				}
+			}
 			if upper == "TIMESTAMP" || upper == "TIME" {
 				if p.acceptKeyword("WITH", "TIME", "ZONE") {
 					withTZ = true
@@ -3632,7 +3645,27 @@ func (p *parser) parsePrimary() (Expr, error) {
 					p.acceptKeyword("WITHOUT", "TIME", "ZONE")
 				}
 			}
-			if s := p.peek(); s.kind == tokString {
+			if s := p.peek(); s.kind == tokString && params != nil {
+				// With a precision: the text cast to the type, read as a
+				// cast reads it (in microseconds unless the type is in
+				// nanoseconds), and rounded.
+				p.pos++
+				ct, err := colTypeFromSQL(sqlTypeSpec{Name: upper, Params: params, WithTZ: withTZ})
+				if err != nil {
+					return nil, &sqlError{msg: err.Error()}
+				}
+				text := stringValue(s.text)
+				if _, _, _, hasTZ, _ := parseTimestamp(s.text); isTimestampTZ(ct) && !hasTZ {
+					// A local time, read when the statement runs, as below.
+					return &Cast{X: &Literal{V: text}, T: ct}, nil
+				}
+				v, err := Coerce(text, ct)
+				if err != nil {
+					return nil, &sqlError{msg: err.Error()}
+				}
+				return &Literal{V: v}, nil
+			}
+			if s := p.peek(); s.kind == tokString && params == nil {
 				p.pos++
 				var v Value
 				var err error
