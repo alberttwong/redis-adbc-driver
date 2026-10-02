@@ -921,6 +921,11 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	if sel.GroupingSets != nil || usesGrouping(sel) {
 		return e.planGroupingSets(plan, types)
 	}
+	if plan.aggregate {
+		if err := checkGroupedSubqueries(plan); err != nil {
+			return nil, err
+		}
+	}
 	return plan, nil
 }
 

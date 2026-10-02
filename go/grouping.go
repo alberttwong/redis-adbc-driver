@@ -324,15 +324,162 @@ func (gp *groupingPlan) slotOf(e Expr) int {
 	return -1
 }
 
-// groupedColumn reports whether a column of the query is a grouping
-// expression by itself.
-func (gp *groupingPlan) groupedColumn(name string) bool {
-	for _, s := range gp.slots {
-		if c, ok := s.expr.(*ColumnRef); ok && c.Outer == 0 && c.Name == name {
+// groupedColumn reports whether a column of the query is one of its GROUP BY
+// expressions by itself.
+func groupedColumn(groupBy []Expr, name string) bool {
+	for _, g := range groupBy {
+		if c, ok := g.(*ColumnRef); ok && c.Outer == 0 && c.Name == name {
 			return true
 		}
 	}
 	return false
+}
+
+// columnName names a column of the query in errors, as Postgres does: "t.c"
+// for the column c of its FROM item t. The columns of a join (also of a
+// table function or an item with column aliases, which the join executor
+// reads) are named so already, except those a NATURAL FULL JOIN merges,
+// which are named by their first side's column, as Postgres names the
+// COALESCE they stand for.
+func (p *selectPlan) columnName(name string) string {
+	sel := p.sel
+	switch {
+	case p.meta != nil && p.meta.join != nil:
+		for _, m := range p.meta.join.merged {
+			if m.key == name {
+				first := ""
+				walkExpr(m.expr, func(x Expr) {
+					if c, ok := x.(*ColumnRef); ok && first == "" {
+						first = c.Name
+					}
+				})
+				return keyLabel(first)
+			}
+		}
+		return keyLabel(name)
+	case sel.FromAlias != "":
+		return sel.FromAlias + "." + name
+	case sel.From != nil:
+		return sel.From.Name + "." + name
+	}
+	return name
+}
+
+// ungroupedSubquery is Postgres's error for a subquery of a grouped query
+// that reads a column of the query that is not grouped: in `SELECT v FROM g
+// GROUP BY v HAVING EXISTS (SELECT 1 FROM g x WHERE x.id > g.id)` it would
+// see one row of each group. As in Postgres, only a column that is a GROUP
+// BY expression by itself is grouped there (a larger expression isn't
+// matched inside a subquery), and so are the references of the subqueries
+// nested in it. The callers don't look inside aggregate calls, which see
+// every row.
+func (p *selectPlan) ungroupedSubquery(sq *Subquery) error {
+	for _, ref := range sq.outerRefs {
+		if ref.up != 0 || groupedColumn(p.sel.GroupBy, ref.name) {
+			continue
+		}
+		if outerAggregated(sq)[ref.name] {
+			return errorf(adbc.StatusNotImplemented, "outer-level aggregate of column %q in a subquery is not supported", p.columnName(ref.name))
+		}
+		return errorf(adbc.StatusInvalidArgument, "subquery uses ungrouped column %q from outer query", p.columnName(ref.name))
+	}
+	return nil
+}
+
+// outerAggregated returns the columns of the enclosing query read by the
+// subquery's outer-level aggregates. In Postgres an aggregate call whose
+// arguments read only an enclosing query's columns, like MAX(g.id) in
+// (SELECT MAX(g.id) FROM x), belongs to that query and is computed over its
+// groups; the driver would compute it over the subquery's rows.
+func outerAggregated(sq *Subquery) map[string]bool {
+	p := sq.plan
+	if p == nil {
+		return nil
+	}
+	if p.grouping != nil {
+		p = p.grouping.base
+	}
+	exprs := []Expr{p.having, p.qualify}
+	for _, it := range p.items {
+		exprs = append(exprs, it.expr)
+	}
+	for _, o := range p.order {
+		exprs = append(exprs, o.expr)
+	}
+	cols := map[string]bool{}
+	for _, e := range exprs {
+		walkExpr(e, func(x Expr) {
+			f, ok := x.(*Func)
+			if !ok || !aggregateFuncs[f.Name] {
+				return
+			}
+			// The call's level is the innermost one its columns are of.
+			level := -1
+			var outer []string
+			walkExpr(f, func(y Expr) {
+				if c, ok := y.(*ColumnRef); ok {
+					if level < 0 || c.Outer < level {
+						level = c.Outer
+					}
+					if c.Outer == 1 {
+						outer = append(outer, c.Name)
+					}
+				}
+			})
+			if level == 1 {
+				for _, name := range outer {
+					cols[name] = true
+				}
+			}
+		})
+	}
+	return cols
+}
+
+// checkGroupedSubqueries applies Postgres's grouping rule to the subqueries
+// of a query with GROUP BY, aggregates or HAVING (one with grouping sets is
+// checked as it is rewritten, see groupingRewriter): where the query
+// computes a value per group (the SELECT list, HAVING, ORDER BY, QUALIFY,
+// DISTINCT ON and window definitions, outside aggregate calls), a subquery
+// may read only the query's grouped columns. A bare column outside
+// subqueries isn't checked: it is the group's first row's.
+func checkGroupedSubqueries(plan *selectPlan) error {
+	sel := plan.sel
+	// A subquery of a GROUP BY item that the query refers to by position or
+	// alias (GROUP BY 1) is the same node, part of the item's value.
+	grouping := map[*Subquery]bool{}
+	for _, g := range sel.GroupBy {
+		walkExpr(g, func(x Expr) {
+			if sq, ok := x.(*Subquery); ok {
+				grouping[sq] = true
+			}
+		})
+	}
+	var exprs []Expr
+	for _, it := range plan.items {
+		exprs = append(exprs, it.expr)
+	}
+	for _, o := range plan.order {
+		exprs = append(exprs, o.expr)
+	}
+	for _, d := range plan.distinctOn {
+		exprs = append(exprs, d.expr)
+	}
+	// A window of the WINDOW clause is part of the calls that name it, but
+	// Postgres also checks the unused ones.
+	for _, nw := range sel.Windows {
+		exprs = append(exprs, windowSpecExprs(nw.Spec)...)
+	}
+	exprs = append(exprs, plan.having, plan.qualify)
+	var err error
+	for _, x := range exprs {
+		walkOutsideAggregates(x, func(n Expr) {
+			if sq, ok := n.(*Subquery); ok && err == nil && !grouping[sq] {
+				err = plan.ungroupedSubquery(sq)
+			}
+		})
+	}
+	return err
 }
 
 // planGroupingSets turns a planned query with grouping sets (or GROUPING()
@@ -391,14 +538,6 @@ func (e *executor) planGroupingSets(plan *selectPlan, types map[string]ColType) 
 	// The plan over the combined groups.
 	out := *plan
 	r := &groupingRewriter{gp: gp, memo: map[Expr]Expr{}}
-	if len(sel.Joins) == 0 {
-		// Name columns like Postgres, "t.c" (in a join they are "t.c"
-		// already).
-		r.rel = sel.FromAlias
-		if r.rel == "" && sel.From != nil {
-			r.rel = sel.From.Name
-		}
-	}
 	out.items = make([]planItem, len(plan.items))
 	for i, it := range plan.items {
 		out.items[i] = planItem{expr: r.rewrite(it.expr), name: it.name}
@@ -457,8 +596,7 @@ func (e *executor) planGroupingSets(plan *selectPlan, types map[string]ColType) 
 // groupingRewriter rewrites the expressions of a query with grouping sets
 // to read the columns of the combined groups.
 type groupingRewriter struct {
-	gp  *groupingPlan
-	rel string // the FROM item's name, for errors
+	gp *groupingPlan
 	// memo keeps shared nodes shared (an ORDER BY alias is its item's
 	// expression), so each window function is computed once.
 	memo map[Expr]Expr
@@ -469,14 +607,6 @@ func (r *groupingRewriter) fail(err error) {
 	if r.err == nil {
 		r.err = err
 	}
-}
-
-// column names a column of the query in errors.
-func (r *groupingRewriter) column(name string) string {
-	if r.rel != "" {
-		return r.rel + "." + name
-	}
-	return keyLabel(name)
 }
 
 func (r *groupingRewriter) rewrite(e Expr) Expr {
@@ -512,7 +642,7 @@ func (r *groupingRewriter) node(e Expr) Expr {
 		// Outer references are constants here.
 		if x.Outer == 0 {
 			r.fail(errorf(adbc.StatusInvalidArgument,
-				"column %q must appear in the GROUP BY clause or be used in an aggregate function", r.column(x.Name)))
+				"column %q must appear in the GROUP BY clause or be used in an aggregate function", gp.base.columnName(x.Name)))
 		}
 		return x
 	case *Unary:
@@ -547,10 +677,8 @@ func (r *groupingRewriter) node(e Expr) Expr {
 		f.Args = r.rewriteAll(x.Args)
 		return &f
 	case *Subquery:
-		for _, ref := range x.outerRefs {
-			if ref.up == 0 && !gp.groupedColumn(ref.name) {
-				r.fail(errorf(adbc.StatusInvalidArgument, "subquery uses ungrouped column %q from outer query", r.column(ref.name)))
-			}
+		if err := gp.base.ungroupedSubquery(x); err != nil {
+			r.fail(err)
 		}
 		if x.X == nil {
 			return x
