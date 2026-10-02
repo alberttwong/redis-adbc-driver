@@ -1016,7 +1016,7 @@ func (env *evalEnv) evalSubquery(sq *Subquery) (Value, error) {
 		case 1:
 			return rows[0][0], nil
 		}
-		return Value{}, fmt.Errorf("scalar subquery returned %d rows", len(rows))
+		return Value{}, fmt.Errorf("more than one row returned by a subquery used as an expression")
 	case SubqueryAny, SubqueryAll:
 		if r, ok := sq.X.(*RowExpr); ok {
 			return env.evalRowQuantified(sq, r, rows)
