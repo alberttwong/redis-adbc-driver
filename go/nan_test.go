@@ -47,8 +47,9 @@ func TestNaNStored(t *testing.T) {
 			}
 		}
 		// Earlier versions wrote "NaN"; RediSearch replies (reducers) say inf
-		// and nan. Only nanStored is a NaN that the index holds as +inf.
-		for s, want := range map[string]float64{"NaN": nan, "inf": inf, "-inf": -inf, "nan": nan, "+Inf": inf} {
+		// and nan, and -nan on amd64. Only nanStored is a NaN that the index
+		// holds as +inf.
+		for s, want := range map[string]float64{"NaN": nan, "inf": inf, "-inf": -inf, "nan": nan, "+Inf": inf, "-nan": nan, "+nan": nan, "-NaN": nan} {
 			v, err := decodeStored(s, typ)
 			if err != nil || !(v.F == want || math.IsNaN(v.F) && math.IsNaN(want)) {
 				t.Errorf("%s %q read as %v (%v), want %v", typ.SQLName(), s, v.F, err, want)
