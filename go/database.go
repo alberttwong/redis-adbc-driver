@@ -68,13 +68,19 @@ func (d *databaseImpl) clientOptions() (*goredis.Options, error) {
 	return opts, nil
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
-	opts, err := d.clientOptions()
-	if err != nil {
-		return nil, err
+// dial connects to Redis as Open does, without checking the server or
+// writing anything.
+func (d *databaseImpl) dial(ctx context.Context) (client goredis.UniversalClient, opts *goredis.Options, t timeouts, writeFollows bool, err error) {
+	if opts, err = d.clientOptions(); err != nil {
+		return nil, nil, t, false, err
 	}
-	t, writeFollows := d.timeouts.resolve(opts)
-	client, err := d.connect(ctx, opts, t)
+	t, writeFollows = d.timeouts.resolve(opts)
+	client, err = d.connect(ctx, opts, t)
+	return client, opts, t, writeFollows, err
+}
+
+func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
+	client, opts, t, writeFollows, err := d.dial(ctx)
 	if err != nil {
 		return nil, err
 	}

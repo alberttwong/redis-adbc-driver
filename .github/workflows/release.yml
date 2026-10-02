@@ -213,7 +213,7 @@ jobs:
               /uv/uv run -q pytest -q tests/'
 
       # The redis-arrow tarball: export to a file, import it, then pipe an
-      # export into an import.
+      # export into an import; check and scan the table's HASHes.
       - name: redis-arrow
         if: hashFiles('go/cmd/redis-arrow/main.go') != ''
         env:
@@ -233,6 +233,11 @@ jobs:
                 /cli/redis-arrow import -table release_cli -mode append 2> out
               grep -qx "1 row ingested into release_cli" out
               /cli/redis-arrow export -o all.arrows "SELECT * FROM release_cli" 2> out
+              grep -qx "2 rows" out
+              /cli/redis-arrow check -prefix public:release_cli -key-column "" > out
+              grep -q "^  2 HASH keys" out
+              grep -qx "Arrow IPC (redis-arrow scan): READY" out
+              /cli/redis-arrow scan -prefix public:release_cli -key-column "" -o rows.arrow 2> out
               grep -qx "2 rows" out'
 
   # GitHub's macOS runners can't run the Redis containers, so the macOS

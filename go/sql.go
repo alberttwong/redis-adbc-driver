@@ -1876,6 +1876,24 @@ func parseExprText(src string) (Expr, error) {
 	return e, nil
 }
 
+// parseTypeText parses a standalone SQL type name, such as BIGINT or
+// TIMESTAMP(3) WITH TIME ZONE.
+func parseTypeText(src string) (ColType, error) {
+	toks, err := lex(src)
+	if err != nil {
+		return ColType{}, err
+	}
+	p := &parser{src: src, toks: toks}
+	spec, err := p.parseTypeSpec()
+	if err != nil {
+		return ColType{}, err
+	}
+	if p.peek().kind != tokEOF {
+		return ColType{}, syntaxErr("unexpected %q", p.peek().text)
+	}
+	return colTypeFromSQL(spec)
+}
+
 func (p *parser) parseCreate() (Stmt, error) {
 	if err := p.expectKeyword("CREATE"); err != nil {
 		return nil, err
