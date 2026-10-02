@@ -464,7 +464,7 @@ func (e *executor) runInsert(ctx context.Context, st *InsertStmt, params []Value
 	if err != nil {
 		return 0, err
 	}
-	if _, err := e.planReturning(ctx, st.Returning, []relation{{name: meta.Name, meta: meta}}, meta, false, nil); err != nil {
+	if _, err := e.planReturning(ctx, st.Returning, []relation{tableRel(meta, "")}, meta, false, nil); err != nil {
 		return 0, err
 	}
 	if st.Select != nil {
@@ -720,14 +720,14 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 		plan.meta, rels, jp = joined, jrels, plan2
 		types = joined.types()
 	} else {
-		meta, relName, err := e.fromRelation(ctx, sel)
+		rel, err := e.fromRelation(ctx, sel)
 		if err != nil {
 			return nil, err
 		}
-		if meta != nil {
-			plan.meta = meta
-			types = meta.types()
-			rels = []relation{{name: relName, meta: meta}}
+		if rel.meta != nil {
+			plan.meta = rel.meta
+			types = rel.meta.types()
+			rels = []relation{rel}
 		}
 	}
 	sc := e.pushScope(rels)
@@ -748,7 +748,7 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 			if plan.meta == nil {
 				return nil, errorf(adbc.StatusInvalidArgument, "SELECT %s requires a FROM clause", it.Text)
 			}
-			cols, err := starColumns(plan.meta, rels, jp != nil, it.StarOf)
+			cols, err := e.starColumns(plan.meta, rels, jp != nil, it.StarOf)
 			if err != nil {
 				return nil, err
 			}
@@ -924,10 +924,11 @@ func (e *executor) planSelect(ctx context.Context, sel *SelectStmt, paramTypes [
 	return plan, nil
 }
 
-// starColumns returns the columns `*` or `rel.*` expands to. In a join, a
-// qualified star picks one item's columns (named alias.column in the joined
-// relation); otherwise the qualifier must name the one FROM item.
-func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) ([]columnMeta, error) {
+// starColumns returns the columns `*` or `rel.*` expands to, where rels are
+// the innermost scope's. The qualifier of rel.* names an item as a column's
+// does (see names); in a join, the star is that item's columns (named
+// alias.column in the joined relation), otherwise the one FROM item's.
+func (e *executor) starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) ([]columnMeta, error) {
 	if len(qual) == 0 {
 		if meta.join != nil && meta.join.star != nil {
 			// NATURAL JOIN: merged columns first (see planNatural).
@@ -935,35 +936,42 @@ func starColumns(meta *tableMeta, rels []relation, joined bool, qual []string) (
 		}
 		return meta.Columns, nil
 	}
-	name := qual[len(qual)-1]
-	for _, r := range rels {
-		if !strings.EqualFold(r.name, name) {
-			continue
-		}
-		// schema.table.* (and catalog.schema.table.*) must match the table
-		// itself, not an alias.
-		if len(qual) >= 2 && (r.meta == nil || !strings.EqualFold(r.meta.Schema, qual[len(qual)-2]) ||
-			!strings.EqualFold(r.meta.Name, name)) {
-			continue
-		}
-		if len(qual) == 3 && !strings.EqualFold(qual[0], catalogName) {
-			continue
-		}
-		if !joined {
-			return meta.Columns, nil
-		}
-		var cols []columnMeta
-		for _, c := range meta.Columns {
-			if strings.HasPrefix(c.Name, r.prefix) {
-				cols = append(cols, c)
-			}
-		}
-		return cols, nil
+	if len(qual) > 3 {
+		return nil, errorf(adbc.StatusInvalidArgument, "improper qualified name (too many dotted names): %s.*", strings.Join(qual, "."))
 	}
-	if alias, ok := aliasOf(rels, name); ok && len(qual) == 1 {
-		return nil, errInvalidFromEntry(name, alias)
+	q := qualName{name: qual[len(qual)-1]}
+	if len(qual) >= 2 {
+		q.schema = qual[len(qual)-2]
 	}
-	return nil, errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", strings.Join(qual, "."))
+	if len(qual) == 3 {
+		q.catalog = qual[0]
+	}
+	if err := q.checkCatalog("*"); err != nil {
+		return nil, err
+	}
+	var match *relation
+	for i := range rels {
+		if !e.names(q, rels[i]) {
+			continue
+		}
+		if match != nil {
+			return nil, errorf(adbc.StatusInvalidArgument, "table reference %q is ambiguous", q.name)
+		}
+		match = &rels[i]
+	}
+	if match == nil {
+		return nil, e.missingFromEntry(q)
+	}
+	if !joined {
+		return meta.Columns, nil
+	}
+	var cols []columnMeta
+	for _, c := range meta.Columns {
+		if strings.HasPrefix(c.Name, match.prefix) {
+			cols = append(cols, c)
+		}
+	}
+	return cols, nil
 }
 
 // distinctAsGroupBy rewrites SELECT DISTINCT over plain expressions (no
@@ -1278,7 +1286,7 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 	}
 	need := map[string]bool{}
 	for _, s := range st.Sets {
-		needs, err := e.bindIn(ctx, s.Expr, meta, name)
+		needs, err := e.bindIn(ctx, s.Expr, meta, st.Alias)
 		if err != nil {
 			return 0, err
 		}
@@ -1290,11 +1298,11 @@ func (e *executor) runUpdate(ctx context.Context, st *UpdateStmt, params []Value
 		return 0, err
 	}
 	checks.need(need, "")
-	ret, err := e.planReturning(ctx, st.Returning, []relation{{name: name, meta: meta}}, meta, false, need)
+	ret, err := e.planReturning(ctx, st.Returning, []relation{tableRel(meta, st.Alias)}, meta, false, need)
 	if err != nil {
 		return 0, err
 	}
-	keys, rows, err := e.matchRows(ctx, meta, name, st.Where, params, need)
+	keys, rows, err := e.matchRows(ctx, meta, st.Alias, st.Where, params, need)
 	if err != nil {
 		return 0, err
 	}
@@ -1334,16 +1342,12 @@ func (e *executor) runDelete(ctx context.Context, st *DeleteStmt, params []Value
 	if err != nil {
 		return 0, err
 	}
-	name := st.Alias
-	if name == "" {
-		name = meta.Name
-	}
 	need := map[string]bool{}
-	ret, err := e.planReturning(ctx, st.Returning, []relation{{name: name, meta: meta}}, meta, false, need)
+	ret, err := e.planReturning(ctx, st.Returning, []relation{tableRel(meta, st.Alias)}, meta, false, need)
 	if err != nil {
 		return 0, err
 	}
-	keys, rows, err := e.matchRows(ctx, meta, name, st.Where, params, need)
+	keys, rows, err := e.matchRows(ctx, meta, st.Alias, st.Where, params, need)
 	if err != nil {
 		return 0, err
 	}

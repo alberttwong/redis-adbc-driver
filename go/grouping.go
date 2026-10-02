@@ -476,7 +476,7 @@ func (r *groupingRewriter) column(name string) string {
 	if r.rel != "" {
 		return r.rel + "." + name
 	}
-	return name
+	return keyLabel(name)
 }
 
 func (r *groupingRewriter) rewrite(e Expr) Expr {

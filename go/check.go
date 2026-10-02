@@ -250,10 +250,12 @@ func (e *executor) checkCheck(ctx context.Context, meta *tableMeta, x Expr) ([]s
 				err = errorf(adbc.StatusInvalidArgument, "grouping operations are not allowed in check constraints")
 			}
 		case *ColumnRef:
-			switch {
-			case v.Qualifier != "" && !strings.EqualFold(v.Qualifier, meta.Name):
-				err = errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", v.Qualifier)
-			case strings.EqualFold(v.Name, rowIDField):
+			if v.Qualifier != "" {
+				// The qualifier names the table as in a query on it: t.col,
+				// s.t.col or catalog.s.t.col (see resolveColumn).
+				err = e.bindCheck(ctx, meta, v)
+			}
+			if err == nil && strings.EqualFold(v.Name, rowIDField) {
 				err = errorf(adbc.StatusInvalidArgument, "system column %q reference in check constraint is invalid", rowIDField)
 			}
 		}
@@ -288,7 +290,7 @@ func (e *executor) bindCheck(ctx context.Context, meta *tableMeta, x Expr) error
 	scopes, sq := e.scopes, e.pendingSq
 	e.scopes, e.pendingSq = nil, nil
 	defer func() { e.scopes, e.pendingSq = scopes, sq }()
-	_, err := e.bindIn(ctx, x, meta, meta.Name)
+	_, err := e.bindIn(ctx, x, meta, "")
 	return err
 }
 
@@ -444,12 +446,12 @@ func (e *executor) validateChecks(ctx context.Context, stored, with *tableMeta, 
 		if err != nil || i < 0 {
 			return err
 		}
-		if _, rows, err := e.matchRows(ctx, stored, stored.Name, nil, nil, nil); err != nil || len(rows) == 0 {
+		if _, rows, err := e.matchRows(ctx, stored, "", nil, nil, nil); err != nil || len(rows) == 0 {
 			return err
 		}
 		return violation(i)
 	}
-	_, rows, err := e.matchRows(ctx, stored, stored.Name, nil, nil, need)
+	_, rows, err := e.matchRows(ctx, stored, "", nil, nil, need)
 	if err != nil {
 		return err
 	}

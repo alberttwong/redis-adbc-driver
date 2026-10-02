@@ -71,7 +71,7 @@ func (e *executor) planReturning(ctx context.Context, list []SelectItem, rels []
 	ret := &returning{env: e.newEnv(ctx, types, e.params)}
 	for _, it := range list {
 		if it.Star {
-			cols, err := starColumns(star, rels, joined, it.StarOf)
+			cols, err := e.starColumns(star, rels, joined, it.StarOf)
 			if err != nil {
 				return nil, err
 			}
@@ -256,7 +256,7 @@ func (e *executor) returningColumns(ctx context.Context, st Stmt) (cols []result
 		if err != nil {
 			return nil, false, err
 		}
-		ret, err = e.planReturning(ctx, st.Returning, []relation{{name: meta.Name, meta: meta}}, meta, false, nil)
+		ret, err = e.planReturning(ctx, st.Returning, []relation{tableRel(meta, "")}, meta, false, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -277,6 +277,9 @@ func (e *executor) returningColumns(ctx context.Context, st Stmt) (cols []result
 			return nil, false, err
 		}
 		defer pop()
+		if err := checkMergeNames(st); err != nil {
+			return nil, false, err
+		}
 		dj, err := e.planDMLJoin(ctx, st.Table, st.Alias, []JoinClause{st.Source}, "LEFT", st.On)
 		if err != nil {
 			return nil, false, err
@@ -313,10 +316,7 @@ func (e *executor) planTargetReturning(ctx context.Context, with []CTE, table Ta
 	if err != nil {
 		return nil, err
 	}
-	if alias == "" {
-		alias = meta.Name
-	}
-	return e.planReturning(ctx, list, []relation{{name: alias, meta: meta}}, meta, false, nil)
+	return e.planReturning(ctx, list, []relation{tableRel(meta, alias)}, meta, false, nil)
 }
 
 // checkMergeAction checks a call of merge_action() (whose arguments the
