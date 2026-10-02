@@ -227,6 +227,9 @@ A table exists for the driver only if its metadata key
 HASHes and indexes created some other way (for example your own
 `row:*` / `idx:rows` layout) won't appear as tables. To query existing data,
 load it through the driver; bulk ingest from Arrow is the quickest route.
+The driver doesn't touch such indexes, even one with the name a new table's
+index would take (see "Indexes the driver didn't create are left alone"
+below).
 
 **Limitation: Redis Flex databases are not supported yet**
 
@@ -773,6 +776,16 @@ build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table
     table's prefix to the next table of that name, and empties a table in
     place, so its `TRUNCATE … RESTART IDENTITY` can still lose rows that
     another connection is writing.
+- **Indexes the driver didn't create are left alone.** Before it creates a
+  table's index (`CREATE TABLE`, bulk ingest, `TRUNCATE`, a re-keying
+  rename), the driver drops an index that already has the new name with
+  `FT.DROPINDEX … DD`: one left over from a `CREATE` or `DROP` that was
+  interrupted. It now first checks with `FT.INFO` that the index is one:
+  a HASH index on just the new prefix, without a filter, with no
+  documents. Any other index of that name (an application's own
+  `idx:public:users` on `user:`, say) makes the driver take the next names
+  (`public:users~2:`, `idx:public:users~2`). Up to v0.0.10 it dropped that
+  index, and `DD` deleted every HASH the index covered.
 - **Missing values**: `ALTER TABLE … ADD COLUMN c … DEFAULT v` doesn't
   rewrite the existing rows. As with Postgres's "missing value", the
   column's metadata records `v` and the row id high-water mark (the

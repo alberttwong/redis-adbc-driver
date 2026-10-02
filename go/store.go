@@ -397,9 +397,13 @@ func (s *store) claimNames(ctx context.Context, schema, table string) (tableName
 			return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
 		}
 		gotP, _ := addP.Int64()
+		var foreign bool
+		var ferr error
 		if gotP == 1 && addI.Val() == 1 && (released == nil || !released.Val()) {
-			s.noteTempNames(nm)
-			return nm, nil
+			if foreign, ferr = s.foreignIndex(ctx, nm); ferr == nil && !foreign {
+				s.noteTempNames(nm)
+				return nm, nil
+			}
 		}
 		// Give back what this candidate got.
 		pipe = s.client.Pipeline()
@@ -413,6 +417,9 @@ func (s *store) claimNames(ctx context.Context, schema, table string) (tableName
 			if _, err := pipe.Exec(ctx); err != nil {
 				return tableNames{}, wrapRedis(err, "failed to reserve a key prefix")
 			}
+		}
+		if ferr != nil {
+			return tableNames{}, ferr
 		}
 	}
 	return tableNames{}, errorf(adbc.StatusInternal, "could not reserve a unique key prefix for %q", rowPrefix(schema, table))
@@ -443,7 +450,13 @@ func (s *store) freeNames(ctx context.Context, tx *goredis.Tx, schema, table str
 			return tableNames{}, err
 		}
 		if !usedP.Val() && !usedI.Val() && (released == nil || !released.Val()) {
-			return nm, nil
+			foreign, err := s.foreignIndex(ctx, nm)
+			if err != nil {
+				return tableNames{}, err
+			}
+			if !foreign {
+				return nm, nil
+			}
 		}
 	}
 	return tableNames{}, errorf(adbc.StatusInternal, "could not reserve a unique key prefix for %q", rowPrefix(schema, table))
@@ -457,6 +470,69 @@ func reserveNames(ctx context.Context, p goredis.Pipeliner, nm tableNames) {
 	if !nm.temp {
 		p.HSet(ctx, namesNextKey, nm.base, nm.n)
 	}
+}
+
+// foreignIndex reports whether a search index that isn't the driver's has
+// the index name of free names (names that no table has, see claimNames).
+// The callers drop an index of that name with its documents (FT.DROPINDEX
+// … DD), as a leftover of a CREATE or DROP that was interrupted after the
+// index was created or before it was dropped. Such a leftover is a HASH
+// index on just the names' prefix, without a filter, and has no documents:
+// no table ever wrote rows under a prefix that is free. Any other index of
+// that name was created by someone else, such as an application with its
+// own idx:<schema>:<table>, and DD would delete its HASHes. Its names are
+// then taken, and the caller tries the next ones.
+func (s *store) foreignIndex(ctx context.Context, nm tableNames) (bool, error) {
+	reply, err := s.searchDo(ctx, nm.index, "FT.INFO", nm.index).Result()
+	if err != nil {
+		if isUnknownIndex(err) {
+			return false, nil
+		}
+		return false, wrapRedis(err, "failed to check the search index "+nm.index)
+	}
+	info := indexInfoOf(reply)
+	leftover := info.keyType == "HASH" && len(info.prefixes) == 1 && info.prefixes[0] == nm.prefix &&
+		info.filter == "" && info.numDocs == 0
+	return !leftover, nil
+}
+
+// indexInfo is what FT.INFO says about an index's definition and size.
+type indexInfo struct {
+	keyType  string
+	prefixes []string
+	filter   string
+	numDocs  int64
+}
+
+// indexInfoOf reads an FT.INFO reply (RESP2: a flat list of names and
+// values).
+func indexInfoOf(reply any) indexInfo {
+	var info indexInfo
+	list, _ := reply.([]any)
+	for i := 0; i+1 < len(list); i += 2 {
+		k, _ := list[i].(string)
+		switch k {
+		case "index_definition":
+			def, _ := list[i+1].([]any)
+			for j := 0; j+1 < len(def); j += 2 {
+				dk, _ := def[j].(string)
+				switch dk {
+				case "key_type":
+					info.keyType = fmt.Sprint(def[j+1])
+				case "prefixes":
+					ps, _ := def[j+1].([]any)
+					for _, p := range ps {
+						info.prefixes = append(info.prefixes, fmt.Sprint(p))
+					}
+				case "filter":
+					info.filter = fmt.Sprint(def[j+1])
+				}
+			}
+		case "num_docs":
+			info.numDocs, _ = strconv.ParseInt(fmt.Sprint(list[i+1]), 10, 64)
+		}
+	}
+	return info
 }
 
 // ensureRegistry records the prefixes and indexes of tables created before
@@ -805,7 +881,8 @@ func (s *store) createTable(ctx context.Context, meta *tableMeta, ifNotExists bo
 	}
 
 	// The index name was free in the registry, so an index with that name is
-	// left over from an interrupted CREATE/DROP and can be discarded.
+	// left over from an interrupted CREATE/DROP and can be discarded
+	// (claimNames skips names whose index isn't one, see foreignIndex).
 	_ = s.searchDo(ctx, meta.index(), "FT.DROPINDEX", meta.index(), "DD").Err()
 
 	if err := s.searchDo(ctx, meta.index(), indexCreateArgs(meta)...).Err(); err != nil {
@@ -927,7 +1004,7 @@ func (s *store) truncateTables(ctx context.Context, metas []*tableMeta, restartI
 		next.KeyPrefix, next.IndexName = nm.prefix, nm.index
 		// The index name was free in the registry, so an index with that
 		// name is left over from an interrupted CREATE/DROP and can be
-		// discarded.
+		// discarded (see foreignIndex).
 		_ = s.searchDo(ctx, nm.index, "FT.DROPINDEX", nm.index, "DD").Err()
 		if err := s.searchDo(ctx, nm.index, indexCreateArgs(&next)...).Err(); err != nil {
 			release()

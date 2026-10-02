@@ -372,7 +372,8 @@ func (s *store) moveRows(ctx context.Context, job *rekeyJob, start *tableMeta, f
 		return err
 	}
 	// The index name was free in the registry, so an index with that name is
-	// left over from an interrupted CREATE/DROP and can be discarded.
+	// left over from an interrupted CREATE/DROP and can be discarded
+	// (freeNames skips names whose index isn't one, see foreignIndex).
 	_ = s.searchDo(ctx, job.IndexName, "FT.DROPINDEX", job.IndexName, "DD").Err()
 	if err := s.searchDo(ctx, job.IndexName, indexCreateArgs(&target)...).Err(); err != nil {
 		return wrapRedis(err, "failed to create the new search index")
