@@ -14,7 +14,7 @@
 
 package redis
 
-// Regression tests for https://github.com/alberttwong/redis-adbc-driver/issues/13:
+// Regression tests for https://github.com/alberttwong/redis-adbc-driver-arrow-ipc/issues/13:
 // bound string parameters must not be read after the bound Arrow data is
 // released. Parameter data is built with an allocator that overwrites
 // buffers when they are freed, so a value that still points into a released
