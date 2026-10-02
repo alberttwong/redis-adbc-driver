@@ -19,6 +19,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -42,6 +43,9 @@ type statementImpl struct {
 	indexColumns map[string]bool
 	// aggPushdown overrides the connection's aggregate pushdown mode.
 	aggPushdown string
+	// stream is adbc.redis.stream_results and stream_batch_rows, from the
+	// connection unless set here.
+	stream streamSettings
 
 	// Bound parameters (or ingest data).
 	params array.RecordReader
@@ -64,8 +68,27 @@ func (s *statementImpl) GetOption(ctx context.Context, key string) (string, erro
 		return strings.Join(names, ","), nil
 	case OptionStringAggregatePushdown:
 		return s.executor().pushdown, nil
+	case OptionStringStreamResults, OptionIntStreamBatchRows:
+		return s.stream.get(key), nil
 	}
 	return s.StatementImplBase.GetOption(ctx, key)
+}
+
+func (s *statementImpl) GetOptionInt(ctx context.Context, key string) (int64, error) {
+	if key == OptionIntStreamBatchRows {
+		return int64(s.stream.rows()), nil
+	}
+	return s.StatementImplBase.GetOptionInt(ctx, key)
+}
+
+func (s *statementImpl) SetOptionInt(ctx context.Context, key string, value int64) error {
+	if key == OptionIntStreamBatchRows {
+		if err := s.checkOpen(); err != nil {
+			return err
+		}
+		return s.stream.set(key, strconv.FormatInt(value, 10))
+	}
+	return s.StatementImplBase.SetOptionInt(ctx, key, value)
 }
 
 func (s *statementImpl) executor() *executor {
@@ -124,6 +147,8 @@ func (s *statementImpl) SetOption(ctx context.Context, key, val string) error {
 		}
 		s.aggPushdown = val
 		return nil
+	case OptionStringStreamResults, OptionIntStreamBatchRows:
+		return s.stream.set(key, val)
 	}
 	handled, err := s.ingest.SetOption(&s.ErrorHelper, key, val)
 	if err != nil {
@@ -272,7 +297,9 @@ func (s *statementImpl) paramRows() ([][]Value, []ColType, error) {
 }
 
 // run executes every statement of the script, once per bound parameter row.
-func (s *statementImpl) run(ctx context.Context) (execResult, error) {
+// With stream set, the result of a query may be a stream (see stream.go):
+// that of a single statement run at most once.
+func (s *statementImpl) run(ctx context.Context, stream bool) (execResult, error) {
 	parsed, err := s.parse()
 	if err != nil {
 		return execResult{}, err
@@ -286,13 +313,17 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 	// in Postgres; what it set ends with it unless a BEGIN is open.
 	exec.script = len(parsed) > 1
 	defer exec.sess.endScript()
+	var so *streamOpts
+	if stream && !s.stream.off && len(parsed) == 1 && len(paramRows) <= 1 {
+		so = &streamOpts{batchRows: s.stream.rows(), mem: s.conn.Alloc, conn: s.conn}
+	}
 	var last execResult
 	for _, ps := range parsed {
 		if paramRows == nil {
 			if ps.NumParams > 0 {
 				return execResult{}, errorf(adbc.StatusInvalidState, "query has %d parameter(s) but none are bound", ps.NumParams)
 			}
-			last, err = exec.execute(ctx, ps, nil, nil)
+			last, err = exec.execute(ctx, ps, nil, nil, so)
 			if err != nil {
 				return execResult{}, err
 			}
@@ -316,11 +347,17 @@ func (s *statementImpl) run(ctx context.Context) (execResult, error) {
 			}
 			combined.isQuery = true
 			combined.cols = cols
+			if so != nil {
+				so.cols = cols
+			}
 		}
 		for _, row := range paramRows {
-			res, err := exec.execute(ctx, ps, row, paramTypes)
+			res, err := exec.execute(ctx, ps, row, paramTypes, so)
 			if err != nil {
 				return execResult{}, err
+			}
+			if res.stream != nil {
+				return res, nil // the only row
 			}
 			if res.isQuery {
 				combined.rows = append(combined.rows, res.rows...)
@@ -348,9 +385,12 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 		rdr, err := recordsReader(s.conn.Alloc, nil, nil)
 		return rdr, n, err
 	}
-	res, err := s.run(ctx)
+	res, err := s.run(ctx, true)
 	if err != nil {
 		return nil, -1, err
+	}
+	if res.stream != nil {
+		return res.stream, -1, nil
 	}
 	if !res.isQuery {
 		rdr, err := recordsReader(s.conn.Alloc, nil, nil)
@@ -370,7 +410,7 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 	if s.ingest.TableName != "" {
 		return s.executeIngest(ctx)
 	}
-	res, err := s.run(ctx)
+	res, err := s.run(ctx, false)
 	if err != nil {
 		return -1, err
 	}

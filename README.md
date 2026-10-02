@@ -593,8 +593,10 @@ build/redis-arrow export "SELECT * FROM sales" | build/redis-arrow import -table
   still run, but `export` then fails and writes nothing. A failed export
   leaves no partial file: it writes a temporary file next to the target and
   renames it at the end.
-- **Memory:** the driver builds a query's whole result before it returns
-  the first batch, so exporting a large table needs memory for all of it.
+- **Memory:** a query that [streams](#streamed-results), such as
+  `SELECT * FROM t` or one that filters and sorts in the index, is exported
+  batch by batch. Others are built whole before the first batch is
+  written, so exporting a large result needs memory for all of it.
   Import reads a stream batch by batch, but reads a file on stdin into
   memory first, since the file format's footer is at its end.
 
@@ -978,7 +980,7 @@ How SQL is executed:
 |-|-|
 | `WHERE __rowid = N` | Direct `HMGET` of the row HASH, index bypassed |
 | Queries that can't return rows: `WHERE false`, `LIMIT 0`, … | Their rows aren't read. A query with `LIMIT 0` (or `FETCH FIRST 0 ROWS ONLY`, or a `HAVING` or `QUALIFY` that is never true) returns without a command. One whose `WHERE` is never true doesn't read its FROM items, and the rest of it runs over no rows: `COUNT(*)` without `GROUP BY` still returns one row, 0. A condition is never true when it is FALSE or NULL whatever the rows hold: its parts that read no column, parameter or subquery are evaluated once, and `AND` is never true if one side is, `OR` if both are (`false`, `1 = 0`, `NULL`, `x > 0 AND false`, `NOT true`, …). This applies at every level (derived tables, CTEs, views, join items, `UNION` branches, subqueries) and to `INSERT … SELECT`, `UPDATE`, `DELETE`, `MERGE` and `CREATE TABLE … AS`. The derived tables, CTEs and views such a query reads are planned but not run, so its columns and their types are those of the full query, and unknown tables, columns and functions and wrong argument counts are still errors; `ExecuteSchema` and `CREATE VIEW` plan their query the same way. This is how dbt asks for a query's columns (`select * from (…) as __dbt_sbq where false limit 0`, for model contracts, snapshots and unit tests), and what `dbt run --empty` reads (`(select * from t where false limit 0)`) |
-| Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables) |
+| Filter / sort / limit | `FT.AGGREGATE <idx> "<pushed-down query>" [SORTBY …] [LIMIT …] LOAD … WITHCURSOR COUNT 10000`: the rows come back in the cursor pages, up to 10,000 at a time (fewer for wide tables), and are [streamed](#streamed-results) as the result is read |
 | `COUNT(*)`, `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX`, `BOOL_OR/BOOL_AND/EVERY` of a boolean column | `FT.AGGREGATE … APPLY exists(@c) … GROUPBY … REDUCE …` over SORTABLE fields, HASHes never opened (`BOOL_OR` / `BOOL_AND` are `MAX` / `MIN` of the stored 0 and 1). On a cluster, a shard whose rows of a group all lack the value sends NaN as its partial `SUM`, which made the group's `SUM` and `AVG` NaN up to v0.0.7 (`AVG` of an integer column also in the default mode). So when a `SUM` comes back NaN for a group that has values, the driver runs the command again with `case(exists(@c), @c, 0)` in place of `@c` (about 2.5 times as long; a real NaN, from adding +Infinity and -Infinity, stays NaN), and a server without `case()` aggregates the query in the driver. An amd64 server writes that NaN `-nan`, which up to v0.0.9 the driver didn't read, so it aggregated such queries itself |
 | Other aggregates (`STRING_AGG`, `STDDEV`, percentiles, `ANY_VALUE`, …), `DISTINCT` and `FILTER (WHERE …)` | Reduced by the driver over the rows fetched from the HASHes (the index still filters them). An aggregate's `FILTER` is evaluated before its arguments, so `SUM(1 / x) FILTER (WHERE x <> 0)` never divides by zero. Ordered-set aggregates keep each group's values and sort them once |
 | `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | Each grouping set runs as its own grouped query: an `FT.AGGREGATE … GROUPBY` when a plain `GROUP BY` of its columns would be one, otherwise in the driver, where the sets share one read of the rows. The driver combines the groups of all sets (`UNION ALL`, NULL for the columns a set doesn't group), then applies HAVING, window functions, QUALIFY, DISTINCT, ORDER BY and LIMIT to the combined rows |
@@ -1000,6 +1002,47 @@ How SQL is executed:
 | Joins | Each table's own WHERE/ON filters run in its index (except on the NULL-supplying side of an outer join). Inner joins are reordered to start from the table with the fewest matches (counted by the index). Equality conditions drive a hash join; when the next table's key is indexed and there are ≤ 1,000 distinct keys, only matching rows are fetched with an index union. The joined rows are then grouped/sorted in memory. `NATURAL JOIN` is an equality join on the common columns, like `USING`. An item whose `ON` can never be true (`ON false`), or that has no rows, isn't read when that settles the result: an inner join is then empty and reads no item, a `LEFT JOIN` keeps the left rows with NULLs for the item, and a `RIGHT JOIN` returns the item's rows without reading the items before it |
 | `UPDATE … FROM`, `DELETE … USING`, `MERGE` | The target is joined with the other items as above: its own filters (in WHERE, or in MERGE's ON) run in its index, and an equality on an indexed target column is an index lookup join, also through a no-op cast like dbt's `s.id::text = t.id::text`. `MERGE` is source `LEFT JOIN` target, or `FULL JOIN` with `WHEN NOT MATCHED BY SOURCE` clauses (which need every target row); `ON FALSE` reads the target only for those. Changes are then written by row key with pipelined `HSET`/`HDEL`/`DEL`, and new rows like `INSERT` does |
 | Anything the index can't answer exactly | Evaluated by the driver on rows fetched from the HASHes |
+
+### Streamed results
+
+A query that reads one table through its index, row by row, is **streamed**:
+its rows are read from the `FT.AGGREGATE` cursor a page at a time as the
+result is read, so the driver holds about one batch of them, whatever the
+table's size. Other results are built whole before `ExecuteQuery` returns.
+
+- **What streams:**
+  - a single `SELECT` (not a script), run without parameters or with one
+    row of them;
+  - on a table, not a view, CTE, derived table or join;
+  - matched through the index, rather than by row id (`WHERE __rowid = N`);
+  - without aggregates, `GROUP BY`, `DISTINCT`, set operations, window
+    functions or correlated subqueries;
+  - in insertion order, or ordered by indexed columns the index sorts
+    exactly. An `ORDER BY` the driver sorts itself (an expression,
+    `NULLS FIRST`, …) reads the rows whole.
+
+  `LIMIT` and `OFFSET` that can't run in the index (because the driver
+  re-checks part of the WHERE clause) are applied as the rows stream, and
+  the cursor is deleted once the limit is reached.
+- **Row count.** `ExecuteQuery` reads the first batch before it returns, so
+  a result that fits in it is returned whole, with its row count, as
+  before. A longer one is a stream, whose row count is -1.
+- **Errors.** One in the first batch comes from `ExecuteQuery`. A later one
+  (division by zero on row 100,000, say) ends the stream: `Next` returns
+  false, and `Err` reports it.
+- **Cursors.** A stream keeps its `FT.AGGREGATE` cursor open until it is
+  read to the end, released, or its connection is closed (reading it then
+  fails). Cancelling the context passed to `ExecuteQuery` (in Go) also
+  deletes it. Redis limits cursors:
+  - It deletes one that isn't read for `search-cursor-max-idle` (300
+    seconds by default). Reading the stream then fails, with a message
+    naming `adbc.redis.stream_results`.
+  - An index has at most `search-index-cursor-limit` open cursors (128 by
+    default), across every client. A query on a table with that many open
+    streams fails until one ends.
+- **Options.** `adbc.redis.stream_results=false` (database or statement)
+  turns streaming off. `adbc.redis.stream_batch_rows` sets the rows per
+  batch (65,536 by default).
 
 Pushed down into the index: numeric range/equality predicates on indexed
 columns (`@c:[lo hi]`), string equality on indexed columns (`@c:{value}`,
@@ -2564,6 +2607,8 @@ clients can see a partly applied statement.
 | `adbc.redis.read_timeout` | database, connection | How long the client waits for each reply: `30s`, `10m`, … or a number of seconds; `0` for no timeout. Default `5m`, or the URI's `read_timeout` (see **Timeouts** under [Server requirements](#server-requirements)). The connection option overrides the database's |
 | `adbc.redis.write_timeout` | database, connection | How long the client waits to send each command, in the same format. Default: the read timeout, or the URI's `write_timeout` |
 | `adbc.redis.ingest.index_columns` | statement | Comma-separated columns to index on bulk ingest (`*` = all indexable) |
+| `adbc.redis.stream_results` | database, statement | `true` (default): [stream](#streamed-results) the results of queries that can be. `false`: build every result whole before `ExecuteQuery` returns. The statement option overrides the database's |
+| `adbc.redis.stream_batch_rows` | database, statement | Rows per record batch of a streamed result (default 65,536). A result that fits in the first batch is returned whole. Also an integer option on the statement |
 | `adbc.redis.time_zone` | database, connection | The session time zone, with the values `SET TIME ZONE` takes (default `UTC`; see Session time zone), and what `RESET timezone` and `SET TIME ZONE DEFAULT` go back to. The connection option overrides the database's and replaces a `SET`'s value; reading it gives the current value, as `SHOW timezone` does |
 
 Scale tips: keep column names short (they are repeated in every HASH), raise

@@ -39,6 +39,10 @@ type connectionImpl struct {
 	// rekey is adbc.redis.rename_rekey (from the database unless set on the
 	// connection).
 	rekey bool
+	// stream is adbc.redis.stream_results and stream_batch_rows, from the
+	// database; streams are the results being streamed (see stream.go).
+	stream  streamSettings
+	streams streams
 
 	// clientOpts are the go-redis options the client was made from, and
 	// timeouts its timeouts (see timeout.go). writeFollows is set while
@@ -132,6 +136,8 @@ func (c *connectionImpl) setTimeouts(ctx context.Context, t timeouts) error {
 }
 
 func (c *connectionImpl) Close(ctx context.Context) error {
+	// Before the client goes: closing a stream deletes its cursor.
+	c.closeStreams()
 	if c.store != nil && c.store.client != nil {
 		// Best effort: whatever can't be dropped now is swept by a later
 		// connection (see temp.go).
@@ -177,6 +183,7 @@ func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithCo
 		StatementImplBase: driverbase.NewStatementImplBase(&c.ConnectionImplBase, c.ErrorHelper),
 		conn:              c,
 		ingest:            driverbase.NewBulkIngestOptions(),
+		stream:            c.stream,
 	}
 	return driverbase.NewStatement(st), nil
 }

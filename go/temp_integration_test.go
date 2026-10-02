@@ -563,7 +563,7 @@ func TestSQLTempSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 		ex := &executor{store: gone, schema: defaultSchema, pushdown: "exact"}
-		if _, err := ex.execute(h.ctx, parsed[0], nil, nil); err != nil {
+		if _, err := ex.execute(h.ctx, parsed[0], nil, nil, nil); err != nil {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}

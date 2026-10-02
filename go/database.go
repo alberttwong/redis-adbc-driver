@@ -36,6 +36,8 @@ type databaseImpl struct {
 	pushdown string
 	cluster  string
 	rekey    bool
+	// stream is adbc.redis.stream_results and adbc.redis.stream_batch_rows.
+	stream streamSettings
 	// timeouts are adbc.redis.read_timeout and write_timeout (see
 	// timeout.go).
 	timeouts timeoutSettings
@@ -120,6 +122,7 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		sess:               d.newSession(),
 		pushdown:           d.pushdown,
 		rekey:              d.rekey,
+		stream:             d.stream,
 		clientOpts:         opts,
 		timeouts:           t,
 		writeFollows:       writeFollows,
@@ -206,6 +209,8 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.cluster, nil
 	case OptionStringRenameRekey:
 		return strconv.FormatBool(d.rekey), nil
+	case OptionStringStreamResults, OptionIntStreamBatchRows:
+		return d.stream.get(key), nil
 	case OptionStringReadTimeout, OptionStringWriteTimeout:
 		// The timeout a connection opened now gets.
 		opts, err := d.clientOptions()
@@ -268,6 +273,8 @@ func (d *databaseImpl) SetOption(ctx context.Context, key, value string) error {
 			return err
 		}
 		d.rekey = rekey
+	case OptionStringStreamResults, OptionIntStreamBatchRows:
+		return d.stream.set(key, value)
 	case OptionStringReadTimeout, OptionStringWriteTimeout:
 		t, err := parseTimeout(key, value)
 		if err != nil {

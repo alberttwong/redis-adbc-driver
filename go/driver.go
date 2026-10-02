@@ -26,6 +26,7 @@ package redis
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -88,6 +89,17 @@ const (
 	// SHOW timezone does.
 	OptionStringTimeZone = "adbc.redis.time_zone"
 
+	// OptionStringStreamResults (database or statement) controls whether a
+	// query's rows are read from Redis as the result is read: "true" (the
+	// default) streams the queries that can be (see stream.go), so their
+	// rows aren't all held in memory; "false" reads every result whole
+	// before ExecuteQuery returns.
+	OptionStringStreamResults = "adbc.redis.stream_results"
+	// OptionIntStreamBatchRows (database or statement) is the number of
+	// rows in each record batch of a streamed result (default 65536). A
+	// result that fits in the first batch is returned whole.
+	OptionIntStreamBatchRows = "adbc.redis.stream_batch_rows"
+
 	PushdownExact = "exact"
 	PushdownAll   = "all"
 	PushdownNone  = "none"
@@ -123,6 +135,24 @@ func validatePushdown(v string) error {
 		return nil
 	}
 	return errorf(adbc.StatusInvalidArgument, "invalid %s %q (want exact, all or none)", OptionStringAggregatePushdown, v)
+}
+
+func parseStreamResults(v string) (bool, error) {
+	switch v {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, errorf(adbc.StatusInvalidArgument, "invalid %s %q (want true or false)", OptionStringStreamResults, v)
+}
+
+func parseStreamBatchRows(v string) (int, error) {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, errorf(adbc.StatusInvalidArgument, "invalid %s %q (want a positive number of rows)", OptionIntStreamBatchRows, v)
+	}
+	return n, nil
 }
 
 func parseRenameRekey(v string) (bool, error) {
