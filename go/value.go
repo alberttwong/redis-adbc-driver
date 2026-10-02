@@ -1010,8 +1010,9 @@ func encodeStored(v Value) string {
 	}
 }
 
-// decodeStored parses a string loaded from a row HASH. A float's nanStored
-// is NaN, and so is the "NaN" of earlier versions.
+// decodeStored parses a string loaded from a row HASH, or a value RediSearch
+// computed. A float's nanStored is NaN, and so are the "NaN" of earlier
+// versions and RediSearch's -nan (see parseFloat).
 func decodeStored(s string, t ColType) (Value, error) {
 	if s == nanStored && t.Kind.isFloat() {
 		return floatValue(t, math.NaN()), nil
@@ -1029,13 +1030,13 @@ func decodeStored(s string, t ColType) (Value, error) {
 		}
 		return intValue(t, i), nil
 	case KindFloat32:
-		f, err := strconv.ParseFloat(s, 32)
+		f, err := parseFloat(s, 32)
 		if err != nil {
 			return Value{}, fmt.Errorf("corrupt float value %q", s)
 		}
 		return floatValue(t, f), nil
 	case KindFloat64:
-		f, err := strconv.ParseFloat(s, 64)
+		f, err := parseFloat(s, 64)
 		if err != nil {
 			return Value{}, fmt.Errorf("corrupt double value %q", s)
 		}

@@ -999,7 +999,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 				continue
 			}
 			nn, _ := strconv.ParseFloat(r[nonNull[argCol[i].Name]+"_n"], 64)
-			if v, err := strconv.ParseFloat(r[fmt.Sprintf("__a%d", i)], 64); nn > 0 && err == nil && math.IsNaN(v) {
+			if v, err := parseFloat(r[fmt.Sprintf("__a%d", i)], 64); nn > 0 && err == nil && math.IsNaN(v) {
 				lost = true
 			}
 		}
@@ -1075,7 +1075,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 					g.results[f] = v
 				}
 			case "AVG":
-				sum, err := strconv.ParseFloat(s, 64)
+				sum, err := parseFloat(s, 64)
 				if err != nil {
 					return nil, false, nil
 				}
