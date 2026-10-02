@@ -201,8 +201,29 @@ func (s *statementImpl) BindStream(ctx context.Context, stream array.RecordReade
 	return nil
 }
 
+// GetParameterSchema describes the statement's parameters, in order: $1,
+// $2, … and ? numbered as they appear. A parameter's type is the one it is
+// used as (see params.go), or NULL if it can't be told; names are empty.
 func (s *statementImpl) GetParameterSchema(ctx context.Context) (*arrow.Schema, error) {
-	return nil, errorf(adbc.StatusNotImplemented, "GetParameterSchema is not supported")
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	if s.ingest.TableName != "" {
+		return nil, errorf(adbc.StatusInvalidState, "a bulk ingest has no parameters")
+	}
+	parsed, err := s.parse()
+	if err != nil {
+		return nil, err
+	}
+	types, err := s.executor().parameterTypes(ctx, parsed)
+	if err != nil {
+		return nil, err
+	}
+	fields := make([]arrow.Field, len(types))
+	for i, t := range types {
+		fields[i] = arrow.Field{Type: t.ArrowType(), Nullable: true}
+	}
+	return arrow.NewSchema(fields, nil), nil
 }
 
 func (s *statementImpl) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.Partitions, int64, error) {
