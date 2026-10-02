@@ -835,7 +835,7 @@ func (gp *groupingPlan) indexable(e *executor, wp wherePlan, set []int) bool {
 	}
 	for _, i := range set {
 		col, ok := indexed(gp.slots[i].expr)
-		if !ok || !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
+		if !ok || !(col.Type.Kind == KindString || col.pushable(e.pushdown)) {
 			return false
 		}
 	}
@@ -854,7 +854,7 @@ func (gp *groupingPlan) indexable(e *executor, wp wherePlan, set []int) bool {
 			return false
 		}
 		col, ok := indexed(f.Args[0])
-		if !ok || col.Name == rowIDField || (f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown)) {
+		if !ok || col.Name == rowIDField || (f.Name != "COUNT" && !col.pushable(e.pushdown)) {
 			return false
 		}
 	}

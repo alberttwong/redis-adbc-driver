@@ -27,7 +27,9 @@ package redis
 //
 // A column added by ADD COLUMN … DEFAULT is the exception: rows that existed
 // then read the default without a field (see "Missing values" in
-// defaults.go).
+// defaults.go). Values are stored as text (encodeStored); a float NaN is
+// "infinity", which the index reads as +Infinity, because RediSearch
+// doesn't index a HASH whose NUMERIC field is "NaN" (see nan.go).
 //
 // Secondary index: a RediSearch index over the row prefix that only covers the
 // columns used for filtering, sorting and aggregation. Numeric-like columns
@@ -124,6 +126,10 @@ type columnMeta struct {
 	// of tables created before it was recorded are checked once.
 	TagValues   string `json:"tag_values,omitempty"`
 	TagsChecked bool   `json:"tags_checked,omitempty"`
+	// NaNs says an indexed float column may hold a NaN, which the index
+	// holds as +Infinity (see nan.go). It is set before one is written and
+	// never cleared.
+	NaNs bool `json:"nans,omitempty"`
 	// Comment is the column's COMMENT ON text (see comment.go).
 	Comment string `json:"comment,omitempty"`
 	// label is the name a result column takes from the column when it
@@ -1319,7 +1325,7 @@ var testHookRowsWritten func(meta *tableMeta, written int)
 // table still has its keys (checkKeys): if it was dropped or its rows moved
 // meanwhile, the statement stops, deletes the rows it wrote, and fails.
 func (s *store) writeRows(ctx context.Context, meta *tableMeta, a rowAlloc, rows [][]Value) (int64, error) {
-	if err := s.raiseTagLevels(ctx, meta, rowTagLevels(meta, rows)); err != nil {
+	if err := s.raiseNeeds(ctx, meta, rowNeeds(meta, rows)); err != nil {
 		return 0, err
 	}
 	if len(rows) == 0 {
