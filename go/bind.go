@@ -39,7 +39,12 @@ import (
 
 type relation struct {
 	name string // alias, table or CTE name
-	meta *tableMeta
+	// aliased is set when name is an alias. schema is the schema of a table
+	// or view, "" for other items: without an alias, schema.name names the
+	// item too.
+	aliased bool
+	schema  string
+	meta    *tableMeta
 	// prefix is prepended to resolved column names ("alias." in joins).
 	prefix string
 	// hidden are columns merged by a NATURAL JOIN: only a qualified
@@ -123,13 +128,21 @@ func (e *executor) pushScope(rels []relation) *scope {
 
 func (e *executor) popScope() { e.scopes = e.scopes[:len(e.scopes)-1] }
 
-// bindIn binds an expression in a new scope over one relation (meta may be
-// nil for expressions without a FROM). It returns the columns of that
-// relation read by correlated subqueries.
-func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, name string) (map[string]bool, error) {
+// tableRel is the relation of a table read under alias ("" for none).
+func tableRel(meta *tableMeta, alias string) relation {
+	if alias == "" {
+		return relation{name: meta.Name, schema: meta.Schema, meta: meta}
+	}
+	return relation{name: alias, aliased: true, schema: meta.Schema, meta: meta}
+}
+
+// bindIn binds an expression in a new scope over one table read under alias
+// ("" for none); meta may be nil for expressions without a FROM. It returns
+// the columns of that table read by correlated subqueries.
+func (e *executor) bindIn(ctx context.Context, expr Expr, meta *tableMeta, alias string) (map[string]bool, error) {
 	var rels []relation
 	if meta != nil {
-		rels = []relation{{name: name, meta: meta}}
+		rels = []relation{tableRel(meta, alias)}
 	}
 	sc := e.pushScope(rels)
 	defer e.popScope()
@@ -225,15 +238,20 @@ func (e *executor) scopeTypes() map[string]ColType {
 
 // resolveColumn resolves a column reference as Postgres does. An unqualified
 // column is one of the innermost scope that has it. A qualified one, t.col,
-// is a column of the item visible as t in the innermost scope that has one;
-// if that item has no such column, it is an error, even if an outer t has
-// one. An item with an alias is visible only by its alias: in a subquery
-// `SELECT … FROM t x`, t.col is an enclosing query's column (#102).
+// is a column of the item named t (see names) in the innermost scope that
+// has one; if that item has no such column, it is an error, even if an
+// outer t has one. An item with an alias is visible only by its alias: in a
+// subquery `SELECT … FROM t x`, t.col is an enclosing query's column (#102).
+// s.t.col names only a table or view t of schema s without an alias (#111).
 func (e *executor) resolveColumn(c *ColumnRef) error {
 	if c.written == "" {
 		c.written = c.Name
 	}
 	c.Name = c.written
+	q := c.qual()
+	if err := q.checkCatalog(c.written); err != nil {
+		return err
+	}
 	top := len(e.scopes) - 1
 	for depth := 0; depth <= top; depth++ {
 		sc := e.scopes[top-depth]
@@ -242,11 +260,13 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 		found, named := 0, 0
 		for _, rel := range sc.rels {
 			if c.Qualifier != "" {
-				// rel.name is the item's alias, or its name if it has none.
-				if !strings.EqualFold(c.Qualifier, rel.name) {
+				if !e.names(q, rel) {
 					continue
 				}
-				named++
+				if named++; named > 1 {
+					// Two tables t of different schemas.
+					return errorf(adbc.StatusInvalidArgument, "table reference %q is ambiguous", c.Qualifier)
+				}
 			}
 			col, ok := rel.meta.column(c.Name)
 			if !ok || (rel.prefix != "" && col.Name == rowIDField) || (c.Qualifier == "" && rel.hidden[col.Name]) {
@@ -289,12 +309,75 @@ func (e *executor) resolveColumn(c *ColumnRef) error {
 		}
 	}
 	if c.Qualifier != "" {
-		return e.missingFromEntry(c.Qualifier)
+		return e.missingFromEntry(q)
 	}
 	if top < 0 {
 		return noSuchColumn(c, nil)
 	}
 	return noSuchColumn(c, e.scopes[top])
+}
+
+// qualName is the qualifier of a column reference or of rel.*: a FROM
+// item's name, optionally with a schema and catalog. item is set for the
+// planner's references (see ColumnRef.item).
+type qualName struct{ catalog, schema, name, item string }
+
+func (c *ColumnRef) qual() qualName {
+	return qualName{catalog: c.Catalog, schema: c.Schema, name: c.Qualifier, item: c.item}
+}
+
+// String returns the qualifier as written.
+func (q qualName) String() string {
+	var parts []string
+	for _, p := range []string{q.catalog, q.schema, q.name} {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+// checkCatalog is Postgres's error for a qualifier naming another catalog;
+// last is the rest of the reference (its column, or "*").
+func (q qualName) checkCatalog(last string) error {
+	if q.catalog == "" || strings.EqualFold(q.catalog, catalogName) {
+		return nil
+	}
+	return errorf(adbc.StatusNotImplemented, "cross-database references are not implemented: %s.%s", q, last)
+}
+
+// names reports whether a qualifier names rel, as Postgres's
+// refnameNamespaceItem matches it: t names the item visible as t (by its
+// alias if it has one), and s.t only a table or view t of schema s that has
+// no alias.
+func (e *executor) names(q qualName, rel relation) bool {
+	if q.item != "" {
+		return rel.prefix == q.item
+	}
+	if !strings.EqualFold(rel.name, q.name) {
+		return false
+	}
+	return q.schema == "" || (!rel.aliased && e.inSchema(rel, q.schema))
+}
+
+// inSchema reports whether rel is a table or view of schema, where pg_temp
+// is the connection's temporary schema. Unlike resolveTable, it doesn't mark
+// the statement as using a temporary object: only a FROM item does that.
+func (e *executor) inSchema(rel relation, schema string) bool {
+	if isTempAlias(schema) {
+		schema = e.store.tempSchema()
+	}
+	return rel.schema != "" && strings.EqualFold(rel.schema, schema)
+}
+
+// readsTable reports whether rel is the table or view q names, under any
+// alias. Without a schema, that is any table, view or CTE of that name
+// (Postgres: the table the search path finds, or the CTE).
+func (e *executor) readsTable(q qualName, rel relation) bool {
+	if rel.meta == nil || !strings.EqualFold(rel.meta.Name, q.name) {
+		return false
+	}
+	return q.schema == "" || e.inSchema(rel, q.schema)
 }
 
 // noSuchColumn is the error for a column that the scope sc (nil for none)
@@ -310,35 +393,50 @@ func noSuchColumn(c *ColumnRef, sc *scope) error {
 	return errorf(adbc.StatusInvalidArgument, "column %q does not exist", name)
 }
 
-// missingFromEntry is Postgres's error for a qualifier that names no FROM
-// item visible at any level. When it is the name of a table, view or CTE
-// that a level reads under an alias, the message names the innermost such
-// alias, as Postgres's hint does.
-func (e *executor) missingFromEntry(name string) error {
+// missingFromEntry is Postgres's error (errorMissingRTE) for a qualifier
+// that names no FROM item visible here. If an item of some level, innermost
+// first, reads the table it names or has its name, the reference is
+// invalid: Postgres's hint names the item's alias when it is the table
+// under an alias that is visible here, and otherwise its detail says the
+// item can't be referenced from here (as for s2.t where s1.t is read).
+// Else the entry is missing.
+func (e *executor) missingFromEntry(q qualName) error {
 	for i := len(e.scopes) - 1; i >= 0; i-- {
-		if alias, ok := aliasOf(e.scopes[i].rels, name); ok {
-			return errInvalidFromEntry(name, alias)
+		for j, rel := range e.scopes[i].rels {
+			if rel.name == "" || !(strings.EqualFold(rel.name, q.name) || e.readsTable(q, rel)) {
+				continue
+			}
+			if rel.aliased && !strings.EqualFold(rel.name, q.name) && e.visibleAt(i, j) {
+				return errorf(adbc.StatusInvalidArgument,
+					"invalid reference to FROM-clause entry for table %q; perhaps you meant to reference the table alias %q", q.name, rel.name)
+			}
+			return errorf(adbc.StatusInvalidArgument,
+				"invalid reference to FROM-clause entry for table %q; there is an entry for table %q, but it cannot be referenced from this part of the query",
+				q.name, rel.name)
 		}
 	}
-	return errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", name)
+	return errorf(adbc.StatusInvalidArgument, "missing FROM-clause entry for table %q", q.name)
 }
 
-// aliasOf returns the alias under which one of rels reads the table, view
-// or CTE name.
-func aliasOf(rels []relation, name string) (string, bool) {
-	for _, rel := range rels {
-		if rel.name != "" && rel.meta != nil && !strings.EqualFold(rel.name, name) && strings.EqualFold(rel.meta.Name, name) {
-			return rel.name, true
+// visibleAt reports whether item j of scope i is the one its name refers to
+// from the innermost scope.
+func (e *executor) visibleAt(i, j int) bool {
+	name := e.scopes[i].rels[j].name
+	for k := len(e.scopes) - 1; k >= 0; k-- {
+		hit := -1
+		for n, rel := range e.scopes[k].rels {
+			if strings.EqualFold(rel.name, name) {
+				if hit >= 0 {
+					return false // ambiguous
+				}
+				hit = n
+			}
+		}
+		if hit >= 0 {
+			return k == i && hit == j
 		}
 	}
-	return "", false
-}
-
-// errInvalidFromEntry is Postgres's error (with its hint) for a table
-// referred to by its name where only its alias is visible.
-func errInvalidFromEntry(name, alias string) error {
-	return errorf(adbc.StatusInvalidArgument,
-		"invalid reference to FROM-clause entry for table %q; perhaps you meant to reference the table alias %q", name, alias)
+	return false
 }
 
 func containsRef(refs []outerRef, r outerRef) bool {
@@ -487,51 +585,60 @@ func (e *executor) lookupCTE(name string) *CTE {
 
 // fromRelation resolves the FROM clause of a SELECT (without joins) to a
 // relation.
-func (e *executor) fromRelation(ctx context.Context, sel *SelectStmt) (*tableMeta, string, error) {
+func (e *executor) fromRelation(ctx context.Context, sel *SelectStmt) (relation, error) {
 	return e.resolveFromItem(ctx, sel.From, sel.FromSelect, sel.FromAlias)
 }
 
-// resolveFromItem resolves one FROM item: a table, a CTE, or a derived table.
-func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *SelectStmt, alias string) (*tableMeta, string, error) {
+// resolveFromItem resolves one FROM item: a table, a view, a CTE, or a
+// derived table. The relation is named by the alias, or else by the item's
+// name; meta is nil if there is no item.
+func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *SelectStmt, alias string) (relation, error) {
+	rel := relation{name: alias, aliased: alias != ""}
 	switch {
 	case sub != nil:
 		if m, ok := e.cache.derived[sub]; ok {
-			return m, alias, nil
+			rel.meta = m
+			return rel, nil
 		}
 		m, err := e.materialize(ctx, sub, alias, sub, nil)
 		if err != nil {
-			return nil, "", err
+			return relation{}, err
 		}
 		if !e.planOnly {
 			// An empty stand-in isn't kept: another reference may read it.
 			e.cache.derived[sub] = m
 		}
-		return m, alias, nil
+		rel.meta = m
+		return rel, nil
 	case table != nil:
 		if alias == "" {
-			alias = table.Name
+			rel.name = table.Name
 		}
 		if isInfoSchema(table.Schema) && (table.Catalog == "" || table.Catalog == catalogName) {
 			meta, err := e.infoSchemaTable(ctx, table.Name)
-			return meta, alias, err
+			rel.meta, rel.schema = meta, infoSchema
+			return rel, err
 		}
 		if table.Schema == "" && table.Catalog == "" {
 			if def := e.lookupCTE(table.Name); def != nil {
 				if m, ok := e.cache.working[def]; ok {
 					// The recursive reference of a recursive CTE.
-					return m, alias, nil
+					rel.meta = m
+					return rel, nil
 				}
 				if m, ok := e.cache.ctes[def]; ok {
-					return m, alias, nil
+					rel.meta = m
+					return rel, nil
 				}
 				m, err := e.materializeCTE(ctx, def)
 				if err != nil {
-					return nil, "", err
+					return relation{}, err
 				}
 				if !e.planOnly {
 					e.cache.ctes[def] = m
 				}
-				return m, alias, nil
+				rel.meta = m
+				return rel, nil
 			}
 		}
 		meta, err := e.loadTable(ctx, *table)
@@ -540,17 +647,21 @@ func (e *executor) resolveFromItem(ctx context.Context, table *TableName, sub *S
 			// Not a table: maybe a view.
 			schema, name, rerr := e.resolveTable(*table)
 			if rerr != nil {
-				return nil, "", err
+				return relation{}, err
 			}
 			v, verr := e.store.getView(ctx, schema, name)
 			if verr != nil {
-				return nil, "", err
+				return relation{}, err
 			}
-			meta, err = e.viewRelation(ctx, v, alias)
+			meta, err = e.viewRelation(ctx, v, rel.name)
 		}
-		return meta, alias, err
+		if err != nil {
+			return relation{}, err
+		}
+		rel.meta, rel.schema = meta, meta.Schema
+		return rel, nil
 	}
-	return nil, "", nil
+	return relation{}, nil
 }
 
 // ---- subquery evaluation ----

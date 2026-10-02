@@ -29,19 +29,26 @@ type Expr interface{ exprNode() }
 
 type Literal struct{ V Value }
 
-// ColumnRef is a column reference, optionally qualified (alias.column).
-// Binding resolves Name to the canonical column name. Outer > 0 marks a
-// correlated reference to a column of an enclosing query, Outer levels up;
-// OuterType is then that column's type.
+// ColumnRef is a column reference, optionally qualified (alias.column,
+// schema.table.column or catalog.schema.table.column; Qualifier is then the
+// alias or table). Binding resolves Name to the canonical column name.
+// Outer > 0 marks a correlated reference to a column of an enclosing query,
+// Outer levels up; OuterType is then that column's type.
 type ColumnRef struct {
 	Name      string
 	Qualifier string
+	Schema    string
+	Catalog   string
 	Outer     int
 	OuterType ColType
 	// written is the name as written; binding always resolves from it, so
 	// binding a node twice (it may be shared, e.g. by an expanded IN list)
 	// gives the same result.
 	written string
+	// item is set for the references the planner makes (USING and NATURAL
+	// join conditions): the row-key prefix of the join item they read,
+	// which they bind to instead of by name, since two items may share it.
+	item string
 }
 
 // Subquery is a SELECT used as an expression: a scalar subquery
@@ -3981,8 +3988,8 @@ func (p *parser) parseDateArith(name string) (Expr, error) {
 	return nil, syntaxErr("DATE_SUB expects (x, INTERVAL n part)")
 }
 
-// parseColumnRef parses the rest of [schema.][table.]column after its first
-// part; the part just before the column is kept as the qualifier.
+// parseColumnRef parses the rest of [[[catalog.]schema.]table.]column after
+// its first part. More parts are an error, as in Postgres.
 func (p *parser) parseColumnRef(first string) (Expr, error) {
 	start := p.toks[p.pos-1].pos
 	parts := []string{first}
@@ -3993,9 +4000,20 @@ func (p *parser) parseColumnRef(first string) (Expr, error) {
 		}
 		parts = append(parts, n)
 	}
-	ref := &ColumnRef{Name: parts[len(parts)-1]}
-	if len(parts) > 1 {
-		ref.Qualifier = parts[len(parts)-2]
+	if len(parts) > 4 {
+		return nil, &sqlError{msg: "improper qualified name (too many dotted names): " + strings.Join(parts, ".")}
+	}
+	n := len(parts)
+	ref := &ColumnRef{Name: parts[n-1]}
+	switch n {
+	case 4:
+		ref.Catalog = parts[0]
+		fallthrough
+	case 3:
+		ref.Schema = parts[n-3]
+		fallthrough
+	case 2:
+		ref.Qualifier = parts[n-2]
 	}
 	if p.refs != nil {
 		last := p.toks[p.pos-1]

@@ -81,7 +81,7 @@ func (e *executor) addFromItem(ctx context.Context, jp *joinPlan, jc JoinClause)
 	// query's, and its scope is pushed later).
 	rels := make([]relation, len(jp.items))
 	for i, it := range jp.items {
-		rels[i] = relation{name: it.alias, meta: it.base, prefix: it.prefix}
+		rels[i] = it.rel()
 	}
 	sc := &scope{rels: rels, sq: e.pendingSq, needs: map[string]bool{}}
 	e.scopes = append(e.scopes, sc)
@@ -117,7 +117,7 @@ func (e *executor) addFromItem(ctx context.Context, jp *joinPlan, jc JoinClause)
 			"invalid reference to FROM-clause entry for table %q: the combining JOIN type must be INNER or LEFT for a LATERAL reference",
 			jp.readBy(lat.need))
 	}
-	it, err := jp.add(jc.Kind, base, alias)
+	it, err := jp.add(jc.Kind, relation{name: alias, aliased: jc.Alias != "", meta: base})
 	if err != nil {
 		return err
 	}

@@ -2986,8 +2986,12 @@ func TestSQLQualifiedStar(t *testing.T) {
 	h.expectRows("SELECT * FROM it_qs_v", "1|x|10")
 
 	h.expectError("SELECT x.* FROM it_qs_a a", `missing FROM-clause entry for table "x"`)
-	h.expectError("SELECT public.a.* FROM it_qs_a a", `missing FROM-clause entry for table "public.a"`)
-	h.expectError("SELECT other.it_qs_a.* FROM it_qs_a", `missing FROM-clause entry for table "other.it_qs_a"`)
+	// Postgres's errors: the schema-qualified name of an alias, or of the
+	// table in another schema (#111).
+	h.expectError("SELECT public.a.* FROM it_qs_a a",
+		`invalid reference to FROM-clause entry for table "a"; there is an entry for table "a", but it cannot be referenced from this part of the query`)
+	h.expectError("SELECT other.it_qs_a.* FROM it_qs_a",
+		`invalid reference to FROM-clause entry for table "it_qs_a"; there is an entry for table "it_qs_a", but it cannot be referenced from this part of the query`)
 	h.expectError("SELECT a.*", "requires a FROM clause")
 }
 

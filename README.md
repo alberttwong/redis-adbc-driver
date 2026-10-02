@@ -1120,8 +1120,9 @@ field, even if later rows have it.
     keys and rows without a parent are inserted, the referenced table
     needn't exist, and `GetObjects` doesn't list them.
   - **`CHECK`, when written:** the expression is checked as in Postgres. It
-    may read the table's columns (`col` or `t.col`) but not `__rowid` or
-    another table, may not use subqueries, parameters, aggregates,
+    may read the table's columns (`col`, `t.col` or `schema.t.col`, see
+    "Names" below) but not `__rowid` or another table, may not use
+    subqueries, parameters, aggregates,
     `GROUPING` or window functions, and must be boolean. Its function calls
     are checked as in a query (see "Function calls" below). The errors are
     `column "x" does not exist in table "t"`, `system column "__rowid"
@@ -1189,7 +1190,8 @@ field, even if later rows have it.
   where an item is a table, a CTE, `[LATERAL] (SELECT …)` or
   `[LATERAL] GENERATE_SERIES(…)`, each with an optional alias and column
   aliases (`AS a(x, y)`; `t.col` qualifies a column, and `t.*` selects one
-  item's columns, also as `schema.table.*`; see "Names" below),
+  item's columns, also as `schema.table.col` and `schema.table.*`; see
+  "Names" below),
   with aggregates (below), `CASE` (simple and searched), arithmetic,
   `CAST(x AS type)` / `x::type` (and `TRY_CAST`, see below), `IS [NOT] NULL`,
   `IS [NOT] DISTINCT FROM` (NULLs count as equal), row constructors
@@ -1210,22 +1212,50 @@ field, even if later rows have it.
     v0.0.7, a level with a single FROM item also knew it by its table's
     name, so `t.v` was the inner row's and the query compared each row with
     itself (#102)
-  - **A FROM item without an alias** is visible by its table name, also as
-    `schema.table.col` (the schema isn't checked)
+  - **A FROM item without an alias** is visible by its name. A table or
+    view without an alias is also visible as `schema.table.col` (or
+    `redis.schema.table.col`), with its own schema only (`pg_temp` for a
+    temporary table): in `select s2.t.v from s1.t`, `s2.t` names no FROM
+    item. Up to v0.0.7 the schema wasn't checked, so that query read
+    `s1.t`'s `v` (#111). CTEs, derived tables and items with an alias
+    aren't visible schema-qualified
+  - **Two tables or views with the same name** from different schemas can
+    be FROM items together without aliases, as in Postgres: `select s1.t.v,
+    s2.t.v from s1.t join s2.t on s1.t.id = s2.t.id`, in any join, `USING`
+    and `NATURAL` included, and in `UPDATE … FROM` and `DELETE … USING`. Up
+    to v0.0.7 that was `table name "t" specified more than once; use
+    aliases`. Any other two items of a level with one name still are: the
+    same table twice, or an item and an alias, CTE or derived table of its
+    name. A `MERGE` source can't have the target's name even then: `name
+    "t" specified more than once; the name is used both as MERGE target
+    table and data source`
   - **`t.col`** is a column of the innermost level with an item visible as
     `t`. If that item has no column `col`, it is an error, even when an
-    outer `t` has one. An unqualified `col` is a column of the innermost
-    level that has one, and `column reference "col" is ambiguous` if two of
-    that level's items have it
-  - **Errors** are Postgres's: `missing FROM-clause entry for table "t"`
-    when no level has an item visible as `t`, and `invalid reference to
-    FROM-clause entry for table "t"; perhaps you meant to reference the
-    table alias "x"` (Postgres's hint) when a level reads `t` as `x`, as in
-    `select t.id from t x` or `update t x set … where t.id = 1`. Postgres
-    gives the second only when `t` is on the search path, the driver
-    whenever an item's table, view or CTE is named `t`. A derived table
-    that refers to an earlier FROM item without `LATERAL` gets the first
-    (Postgres: the second, with a hint to add `LATERAL`)
+    outer `t` has one; if two items of that level are visible as `t`
+    (`s1.t` and `s2.t`), it is `table reference "t" is ambiguous`. An
+    unqualified `col` is a column of the innermost level that has one, and
+    `column reference "col" is ambiguous` if two of that level's items
+    have it
+  - **Errors** are Postgres's:
+    - `missing FROM-clause entry for table "t"` when no level has an item
+      visible as `t`, or that reads the table `t`
+    - `invalid reference to FROM-clause entry for table "t"; perhaps you
+      meant to reference the table alias "x"` (Postgres's hint) when a
+      level reads `t` as `x`, as in `select t.id from t x`, `select
+      s.t.id from s.t x` or `update t x set … where t.id = 1`. For an
+      unqualified `t`, Postgres gives it only when `t` is on the search
+      path, the driver whenever an item's table, view or CTE is named `t`
+    - `invalid reference to FROM-clause entry for table "t"; there is an
+      entry for table "t", but it cannot be referenced from this part of
+      the query` (Postgres's detail) when a level has an item named `t`
+      that the reference can't name: `select s2.t.v from s1.t`, `select
+      s.t.v from s.t t`, or a CTE `t` read as `s.t.v`
+    - `cross-database references are not implemented: other.s.t.col` for
+      a catalog other than `redis`, and `improper qualified name (too many
+      dotted names): a.b.c.d.e` for more than four names (also for `*`)
+    - A derived table that refers to an earlier FROM item without
+      `LATERAL` gets `missing FROM-clause entry` (Postgres: `invalid
+      reference …`, with a hint to add `LATERAL`)
 - `FETCH FIRST n ROWS ONLY` is `LIMIT n` (`FETCH FIRST ROW ONLY` is `LIMIT
   1`); `WITH TIES` is not supported, and a query has at most one `LIMIT` or
   `FETCH` (Postgres's "multiple LIMIT clauses not allowed")

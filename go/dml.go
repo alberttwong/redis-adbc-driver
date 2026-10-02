@@ -77,8 +77,9 @@ func (e *executor) planDMLJoin(ctx context.Context, table TableName, alias strin
 	if err != nil {
 		return nil, err
 	}
+	rel := tableRel(meta, alias)
 	if alias == "" {
-		alias = table.Name
+		rel.name = table.Name
 	}
 	jp := &joinPlan{}
 	for _, jc := range from {
@@ -86,7 +87,7 @@ func (e *executor) planDMLJoin(ctx context.Context, table TableName, alias strin
 			return nil, err
 		}
 	}
-	target, err := jp.add(kind, meta, alias)
+	target, err := jp.add(kind, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +272,9 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 			kind = "FULL"
 		}
 	}
+	if err := checkMergeNames(st); err != nil {
+		return 0, err
+	}
 	dj, err := e.planDMLJoin(ctx, st.Table, st.Alias, []JoinClause{st.Source}, kind, st.On)
 	if err != nil {
 		return 0, err
@@ -431,6 +435,24 @@ func (e *executor) bindMergeClause(ctx context.Context, c *MergeClause, need map
 		columnRefs(x, need)
 	}
 	return nil
+}
+
+// checkMergeNames is Postgres's error for a MERGE source with the target's
+// name, even when they are tables of different schemas (which a join
+// allows).
+func checkMergeNames(st *MergeStmt) error {
+	target, source := st.Alias, st.Source.Alias
+	if target == "" {
+		target = st.Table.Name
+	}
+	if source == "" && st.Source.Table != nil {
+		source = st.Source.Table.Name
+	}
+	if !strings.EqualFold(target, source) {
+		return nil
+	}
+	return errorf(adbc.StatusInvalidArgument,
+		"name %q specified more than once; the name is used both as MERGE target table and data source", target)
 }
 
 // mergeScopeHint explains an unknown column or table in a WHEN NOT MATCHED

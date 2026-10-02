@@ -77,7 +77,7 @@ func (jp *joinPlan) planNatural(joined *tableMeta, rels []relation) []relation {
 			out[i] = outputColumn{
 				name: c.Name,
 				col:  columnMeta{Name: it.prefix + c.Name, label: c.Name, Type: c.Type, Nullable: true},
-				expr: &ColumnRef{Qualifier: it.alias, Name: c.Name},
+				expr: it.ref(c.Name),
 			}
 		}
 		return out

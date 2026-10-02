@@ -49,9 +49,12 @@ import (
 )
 
 type joinItem struct {
-	alias    string
+	alias string // the name it is visible as (see relation)
+	// aliased and schema are as in relation.
+	aliased  bool
+	schema   string
 	base     *tableMeta // table, CTE or derived table
-	prefix   string     // alias + "."
+	prefix   string     // alias + "." (see add)
 	kind     string     // "" for the first item; INNER, LEFT, RIGHT, FULL, CROSS
 	on       Expr       // bound join condition (may be nil)
 	nullable bool       // on the NULL-supplying side of an outer join
@@ -114,40 +117,72 @@ func (e *executor) planJoin(ctx context.Context, sel *SelectStmt) (*tableMeta, [
 // addJoinItem resolves a FROM item (table, view, CTE or derived table) and
 // adds it to the join.
 func (e *executor) addJoinItem(ctx context.Context, jp *joinPlan, kind string, table *TableName, sub *SelectStmt, alias string) error {
-	meta, name, err := e.resolveFromItem(ctx, table, sub, alias)
+	rel, err := e.resolveFromItem(ctx, table, sub, alias)
 	if err != nil {
 		return err
 	}
-	if meta.view != nil {
+	if rel.meta.view != nil {
 		// Joins read each item fully; compute the view now (unless only
 		// planning).
 		var rows []map[string]Value
 		if !e.planOnly {
-			if rows, err = e.runView(ctx, meta.view, nil, nil, e.params); err != nil {
+			if rows, err = e.runView(ctx, rel.meta.view, nil, nil, e.params); err != nil {
 				return err
 			}
 		}
-		m := *meta
+		m := *rel.meta
 		m.view, m.mem = nil, rows
-		meta = &m
+		rel.meta = &m
 	}
-	if name == "" {
+	if rel.name == "" {
 		return errorf(adbc.StatusInvalidArgument, "a subquery in FROM must have an alias")
 	}
-	_, err = jp.add(kind, meta, name)
+	_, err = jp.add(kind, rel)
 	return err
 }
 
-// add appends a resolved relation to the join under a unique alias.
-func (jp *joinPlan) add(kind string, meta *tableMeta, alias string) (*joinItem, error) {
+// add appends a resolved relation to the join. As in Postgres
+// (checkNameSpaceConflicts), no two items may have the same name, except
+// two tables or views without aliases from different schemas (s1.t and
+// s2.t). Their row keys are kept apart: the second one's prefix is
+// "t\x00<n>.", which can't start or be started by another item's
+// ("alias.", or mergedPrefix's).
+func (jp *joinPlan) add(kind string, rel relation) (*joinItem, error) {
+	prefix := rel.name + "."
 	for _, it := range jp.items {
-		if strings.EqualFold(it.alias, alias) {
-			return nil, errorf(adbc.StatusInvalidArgument, "table name %q specified more than once; use aliases", alias)
+		if !strings.EqualFold(it.alias, rel.name) {
+			continue
 		}
+		if it.aliased || rel.aliased || it.schema == "" || rel.schema == "" || strings.EqualFold(it.schema, rel.schema) {
+			return nil, errorf(adbc.StatusInvalidArgument, "table name %q specified more than once; use aliases", rel.name)
+		}
+		prefix = rel.name + "\x00" + strconv.Itoa(len(jp.items)) + "."
 	}
-	it := &joinItem{alias: alias, base: meta, prefix: alias + ".", kind: kind}
+	it := &joinItem{alias: rel.name, aliased: rel.aliased, schema: rel.schema, base: rel.meta, prefix: prefix, kind: kind}
 	jp.items = append(jp.items, it)
 	return it, nil
+}
+
+// rel is the item's relation in the query's scope.
+func (it *joinItem) rel() relation {
+	return relation{name: it.alias, aliased: it.aliased, schema: it.schema, meta: it.base, prefix: it.prefix}
+}
+
+// ref is a reference to the item's column col, bound to the item itself
+// (another item may have its name).
+func (it *joinItem) ref(col string) *ColumnRef {
+	return &ColumnRef{Qualifier: it.alias, Name: col, item: it.prefix}
+}
+
+// keyLabel is a joined row's key as errors name it: alias.column, without
+// the number in a second item's prefix (see add).
+func keyLabel(key string) string {
+	if i := strings.IndexByte(key, 0); i > 0 {
+		if j := strings.IndexByte(key[i:], '.'); j > 0 {
+			return key[:i] + key[i+j:]
+		}
+	}
+	return key
 }
 
 // finish works out which items are NULL-supplying and returns the joined
@@ -178,7 +213,7 @@ func (jp *joinPlan) finish() (*tableMeta, []relation) {
 				Name: it.prefix + c.Name, label: c.Name, Type: c.Type, Nullable: true,
 			})
 		}
-		rels[i] = relation{name: it.alias, meta: it.base, prefix: it.prefix}
+		rels[i] = it.rel()
 	}
 	rels = jp.planNatural(joined, rels)
 	return joined, rels
@@ -204,21 +239,19 @@ func (e *executor) bindJoin(ctx context.Context, sel *SelectStmt, jp *joinPlan) 
 		if len(jc.Using) > 0 {
 			var parts []Expr
 			for _, col := range jc.Using {
-				left := ""
+				var left *joinItem
 				for _, prev := range jp.items[:i+1] {
 					if _, ok := prev.base.column(col); ok {
-						if left != "" {
+						if left != nil {
 							return errorf(adbc.StatusInvalidArgument, "USING column %q is ambiguous", col)
 						}
-						left = prev.alias
+						left = prev
 					}
 				}
-				if left == "" {
+				if left == nil {
 					return errorf(adbc.StatusInvalidArgument, "USING column %q does not exist in the left side of the join", col)
 				}
-				parts = append(parts, &Binary{Op: "=",
-					L: &ColumnRef{Qualifier: left, Name: col},
-					R: &ColumnRef{Qualifier: it.alias, Name: col}})
+				parts = append(parts, &Binary{Op: "=", L: left.ref(col), R: it.ref(col)})
 			}
 			cond = andAll(parts)
 		}
