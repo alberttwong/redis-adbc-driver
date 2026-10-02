@@ -263,6 +263,8 @@ arm64). The Linux libraries run on every Linux that
 RHEL 8 and 9 (and compatible distributions), Ubuntu 20.04 and later, and
 Amazon Linux 2023. To use one instead of building, put it at the path
 `make build` would create (`go/build/libadbc_driver_redis.dylib` or `.so`).
+Releases after v0.0.9 also have the [`redis-arrow`](#arrow-ipc-files-redis-arrow)
+command for the same platforms.
 
 **1. Start Redis 8.6 and build the driver**
 
@@ -538,6 +540,14 @@ Build it from `go`:
 ```bash
 make cli
 ```
+
+Or download `redis-arrow-<version>-<os>-<arch>.tar.gz` from a
+[release](https://github.com/alberttwong/redis-adbc-driver/releases) after
+v0.0.9. The Linux binaries are statically linked, and each release runs
+them on the same distributions as the driver. On macOS, a binary from a
+tarball downloaded with a browser is quarantined, and macOS refuses to run
+it; download with `gh release download` or `curl` instead, or clear the flag
+with `xattr -d com.apple.quarantine redis-arrow`.
 
 **Export.** `-o` names the output file. The result is in the IPC file format
 (`.arrow`, also read as Feather v2), except for `.arrows` files and stdout,
