@@ -56,54 +56,62 @@ func isAggregate(e Expr) bool {
 }
 
 func walkExpr(e Expr, fn func(Expr)) {
-	if e == nil {
+	walkExprPruned(e, func(x Expr) bool {
+		fn(x)
+		return true
+	})
+}
+
+// walkExprPruned is walkExpr, where fn returns whether to visit the
+// children of a node.
+func walkExprPruned(e Expr, fn func(Expr) bool) {
+	if e == nil || !fn(e) {
 		return
 	}
-	fn(e)
 	switch x := e.(type) {
 	case *Unary:
-		walkExpr(x.X, fn)
+		walkExprPruned(x.X, fn)
 	case *Binary:
-		walkExpr(x.L, fn)
-		walkExpr(x.R, fn)
+		walkExprPruned(x.L, fn)
+		walkExprPruned(x.R, fn)
 	case *IsNull:
-		walkExpr(x.X, fn)
+		walkExprPruned(x.X, fn)
 	case *Cast:
-		walkExpr(x.X, fn)
-		walkExpr(x.OnError, fn)
+		walkExprPruned(x.X, fn)
+		walkExprPruned(x.OnError, fn)
 	case *Func:
 		for _, a := range x.Args {
-			walkExpr(a, fn)
+			walkExprPruned(a, fn)
 		}
 		for _, o := range x.OrderBy {
-			walkExpr(o.Expr, fn)
+			walkExprPruned(o.Expr, fn)
 		}
-		walkExpr(x.Filter, fn)
+		walkExprPruned(x.Filter, fn)
 	case *Case:
-		walkExpr(x.Operand, fn)
+		walkExprPruned(x.Operand, fn)
 		for _, w := range x.Whens {
-			walkExpr(w.When, fn)
-			walkExpr(w.Then, fn)
+			walkExprPruned(w.When, fn)
+			walkExprPruned(w.Then, fn)
 		}
-		walkExpr(x.Else, fn)
+		walkExprPruned(x.Else, fn)
 	case *Subquery:
 		// The body is a separate scope; only the IN operand belongs here. A
 		// row operand's items are visited, not the row: a *RowExpr is
 		// visited only where it is an error.
 		for _, it := range subqueryOperands(x) {
-			walkExpr(it, fn)
+			walkExprPruned(it, fn)
 		}
 	case *RowColumn:
-		walkExpr(x.Sub, fn)
+		walkExprPruned(x.Sub, fn)
 	case *RowExpr:
 		for _, it := range x.Items {
-			walkExpr(it, fn)
+			walkExprPruned(it, fn)
 		}
 	case *WindowFunc:
 		// The call itself is not visited as a *Func: SUM(x) OVER (…) is not
 		// an aggregate, but aggregates in its arguments (SUM(COUNT(*))) are.
 		for _, c := range x.children() {
-			walkExpr(c, fn)
+			walkExprPruned(c, fn)
 		}
 	}
 }

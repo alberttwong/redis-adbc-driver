@@ -106,18 +106,26 @@ func (dj *dmlJoin) rows(ctx context.Context, e *executor, where Expr, need map[s
 	return rows, err
 }
 
-// bindWhere binds the WHERE clause of UPDATE … FROM / DELETE … USING.
+// bindWhere binds the WHERE clause of UPDATE … FROM / DELETE … USING in
+// the current scope.
 func (e *executor) bindWhere(ctx context.Context, where Expr) error {
 	if where == nil {
 		return nil
 	}
-	if isAggregate(where) {
-		return errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHERE")
-	}
 	if containsWindow(where) {
 		return errWindowPlacement()
 	}
-	return e.bind(ctx, where)
+	return e.bindClause(ctx, where, "WHERE")
+}
+
+// bindClause binds an expression of a statement's clause in the current
+// scope; clause names it in the error for an aggregate in it.
+func (e *executor) bindClause(ctx context.Context, x Expr, clause string) error {
+	sc := e.scopes[len(e.scopes)-1]
+	saved := sc.aggClause
+	sc.aggClause = clause
+	defer func() { sc.aggClause = saved }()
+	return e.bind(ctx, x)
 }
 
 // runUpdateFrom implements UPDATE t SET … FROM items [WHERE …].
@@ -136,7 +144,7 @@ func (e *executor) runUpdateFrom(ctx context.Context, st *UpdateStmt, params []V
 	if err != nil {
 		return 0, err
 	}
-	sc := e.pushScope(dj.rels)
+	sc := e.pushScope(dj.rels, "UPDATE")
 	defer e.popScope()
 	if err := e.bindJoin(ctx, dj.sel, dj.jp); err != nil {
 		return 0, err
@@ -214,7 +222,7 @@ func (e *executor) runDeleteUsing(ctx context.Context, st *DeleteStmt, params []
 	if err != nil {
 		return 0, err
 	}
-	sc := e.pushScope(dj.rels)
+	sc := e.pushScope(dj.rels, "WHERE")
 	defer e.popScope()
 	if err := e.bindJoin(ctx, dj.sel, dj.jp); err != nil {
 		return 0, err
@@ -286,7 +294,7 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 	// NOT MATCHED BY SOURCE clauses only the target.
 	need := map[string]bool{}
 	inScope := func(rels []relation, fn func() error) error {
-		sc := e.pushScope(rels)
+		sc := e.pushScope(rels, "MERGE WHEN conditions")
 		defer e.popScope()
 		if err := fn(); err != nil {
 			return err
@@ -415,24 +423,28 @@ func (e *executor) runMerge(ctx context.Context, st *MergeStmt, params []Value) 
 // bindMergeClause binds a WHEN clause's condition and values in the current
 // scope, adding the columns they read to need.
 func (e *executor) bindMergeClause(ctx context.Context, c *MergeClause, need map[string]bool) error {
-	exprs := slices.Clone(c.Values)
+	type part struct {
+		x      Expr
+		clause string // for the error of an aggregate in it
+	}
+	var parts []part
+	for _, v := range c.Values {
+		parts = append(parts, part{v, "VALUES"})
+	}
 	if c.Cond != nil {
-		if isAggregate(c.Cond) {
-			return errorf(adbc.StatusInvalidArgument, "aggregates are not allowed in WHEN conditions")
-		}
-		exprs = append(exprs, c.Cond)
+		parts = append(parts, part{c.Cond, "MERGE WHEN conditions"})
 	}
 	for _, s := range c.Sets {
-		exprs = append(exprs, s.Expr)
+		parts = append(parts, part{s.Expr, "UPDATE"})
 	}
-	for _, x := range exprs {
-		if containsWindow(x) {
+	for _, p := range parts {
+		if containsWindow(p.x) {
 			return errWindowPlacement()
 		}
-		if err := e.bind(ctx, x); err != nil {
+		if err := e.bindClause(ctx, p.x, p.clause); err != nil {
 			return err
 		}
-		columnRefs(x, need)
+		columnRefs(p.x, need)
 	}
 	return nil
 }

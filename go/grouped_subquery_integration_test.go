@@ -23,10 +23,13 @@ package redis
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // setupGroupedSubqueries creates it_gq.g, the issue's table.
@@ -242,27 +245,219 @@ func TestSQLGroupedSubqueryAllowed(t *testing.T) {
 	h.expectRows(`select id, (select count(*) from it_gq.g x where x.v = g.v) from it_gq.g order by id`, "1|2", "2|2", "3|1")
 }
 
-// An aggregate of the outer query's columns inside a subquery is computed
-// by Postgres over the outer query's groups; the driver doesn't support it.
+// An aggregate of the outer query's columns inside a subquery is the outer
+// query's, as in Postgres: it is computed over the outer query's groups
+// (#120). Up to #117 these were computed over the subquery's rows, then
+// rejected as not supported.
 func TestSQLGroupedSubqueryOuterAggregates(t *testing.T) {
 	h := newSQLHarness(t)
 	h.setupGroupedSubqueries()
-	const msg = `outer-level aggregate of column "g.id" in a subquery is not supported`
-	for _, sql := range []string{
-		// Postgres: 10|2, 20|3.
-		`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v`,
-		`select v, (select max(g.id) filter (where g.v > 0) from it_gq.g x where x.id = 1) from it_gq.g group by v`,
-		// Postgres: 10|3, 20|3.
-		`select v, (select sum(g.id)) from it_gq.g group by v`,
-		// Postgres: 10|1, 20|1.
-		`select v, (select x.id from it_gq.g x order by max(g.id) limit 1) from it_gq.g group by v`,
-		// Postgres: 3|3.
-		`select count(*), (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`,
-	} {
-		h.expectQueryError(sql, adbc.StatusNotImplemented, msg)
-	}
+	h.expectRows(`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
+		"10|2", "20|3")
+	h.expectRows(`select v, (select max(g.id) filter (where g.v > 0) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
+		"10|2", "20|3")
+	h.expectRows(`select v, (select sum(g.id)) from it_gq.g group by v order by v`, "10|3", "20|3")
+	h.expectRows(`select v, (select x.id from it_gq.g x order by max(g.id) limit 1) from it_gq.g group by v order by v`,
+		"10|1", "20|1")
+	h.expectRows(`select count(*), (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`, "3|3")
 	// An aggregate that also reads the subquery's own columns is the
 	// subquery's.
 	h.expectUngrouped(`select v, (select sum(g.id + x.id) from it_gq.g x) from it_gq.g group by v`, "g.id")
 	h.expectUngrouped(`select v, (select max(x.id) filter (where g.id > 0) from it_gq.g x) from it_gq.g group by v`, "g.id")
+	// So is its column outside the aggregate.
+	h.expectUngrouped(`select v, (select max(g.id) + g.id from it_gq.g x where x.id = 1) from it_gq.g group by v`, "g.id")
+	h.expectUngrouped(`select v, (select max(g.id) from it_gq.g x where x.id > g.id) from it_gq.g group by v`, "g.id")
+}
+
+// The queries of #120, and its acceptance cases.
+func TestSQLOuterAggregateIssue(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupGroupedSubqueries()
+	// Over each group: the subquery ran once and read one row's value.
+	h.expectRows(`select v, (select sum(g.v) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
+		"10|20", "20|20")
+	// Without GROUP BY, the query is an aggregate one: one row.
+	h.expectRows(`select (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`, "3")
+	h.expectRows(`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
+		"10|2", "20|3")
+	h.expectRows(`select count(*), (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`, "3|3")
+	h.expectRows(`select v from it_gq.g group by v having (select count(g.id) from it_gq.g x where x.id = 1) > 1 order by v`,
+		"10")
+	h.expectRows(`select (select sum(g.v)) from it_gq.g`, "40")
+	// An aggregate that reads the subquery's columns too is the subquery's.
+	h.expectRows(`select (select sum(g.v + x.id) from it_gq.g x where x.id = 1) from it_gq.g`, "11", "11", "21")
+	// In the subquery, the outer aggregate is a constant, also in WHERE.
+	h.expectRows(`select (select x.id from it_gq.g x where x.id = max(g.id)) from it_gq.g`, "3")
+	// Where it may be is decided at its own level.
+	h.expectQueryError(`select id from it_gq.g where (select max(g.id)) > 1`, adbc.StatusInvalidArgument,
+		"aggregate functions are not allowed in WHERE")
+}
+
+// Outer-level aggregates wherever a query computes values per group, and
+// in the forms an aggregate takes.
+func TestSQLOuterAggregateForms(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupGroupedSubqueries()
+	h.exec(`CREATE TABLE it_gq.e (id INTEGER, v INTEGER)`)
+
+	// Two levels down.
+	h.expectRows(`select (select (select max(g.id) from it_gq.g y where y.id = 1) from it_gq.g x where x.id = 1) from it_gq.g`, "3")
+	h.expectRows(`select v, (select (select max(g.id) from it_gq.g y where y.id = 1) from it_gq.g x where x.id = 1)
+		from it_gq.g group by v order by v`, "10|2", "20|3")
+	// HAVING, an IN subquery and EXISTS, ORDER BY by an alias.
+	h.expectRows(`select v from it_gq.g group by v
+		having exists (select 1 from it_gq.g x where x.id = max(g.id) and x.v = 20) order by v`, "20")
+	h.expectRows(`select v, max(g.id) in (select x.id from it_gq.g x where x.id > min(g.id)) from it_gq.g group by v order by v`,
+		"10|true", "20|false")
+	h.expectRows(`select v, (select sum(g.v) + 1 from it_gq.g x where x.id = 1) from it_gq.g group by v
+		having (select sum(g.v)) > 15 order by v`, "10|21", "20|21")
+	h.expectRows(`select v, (select max(g.id) from it_gq.g x where x.id = 1) as m from it_gq.g group by v order by m desc`,
+		"20|3", "10|2")
+	// Grouping sets.
+	h.expectRows(`select v, (select sum(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by rollup (v) order by v`,
+		"10|3", "20|3", "NULL|6")
+	h.expectRows(`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by rollup (v) order by v`,
+		"10|2", "20|3", "NULL|3")
+	// Window functions, DISTINCT and DISTINCT ON.
+	h.expectRows(`select v, rank() over (order by (select max(g.id))) from it_gq.g group by v order by v`, "10|1", "20|2")
+	h.expectRows(`select v, sum((select max(g.id))) over () from it_gq.g group by v order by v`, "10|5", "20|5")
+	h.expectRows(`select v, count(*) over (partition by (select max(g.id))) from it_gq.g group by v order by v`, "10|1", "20|1")
+	h.expectRows(`select distinct (select max(g.id) / 3 from it_gq.g x where x.id = 1) from it_gq.g group by v order by 1`, "0", "1")
+	h.expectRows(`select distinct on (1) (select max(g.id) from it_gq.g x where x.id = 1) m, v from it_gq.g group by v order by 1, v`,
+		"2|10", "3|20")
+	// DISTINCT, ORDER BY and FILTER in the aggregate.
+	h.expectRows(`select v, (select count(distinct g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`,
+		"10|2", "20|1")
+	h.expectRows(`select v, (select string_agg(g.id::text, ',' order by g.id desc)) from it_gq.g group by v order by v`,
+		"10|2,1", "20|3")
+	h.expectRows(`select v, (select count(*) filter (where g.id > 1)) from it_gq.g group by v order by v`, "10|1", "20|1")
+	h.expectRows(`select (select percentile_disc(0.5) within group (order by g.v) from it_gq.g x where x.id = 1) from it_gq.g`, "10")
+	// With the subquery's own aggregates, and the query's.
+	h.expectRows(`select v, (select max(g.id) + max(x.id) from it_gq.g x) from it_gq.g group by v order by v`, "10|5", "20|6")
+	h.expectRows(`select max(id), (select max(g.id) + 1) from it_gq.g`, "3|4")
+	// No rows, an empty table, HAVING alone.
+	h.expectRows(`select (select max(g.id)) from it_gq.g where false`, "NULL")
+	h.expectRows(`select (select count(e.id)) from it_gq.e`, "0")
+	h.expectRows(`select 1 from it_gq.g having (select max(g.id)) > 2`, "1")
+	h.expectRows(`select 1 from it_gq.g having (select max(g.id)) > 3`)
+	// Views, CTEs and set operations.
+	h.exec(`CREATE VIEW it_gq.sums AS select v, (select sum(g.v) from it_gq.g x where x.id = 1) s from it_gq.g group by v`)
+	h.expectRows(`select * from it_gq.sums order by v`, "10|20", "20|20")
+	h.expectRows(`with c as (select * from it_gq.g) select (select max(c.id)) from c`, "3")
+	h.expectRows(`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v
+		union all select 0, (select min(g.id)) from it_gq.g order by 1`, "0|1", "10|2", "20|3")
+	// Not supported: a subquery in its arguments, whose columns are found
+	// only as it is planned. Postgres gives 10|2, 20|3.
+	h.expectQueryError(`select v, (select max((select g.id)) from it_gq.g x where x.id = 1) from it_gq.g group by v`,
+		adbc.StatusNotImplemented, "outer-level aggregate with a subquery in its arguments is not supported")
+	// A subquery in the arguments of the query's own aggregate is fine.
+	h.expectRows(`select v, max((select g.id)) from it_gq.g group by v order by v`, "10|2", "20|3")
+}
+
+// Postgres's rule for where an aggregate may be applies at the aggregate's
+// own level, also when a subquery holds it. The errors are Postgres's.
+func TestSQLOuterAggregatePlacement(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupGroupedSubqueries()
+	h.exec(`CREATE TABLE it_gq.h (id INTEGER, v INTEGER)`)
+	notAllowed := func(sql, clause string) {
+		h.t.Helper()
+		h.expectQueryError(sql, adbc.StatusInvalidArgument, "aggregate functions are not allowed in "+clause)
+	}
+	for _, c := range []struct{ sql, clause string }{
+		{`select id from it_gq.g where (select max(g.id)) > 1`, "WHERE"},
+		{`select id from it_gq.g where max(id) > 1`, "WHERE"},
+		{`select 1 from it_gq.g where sum(count(*)) > 1`, "WHERE"},
+		{`select g.id from it_gq.g join it_gq.g h on h.id = (select max(g.id))`, "JOIN conditions"},
+		{`select 1 from it_gq.g join it_gq.g h on h.id = max(g.id)`, "JOIN conditions"},
+		{`select v from it_gq.g group by (select max(g.id))`, "GROUP BY"},
+		{`select (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by 1`, "GROUP BY"},
+		{`select 1 from it_gq.g group by max(id)`, "GROUP BY"},
+		{`select count(*) filter (where (select max(g.id)) > 1) from it_gq.g`, "FILTER"},
+		{`select count(*) filter (where count(*) > 1) from it_gq.g`, "FILTER"},
+		{`select * from it_gq.g, lateral (select max(g.id)) l`, "FROM clause of their own query level"},
+		{`select * from it_gq.g, generate_series(1, (select max(g.id))) s`, "functions in FROM"},
+		{`update it_gq.g set v = (select max(g.id))`, "UPDATE"},
+		{`update it_gq.g set v = max(id)`, "UPDATE"},
+		{`update it_gq.h t set v = (select max(s.id)) from it_gq.g s where s.id = t.id`, "UPDATE"},
+		{`update it_gq.g set v = 1 where (select max(g.id)) > 1`, "WHERE"},
+		{`delete from it_gq.g where (select max(g.id)) > 1`, "WHERE"},
+		{`delete from it_gq.h t using it_gq.g s where max(s.id) > 1`, "WHERE"},
+		{`insert into it_gq.h values (count(*), 1)`, "VALUES"},
+		{`update it_gq.g set v = v returning (select max(g.id))`, "RETURNING"},
+		{`merge into it_gq.h t using it_gq.g s on t.id = s.id when matched and (select max(s.id)) > 1 then delete`,
+			"MERGE WHEN conditions"},
+		{`merge into it_gq.h t using it_gq.g s on t.id = s.id when matched and count(*) > 1 then delete`,
+			"MERGE WHEN conditions"},
+		{`merge into it_gq.h t using it_gq.g s on t.id = max(s.id) when matched then delete`, "JOIN conditions"},
+		{`merge into it_gq.h t using it_gq.g s on t.id = s.id when matched then update set v = max(s.id)`, "UPDATE"},
+		{`merge into it_gq.h t using it_gq.g s on t.id = s.id when not matched then insert values (max(s.id), 1)`, "VALUES"},
+		{`with recursive t(n) as (select 1 union all select (select max(t.n) + 1) from t where n < 3) select * from t`,
+			"a recursive query's recursive term"},
+	} {
+		notAllowed(c.sql, c.clause)
+	}
+	// Nothing was changed.
+	h.expectRows(`select * from it_gq.g order by id`, "1|10", "2|10", "3|20")
+	h.expectRows(`select count(*) from it_gq.h`, "0")
+
+	const nested = "aggregate function calls cannot be nested"
+	h.expectQueryError(`select max((select max(g.id))) from it_gq.g`, adbc.StatusInvalidArgument, nested)
+	h.expectQueryError(`select (select sum(count(g.id)) from it_gq.g x where x.id = 1) from it_gq.g`, adbc.StatusInvalidArgument, nested)
+	h.expectQueryError(`select sum(count(*)) from it_gq.g`, adbc.StatusInvalidArgument, nested)
+	h.expectQueryError(`select (select percentile_cont(x.id / 10.0) within group (order by g.v) from it_gq.g x where x.id = 1) from it_gq.g`,
+		adbc.StatusInvalidArgument, "outer-level aggregate cannot contain a lower-level variable in its direct arguments")
+}
+
+// Outer-level aggregates in every aggregate pushdown mode, in the index
+// when it can compute them, and in a statement that runs again.
+func TestSQLOuterAggregatePushdown(t *testing.T) {
+	h := newSQLHarness(t)
+	h.setupGroupedSubqueries()
+	queries := []struct {
+		sql  string
+		want []string
+	}{
+		{`select v, (select sum(g.v) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`, []string{"10|20", "20|20"}},
+		{`select v, (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`, []string{"10|2", "20|3"}},
+		{`select (select max(g.id) from it_gq.g x where x.id = 1) from it_gq.g`, []string{"3"}},
+		{`select count(*), (select count(g.v) from it_gq.g x where x.id = 1) from it_gq.g where v > 10`, []string{"1|1"}},
+		{`select v, (select sum(g.id) from it_gq.g x where x.id = 1) from it_gq.g group by rollup (v) order by v`,
+			[]string{"10|3", "20|3", "NULL|6"}},
+	}
+	for _, mode := range []string{PushdownExact, PushdownAll, PushdownNone} {
+		m := newGSPushdownHarness(t, mode)
+		for _, q := range queries {
+			m.expectRows(q.sql, q.want...)
+		}
+	}
+	// The outer query computes SUM(v) with its GROUP BY in the index.
+	if !h.indexAggIn(PushdownExact, `select v, (select sum(g.v) from it_gq.g x where x.id = 1) from it_gq.g group by v`) {
+		t.Error("the outer-level SUM(g.v) doesn't run in the index")
+	}
+
+	// A statement keeps its parsed query, planned again when it runs again.
+	st := h.gsPrepare(`select v, (select sum(g.v) from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`)
+	for range 2 {
+		if got := h.gsRows(st); !slices.Equal(got, []string{"10|20", "20|20"}) {
+			t.Errorf("run again: got %q", got)
+		}
+	}
+	st = h.gsPrepare(`select v, (select sum(g.v) + ? from it_gq.g x where x.id = 1) from it_gq.g group by v order by v`)
+	for _, c := range []struct {
+		param int64
+		want  []string
+	}{{1, []string{"10|21", "20|21"}}, {5, []string{"10|25", "20|25"}}} {
+		ib := array.NewInt64Builder(memory.DefaultAllocator)
+		ib.Append(c.param)
+		col := ib.NewArray()
+		ib.Release()
+		rec := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{{Name: "p", Type: arrow.PrimitiveTypes.Int64}}, nil), []arrow.Array{col}, 1)
+		if err := st.Bind(h.ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.gsRows(st); !slices.Equal(got, c.want) {
+			t.Errorf("parameter %d: got %q, want %q", c.param, got, c.want)
+		}
+	}
 }

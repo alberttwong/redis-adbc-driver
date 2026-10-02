@@ -388,7 +388,7 @@ func TestSQLFunctionsErrorOrder(t *testing.T) {
 		{"SELECT nosuchfunc(s) FILTER (WHERE true) FROM it_fx_t", "function nosuchfunc(varchar) does not exist"},
 		{"SELECT upper(s) FILTER (WHERE true) FROM it_fx_t", "FILTER specified, but UPPER is not an aggregate function"},
 		{"SELECT nosuchfunc(s) IGNORE NULLS FROM it_fx_t", "function nosuchfunc(varchar) does not exist"},
-		{"SELECT id FROM it_fx_t WHERE nosuchfunc(COUNT(*)) > 0", "aggregates are not allowed in WHERE"},
+		{"SELECT id FROM it_fx_t WHERE nosuchfunc(COUNT(*)) > 0", "aggregate functions are not allowed in WHERE"},
 		{"SELECT 1 FROM it_fx_t WHERE nosuchfunc(id) = 1 GROUP BY nosuchcol", `column "nosuchcol" does not exist in table "it_fx_t"`},
 	} {
 		h.expectErrorText(c.sql, c.err)

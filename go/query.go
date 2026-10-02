@@ -735,19 +735,7 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 	if err != nil {
 		return nil, err
 	}
-	var aggs []*Func
-	for _, it := range plan.items {
-		collectAggregates(it.expr, &aggs)
-	}
-	for _, o := range plan.order {
-		collectAggregates(o.expr, &aggs)
-	}
-	if plan.having != nil {
-		collectAggregates(plan.having, &aggs)
-	}
-	if plan.qualify != nil {
-		collectAggregates(plan.qualify, &aggs)
-	}
+	aggs := plan.aggregateCalls()
 	types := meta.types()
 	env := e.newEnv(ctx, types, params)
 
@@ -759,6 +747,17 @@ func (e *executor) selectAggregate(ctx context.Context, plan *selectPlan, params
 		groups, err = e.driverAggregate(ctx, plan, wp, aggs, params)
 		if err != nil {
 			return nil, err
+		}
+	}
+	if len(plan.outerAggs) > 0 {
+		// The values of the aggregates its subqueries hold, which they read
+		// as columns of the group.
+		for i := range groups {
+			rep := maps.Clone(groups[i].rep)
+			for _, a := range plan.outerAggs {
+				rep[a.name] = groups[i].results[a.fn]
+			}
+			groups[i].rep = rep
 		}
 	}
 
@@ -1116,6 +1115,10 @@ func (e *executor) driverAggregate(ctx context.Context, plan *selectPlan, wp whe
 	if plan.qualify != nil {
 		columnRefs(plan.qualify, req.need)
 	}
+	for _, f := range aggs {
+		// Those of its subqueries, too.
+		columnRefs(f, req.need)
+	}
 	_, rows, err := e.scan(ctx, req, params)
 	if err != nil {
 		return nil, err
@@ -1198,7 +1201,7 @@ func (e *executor) matchRows(ctx context.Context, meta *tableMeta, alias string,
 		need = map[string]bool{}
 	}
 	if where != nil {
-		needs, err := e.bindIn(ctx, where, meta, alias)
+		needs, err := e.bindIn(ctx, where, meta, alias, "WHERE")
 		if err != nil {
 			return nil, nil, err
 		}

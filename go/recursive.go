@@ -115,6 +115,11 @@ func (e *executor) materializeRecursive(ctx context.Context, def *CTE, rc *recur
 	if err != nil {
 		return nil, err
 	}
+	if len(rec.outerAggs) > 0 {
+		// An aggregate of its level in a subquery (checkRecursion sees those
+		// written in it).
+		return nil, errorf(adbc.StatusInvalidArgument, "aggregate functions are not allowed in a recursive query's recursive term")
+	}
 	if len(rec.items) != len(cols) {
 		return nil, errorf(adbc.StatusInvalidArgument, "each UNION query must have the same number of columns (%d and %d)",
 			len(cols), len(rec.items))

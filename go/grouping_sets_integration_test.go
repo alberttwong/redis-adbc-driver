@@ -585,7 +585,7 @@ func TestSQLGroupingSetsErrors(t *testing.T) {
 	h.expectError(`SELECT COUNT(*) FROM it_gs_sales GROUP BY CUBE (id, region, product, yr, qty, amount, note),
 		CUBE (id + 1, id + 2, id + 3, id + 4, id + 5, id + 6)`, "too many grouping sets present (maximum 4096)")
 	h.expectError("SELECT region, COUNT(*) FROM it_gs_sales GROUP BY ROLLUP (3)", "GROUP BY position 3 is out of range")
-	h.expectError("SELECT COUNT(*) FROM it_gs_sales GROUP BY ROLLUP (COUNT(*))", "aggregates are not allowed in GROUP BY")
+	h.expectError("SELECT COUNT(*) FROM it_gs_sales GROUP BY ROLLUP (COUNT(*))", "aggregate functions are not allowed in GROUP BY")
 	h.expectError("SELECT COUNT(*) FROM it_gs_sales GROUP BY CUBE (ROW_NUMBER() OVER ())", "window functions are not allowed in GROUP BY")
 	h.expectError("SELECT COUNT(*) GROUP BY ()", "aggregates require a FROM clause")
 
