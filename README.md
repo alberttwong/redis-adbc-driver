@@ -769,8 +769,9 @@ build/redis-arrow scan -prefix user: | build/redis-arrow import -table users
   exists for the whole scan is read once (`SCAN` can return a key twice;
   `scan` remembers the keys it has read, which takes memory for every key).
   One created or deleted meanwhile may or may not be read.
-- **Memory:** `scan` streams batches of up to 10,000 rows, so unlike
-  `export` it doesn't hold the whole result.
+- **Memory:** `scan` streams batches of up to 10,000 rows, whatever the
+  collection's size, as `export` does for a query that
+  [streams](#streamed-results).
 
 <a id="adopt-hashes-in-place"></a>
 **Adopt.** `adopt` reads every HASH under the prefix, runs the in-place
