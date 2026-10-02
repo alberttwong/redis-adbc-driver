@@ -592,7 +592,7 @@ Stop Redis with `docker compose down`.
     when they write.
 - **NaNs in the index**: `REAL` and `DOUBLE PRECISION` columns hold `NaN`,
   `Infinity` and `-Infinity`, as in Postgres. RediSearch doesn't index a
-  HASH whose `NUMERIC` field is `NaN`, so up to v0.0.7 a row holding one was
+  HASH whose `NUMERIC` field is `NaN`, so up to v0.0.8 a row holding one was
   written and never seen again: no index query found it (only `WHERE
   __rowid = N` did), so `SELECT`, `COUNT(*)`, `UPDATE` and `DELETE` skipped
   it, and `DROP TABLE` and `TRUNCATE` left its HASH behind. A NaN is now
@@ -622,7 +622,7 @@ Stop Redis with `docker compose down`.
   - A hash join now matches a NaN with a NaN (it matched it with nothing),
     and `IN` sets and semi-joins look NaNs up by key, as `DISTINCT` and set
     operations did, instead of falling back to comparing values one by one.
-  - **Rows written before:** a row that v0.0.7 or earlier wrote with a NaN
+  - **Rows written before:** a row that v0.0.8 or earlier wrote with a NaN
     in an indexed float column is still not in the index, and its HASH stays
     behind when the table is dropped or truncated. A table has such rows
     when its `COUNT(*)` is less than the number of keys under its
@@ -1260,14 +1260,14 @@ field, even if later rows have it.
     view without an alias is also visible as `schema.table.col` (or
     `redis.schema.table.col`), with its own schema only (`pg_temp` for a
     temporary table): in `select s2.t.v from s1.t`, `s2.t` names no FROM
-    item. Up to v0.0.7 the schema wasn't checked, so that query read
+    item. Up to v0.0.8 the schema wasn't checked, so that query read
     `s1.t`'s `v` (#111). CTEs, derived tables and items with an alias
     aren't visible schema-qualified
   - **Two tables or views with the same name** from different schemas can
     be FROM items together without aliases, as in Postgres: `select s1.t.v,
     s2.t.v from s1.t join s2.t on s1.t.id = s2.t.id`, in any join, `USING`
     and `NATURAL` included, and in `UPDATE … FROM` and `DELETE … USING`. Up
-    to v0.0.7 that was `table name "t" specified more than once; use
+    to v0.0.8 that was `table name "t" specified more than once; use
     aliases`. Any other two items of a level with one name still are: the
     same table twice, or an item and an alias, CTE or derived table of its
     name. A `MERGE` source can't have the target's name even then: `name
@@ -2206,7 +2206,7 @@ field, even if later rows have it.
     Postgres, NaN is greater than every other number and equal to itself,
     in comparisons, `ORDER BY`, `GROUP BY`, `DISTINCT`, joins and
     aggregates, and as text (casts, `||`, JSON) they are `NaN`, `Infinity`
-    and `-Infinity`, which were `NaN`, `+Inf` and `-Inf` up to v0.0.7.
+    and `-Infinity`, which were `NaN`, `+Inf` and `-Inf` up to v0.0.8.
     Arrow results hold the doubles themselves. `NUMERIC` has neither (in
     Postgres it has both): converting one to it fails with `cannot convert
     NaN to NUMERIC(10,2): NUMERIC values can't be NaN or infinite`, and
