@@ -379,7 +379,8 @@ func (it *joinItem) view() *tableMeta {
 }
 
 // joinKey normalizes a value for hash-join equality: values that compare
-// equal (e.g. 1, 1.0 and 1.00) get the same key. NULLs never match.
+// equal (e.g. 1, 1.0 and 1.00) get the same key, and so do NaNs, which are
+// equal to each other as in Postgres. NULLs never match.
 func joinKey(v Value) (string, bool) {
 	if v.Null {
 		return "", false
@@ -401,7 +402,7 @@ func joinKey(v Value) (string, bool) {
 			return "n" + strconv.FormatInt(int64(v.F), 10), true
 		}
 		if math.IsNaN(v.F) {
-			return "", false
+			return "nNaN", true
 		}
 		// Shortest decimal form, matching how NUMERIC values render.
 		return "n" + strconv.FormatFloat(v.F, 'f', -1, 64), true

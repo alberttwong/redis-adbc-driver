@@ -590,9 +590,50 @@ Stop Redis with `docker compose down`.
     NUL byte up to that byte), in the same window in which it may or may
     not see them at all. Earlier versions of the driver don't raise levels
     when they write.
+- **NaNs in the index**: `REAL` and `DOUBLE PRECISION` columns hold `NaN`,
+  `Infinity` and `-Infinity`, as in Postgres. RediSearch doesn't index a
+  HASH whose `NUMERIC` field is `NaN`, so up to v0.0.7 a row holding one was
+  written and never seen again: no index query found it (only `WHERE
+  __rowid = N` did), so `SELECT`, `COUNT(*)`, `UPDATE` and `DELETE` skipped
+  it, and `DROP TABLE` and `TRUNCATE` left its HASH behind. A NaN is now
+  stored as `infinity`, a spelling of +∞ that RediSearch indexes as `+inf`
+  but that is neither what the driver writes for `Infinity` (`+Inf`) nor
+  what RediSearch replies with (`inf`), so it reads back as NaN (as does the
+  `NaN` of earlier versions). Postgres puts NaN above every number,
+  `Infinity` included, and NaN equals NaN; in the index a NaN is `+inf`,
+  which is the right place against every value but `Infinity`. So:
+  - A comparison with a finite number or `-Infinity` runs in the index
+    exactly, as before: `x > 5` finds the NaNs, `x < 5` doesn't. One with
+    `NaN` or `Infinity` gets the inclusive bound `+inf` (`x = 'NaN'` is
+    `@x:[+inf +inf]`) and is re-checked by the driver, as are `IN` lists,
+    index lookup joins and semi-joins with those values. Index queries
+    write infinite bounds as `+inf` and `-inf`: `x = 'NaN'` used to fail
+    with `Syntax error … near NaN`.
+  - Each indexed float column's metadata records whether it may hold a NaN
+    (`nans`). Writes set it as they raise string levels, in the same
+    transaction before the rows are written, and it is never cleared (not
+    even by `DELETE` or `TRUNCATE`). On such a column the driver sorts
+    (`ORDER BY`), groups (`GROUP BY`, `DISTINCT`) and, with
+    `adbc.redis.aggregate_pushdown` `all`, computes `MIN`, `MAX`, `SUM` and
+    `AVG` itself, since the index takes a NaN for `Infinity`; `COUNT(x)`
+    still runs in the index. As with string levels, a statement that read
+    the metadata before another connection's first NaN may sort or
+    aggregate that connection's new NaNs as `Infinity`.
+  - A hash join now matches a NaN with a NaN (it matched it with nothing),
+    and `IN` sets and semi-joins look NaNs up by key, as `DISTINCT` and set
+    operations did, instead of falling back to comparing values one by one.
+  - **Rows written before:** a row that v0.0.7 or earlier wrote with a NaN
+    in an indexed float column is still not in the index, and its HASH stays
+    behind when the table is dropped or truncated. A table has such rows
+    when its `COUNT(*)` is less than the number of keys under its
+    `key_prefix` (`redis-cli --scan --pattern '<prefix>*' | wc -l`, on every
+    primary of a cluster); `FT.INFO <index>` reports them as
+    `hash_indexing_failures` (`Invalid numeric value: 'NaN'`). Writing the
+    row again by its id indexes it: `UPDATE t SET x = 'NaN' WHERE __rowid =
+    N`.
 - **Metadata**, all in one hash slot: `adbc:{meta}:table:<schema>:<table>`
-  (column types, defaults, missing values, string levels, comments and
-  `CHECK` constraints as JSON), `adbc:{meta}:seq:*` (row ids),
+  (column types, defaults, missing values, string levels, NaN flags,
+  comments and `CHECK` constraints as JSON), `adbc:{meta}:seq:*` (row ids),
   `adbc:{meta}:tables:<schema>`, `adbc:{meta}:schemas`, and for views
   `adbc:{meta}:view:<schema>:<view>` (the SELECT text, its columns and comments) and
   `adbc:{meta}:views:<schema>`. Tables and views share one namespace.
@@ -734,12 +775,14 @@ splits or cuts; see "Strings in the index" above), `ORDER BY` on indexed
 columns, `LIMIT/OFFSET`, and aggregates. A constant
 that doesn't fit the column's type exactly (`int_col > 1.5`, `numeric_col =
 1.249`, `date_col < TIMESTAMP '… 12:00:00'`) is pushed as an inclusive bound
-at its rounded value and re-checked by the driver. A `TIMESTAMP WITH TIME
-ZONE` column compared with a local time (text without an offset, a
-`TIMESTAMP` or a `DATE`) is pushed as that local time's instant in the
-session time zone. A `TIMESTAMP` or `DATE` column compared with a timestamp
-with time zone is pushed as the range of local times that can be that
-instant (in a DST gap, 02:30 is the same instant as 03:30) and re-checked.
+at its rounded value and re-checked by the driver, as is a `NaN` or
+`Infinity` compared with a float column (see "NaNs in the index" above). A
+`TIMESTAMP WITH TIME ZONE` column compared with a local time (text without
+an offset, a `TIMESTAMP` or a `DATE`) is pushed as that local time's
+instant in the session time zone. A `TIMESTAMP` or `DATE` column compared
+with a timestamp with time zone is pushed as the range of local times that
+can be that instant (in a DST gap, 02:30 is the same instant as 03:30) and
+re-checked.
 
 Row values always come from the HASHes as stored, never from the index sort
 vectors: `LOAD @c` on a SORTABLE numeric attribute returns the sort vector's
@@ -768,7 +811,8 @@ Aggregate pushdown (`adbc.redis.aggregate_pushdown`):
   otherwise it differs from it after the 12th digit (`SUM` of 1/3 and 1/7
   is 0.47619047619, not 0.47619047619047616), and sums that cancel can lose
   their small values (1e16, 1, -1e16, 3, 1e16, 0.5, -1e16 came back as 4,
-  not 4.5).
+  not 4.5). A float column that may hold a NaN is grouped and reduced by
+  the driver (see "NaNs in the index" above).
 - `none`: always aggregates in the driver.
 
 The other modes compute `SUM` and `AVG` of doubles exactly (see
@@ -2144,6 +2188,18 @@ field, even if later rows have it.
   zone.
   JSON documents are stored in `VARCHAR` columns (`NOINDEX` if they are
   never compared as a whole); `JSON` and `JSONB` are only cast targets
+  - **NaN and the infinities:** `REAL` and `DOUBLE PRECISION` hold `NaN`,
+    `Infinity` and `-Infinity` (read from text in any case, also as `inf`),
+    in every column, indexed or not (see "NaNs in the index"). As in
+    Postgres, NaN is greater than every other number and equal to itself,
+    in comparisons, `ORDER BY`, `GROUP BY`, `DISTINCT`, joins and
+    aggregates, and as text (casts, `||`, JSON) they are `NaN`, `Infinity`
+    and `-Infinity`, which were `NaN`, `+Inf` and `-Inf` up to v0.0.7.
+    Arrow results hold the doubles themselves. `NUMERIC` has neither (in
+    Postgres it has both): converting one to it fails with `cannot convert
+    NaN to NUMERIC(10,2): NUMERIC values can't be NaN or infinite`, and
+    nothing is written. A value beyond `REAL`'s range is an infinity
+    (Postgres raises `value out of range: overflow`)
   - **Fractional seconds:** `TIME(p)` and `TIMESTAMP(p)` hold 0, 3, 6 or 9
     digits, the Arrow units: a `p` of 1 or 2 is 3, 4 or 5 is 6, and 7 or 8
     is 9 (Postgres keeps any `p` up to 6). A value with more digits is

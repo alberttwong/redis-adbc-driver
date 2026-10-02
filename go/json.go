@@ -970,19 +970,10 @@ func writeJSONString(b *strings.Builder, s string) {
 // jsonText is the text of a SQL value inside JSON, as in Postgres: ISO 8601
 // times (2024-01-15T10:30:00.5+00:00, fractions without trailing zeros; a
 // timestamp with time zone in the session time zone z), \x and hex digits
-// for binary values, NaN and Infinity for such doubles, and otherwise the
-// value's text.
+// for binary values, and otherwise the value's text (NaN and Infinity for
+// such doubles).
 func jsonText(v Value, z tzZone) string {
 	switch v.T.Kind {
-	case KindFloat32, KindFloat64:
-		switch {
-		case math.IsNaN(v.F):
-			return "NaN"
-		case math.IsInf(v.F, 1):
-			return "Infinity"
-		case math.IsInf(v.F, -1):
-			return "-Infinity"
-		}
 	case KindTimestamp:
 		return formatTimestamp(v.I, v.T.Unit, v.T.TZ != "", v.offsetIn(z), true)
 	case KindBinary:

@@ -626,9 +626,9 @@ func (v Value) textIn(z tzZone) string {
 	case KindInt16, KindInt32, KindInt64:
 		return strconv.FormatInt(v.I, 10)
 	case KindFloat32:
-		return strconv.FormatFloat(v.F, 'g', -1, 32)
+		return floatText(v.F, 32)
 	case KindFloat64:
-		return strconv.FormatFloat(v.F, 'g', -1, 64)
+		return floatText(v.F, 64)
 	case KindDecimal:
 		return formatDecimal(v.D, v.T.Scale)
 	case KindString:
@@ -648,6 +648,21 @@ func (v Value) textIn(z tzZone) string {
 		return formatInterval(v)
 	}
 	return ""
+}
+
+// floatText renders a REAL (bits 32) or DOUBLE PRECISION (bits 64) value as
+// Postgres's float4out / float8out do: NaN, Infinity and -Infinity, and
+// otherwise the shortest form that reads back as the value.
+func floatText(f float64, bits int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	return strconv.FormatFloat(f, 'g', -1, bits)
 }
 
 // offsetIn is the offset (seconds east of UTC) a timestamp with time zone
@@ -761,7 +776,7 @@ func coerceIn(v Value, t ColType, z tzZone) (Value, error) {
 			d, scale = v.D, v.T.Scale
 		case v.T.Kind.isFloat():
 			if math.IsNaN(v.F) || math.IsInf(v.F, 0) {
-				return fail()
+				return Value{}, numericSpecialError(v.F, t)
 			}
 			var err error
 			d, scale, err = parseDecimal(strconv.FormatFloat(v.F, 'f', -1, 64))
@@ -890,6 +905,13 @@ func castable(from, to ColType) bool {
 	return f == to.Kind // BINARY, INTERVAL
 }
 
+// numericSpecialError is the error for a NaN or an infinity (f) converted to
+// NUMERIC type t. NUMERIC values are fixed-point decimals here, which
+// Postgres's numeric NaN and ±Infinity don't fit.
+func numericSpecialError(f float64, t ColType) error {
+	return fmt.Errorf("cannot convert %s to %s: NUMERIC values can't be NaN or infinite", floatText(f, 64), t.SQLName())
+}
+
 // parseString converts text into a value of the given type.
 func parseString(s string, t ColType) (Value, error) { return parseStringIn(s, t, utcZone) }
 
@@ -919,6 +941,12 @@ func parseStringIn(s string, t ColType, z tzZone) (Value, error) {
 			return floatValue(typeFloat64, f), nil
 		}
 	case KindDecimal:
+		// 'NaN', 'Infinity', 'inf', … (each has an n).
+		if strings.ContainsAny(trimmed, "nN") {
+			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && (math.IsNaN(f) || math.IsInf(f, 0)) {
+				return Value{}, numericSpecialError(f, t)
+			}
+		}
 		return numberLiteral(trimmed)
 	case KindDate:
 		if len(trimmed) > 10 {
@@ -946,15 +974,21 @@ func parseStringIn(s string, t ColType, z tzZone) (Value, error) {
 // ---- storage encoding ----
 
 // encodeStored renders a value (already coerced to its column type) as the
-// string stored in the row HASH.
+// string stored in the row HASH. A NaN is nanStored, which the index holds
+// as +Infinity (see nan.go).
 func encodeStored(v Value) string {
 	switch v.T.Kind {
 	case KindBool, KindInt16, KindInt32, KindInt64, KindDate, KindTime, KindTimestamp:
 		return strconv.FormatInt(v.I, 10)
-	case KindFloat32:
-		return strconv.FormatFloat(v.F, 'g', -1, 32)
-	case KindFloat64:
-		return strconv.FormatFloat(v.F, 'g', -1, 64)
+	case KindFloat32, KindFloat64:
+		if math.IsNaN(v.F) {
+			return nanStored
+		}
+		bits := 64
+		if v.T.Kind == KindFloat32 {
+			bits = 32
+		}
+		return strconv.FormatFloat(v.F, 'g', -1, bits)
 	case KindDecimal:
 		return formatDecimal(v.D, v.T.Scale)
 	case KindInterval:
@@ -964,8 +998,12 @@ func encodeStored(v Value) string {
 	}
 }
 
-// decodeStored parses a string loaded from a row HASH.
+// decodeStored parses a string loaded from a row HASH. A float's nanStored
+// is NaN, and so is the "NaN" of earlier versions.
 func decodeStored(s string, t ColType) (Value, error) {
+	if s == nanStored && t.Kind.isFloat() {
+		return floatValue(t, math.NaN()), nil
+	}
 	switch t.Kind {
 	case KindBool, KindInt16, KindInt32, KindInt64, KindDate, KindTime, KindTimestamp:
 		i, err := strconv.ParseInt(s, 10, 64)

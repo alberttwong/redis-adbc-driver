@@ -1443,9 +1443,10 @@ func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChan
 
 // writeUpdates applies row changes to a table with pipelined HSET / HDEL.
 // The index follows the HASHes by itself, once the levels of the strings
-// written are recorded (see tags.go). Like every write, it is refused
-// while a re-key moves the table's rows (see checkWritable in rekey.go),
-// and it checks the table's keys between pipelines as writeRows does.
+// written and the columns that get a NaN are recorded (see tags.go and
+// nan.go). Like every write, it is refused while a re-key moves the
+// table's rows (see checkWritable in rekey.go), and it checks the table's
+// keys between pipelines as writeRows does.
 func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []rowChange) error {
 	if len(changes) == 0 {
 		return nil
@@ -1453,7 +1454,7 @@ func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []
 	if err := e.store.checkWritable(ctx, meta); err != nil {
 		return err
 	}
-	if err := e.store.raiseTagLevels(ctx, meta, changeTagLevels(meta, changes)); err != nil {
+	if err := e.store.raiseNeeds(ctx, meta, changeNeeds(meta, changes)); err != nil {
 		return err
 	}
 	for start := 0; start < len(changes); start += pipelineChunk {

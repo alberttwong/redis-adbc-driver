@@ -133,10 +133,7 @@ func rowKey(row []Value) string {
 			b.WriteString("N\x00")
 			continue
 		}
-		k, ok := joinKey(v)
-		if !ok {
-			k = "?" + v.Text() // NaN
-		}
+		k, _ := joinKey(v)
 		b.WriteString("V")
 		b.WriteString(k)
 		b.WriteByte(0)

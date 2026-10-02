@@ -38,8 +38,9 @@ package redis
 // sorting vector either (tagsTruncated: a value with a NUL byte). Statements
 // that write values (INSERT, UPDATE, MERGE, bulk ingest, ADD COLUMN …
 // DEFAULT) raise the level the values need in a metadata transaction that
-// commits before the rows are written, and the level never goes down, not
-// even when the rows are deleted. Then:
+// commits before the rows are written (which also records the float columns
+// that get a NaN, see nan.go), and the level never goes down, not even when
+// the rows are deleted. Then:
 //
 //   - On a column held exactly, `c = 'v'` is the TAG query @c:{v}, which
 //     answers it exactly, so COUNT, aggregates and LIMIT can still run in
@@ -85,6 +86,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -203,10 +205,17 @@ func (c columnMeta) tagLevel() string {
 func (c columnMeta) tagsExact() bool { return c.tagLevel() == "" }
 
 // sortsExactly reports whether the index's sorting vector holds the values
-// of an indexed column as stored: those of a string column may be cut at a
-// NUL byte.
+// of an indexed column as stored, in SQL's order: those of a string column
+// may be cut at a NUL byte, and a float column that may hold a NaN holds it
+// as +Infinity (see nan.go).
 func (c columnMeta) sortsExactly() bool {
-	return c.Type.Kind != KindString || tagRank(c.tagLevel()) < tagRank(tagsTruncated)
+	switch {
+	case c.Type.Kind == KindString:
+		return tagRank(c.tagLevel()) < tagRank(tagsTruncated)
+	case c.Type.Kind.isFloat():
+		return !c.NaNs
+	}
+	return true
 }
 
 // initTags records that a new indexed string column has no values yet.
@@ -218,23 +227,51 @@ func (c *columnMeta) initTags() {
 
 // ---- raising levels ----
 
-// rowTagLevels returns the levels that rows to be written (values ordered
-// like meta.Columns) need for meta's indexed string columns, by field, where
-// they are above the recorded ones.
-func rowTagLevels(meta *tableMeta, rows [][]Value) map[string]string {
-	var need map[string]string
+// valueNeeds is what values about to be written need recorded in their
+// table's metadata first, by field: the levels of indexed string columns
+// that are above the recorded ones, and the indexed float columns that get
+// a NaN and don't have NaNs set yet (see nan.go).
+type valueNeeds struct {
+	levels map[string]string
+	nans   map[string]bool
+}
+
+func (n *valueNeeds) level(field, l string) {
+	if n.levels == nil {
+		n.levels = map[string]string{}
+	}
+	n.levels[field] = l
+}
+
+func (n *valueNeeds) nan(field string) {
+	if n.nans == nil {
+		n.nans = map[string]bool{}
+	}
+	n.nans[field] = true
+}
+
+// rowNeeds returns what rows to be written (values ordered like
+// meta.Columns) need recorded for meta's indexed columns.
+func rowNeeds(meta *tableMeta, rows [][]Value) valueNeeds {
+	var need valueNeeds
 	for i, c := range meta.Columns {
-		if !c.Indexed || c.Type.Kind != KindString {
-			continue
-		}
-		have := tagRank(c.TagValues)
-		for _, row := range rows {
-			if v := row[i]; !v.Null {
-				if l := tagLevelOf(v.S); tagRank(l) > have {
-					if need == nil {
-						need = map[string]string{}
+		switch {
+		case !c.Indexed:
+		case c.Type.Kind == KindString:
+			have := tagRank(c.TagValues)
+			for _, row := range rows {
+				if v := row[i]; !v.Null {
+					if l := tagLevelOf(v.S); tagRank(l) > have {
+						need.level(c.field(), l)
+						have = tagRank(l)
 					}
-					need[c.field()], have = l, tagRank(l)
+				}
+			}
+		case c.Type.Kind.isFloat() && !c.NaNs:
+			for _, row := range rows {
+				if v := row[i]; !v.Null && math.IsNaN(v.F) {
+					need.nan(c.field())
+					break
 				}
 			}
 		}
@@ -242,47 +279,54 @@ func rowTagLevels(meta *tableMeta, rows [][]Value) map[string]string {
 	return need
 }
 
-// changeTagLevels is rowTagLevels for row changes.
-func changeTagLevels(meta *tableMeta, changes []rowChange) map[string]string {
+// changeNeeds is rowNeeds for row changes, whose values are encoded.
+func changeNeeds(meta *tableMeta, changes []rowChange) valueNeeds {
 	have := map[string]int{}
+	noNaNs := map[string]bool{}
 	for _, c := range meta.Columns {
-		if c.Indexed && c.Type.Kind == KindString {
+		switch {
+		case !c.Indexed:
+		case c.Type.Kind == KindString:
 			have[c.field()] = tagRank(c.TagValues)
+		case c.Type.Kind.isFloat() && !c.NaNs:
+			noNaNs[c.field()] = true
 		}
 	}
-	var need map[string]string
+	var need valueNeeds
 	for _, ch := range changes {
 		for i := 0; i+1 < len(ch.set); i += 2 {
 			f, _ := ch.set[i].(string)
-			r, ok := have[f]
-			if !ok {
-				continue
-			}
 			v, _ := ch.set[i+1].(string)
-			if l := tagLevelOf(v); tagRank(l) > r {
-				if need == nil {
-					need = map[string]string{}
+			if r, ok := have[f]; ok {
+				if l := tagLevelOf(v); tagRank(l) > r {
+					need.level(f, l)
+					have[f] = tagRank(l)
 				}
-				need[f], have[f] = l, tagRank(l)
+			} else if noNaNs[f] && v == nanStored {
+				need.nan(f)
+				delete(noNaNs, f)
 			}
 		}
 	}
 	return need
 }
 
-// raiseTagLevels records the levels values about to be written need (from
-// rowTagLevels or changeTagLevels) in the table's metadata. meta keeps the
-// levels it was read with, so each batch a statement writes is compared with
-// those: the table may have been replaced in between.
-func (s *store) raiseTagLevels(ctx context.Context, meta *tableMeta, need map[string]string) error {
-	if len(need) == 0 {
+// raiseNeeds records what values about to be written need (from rowNeeds or
+// changeNeeds) in the table's metadata, in one transaction. meta keeps the
+// levels and NaNs it was read with, so each batch a statement writes is
+// compared with those: the table may have been replaced in between.
+func (s *store) raiseNeeds(ctx context.Context, meta *tableMeta, need valueNeeds) error {
+	if len(need.levels) == 0 && len(need.nans) == 0 {
 		return nil
 	}
 	return s.updateTable(ctx, meta.Schema, meta.Name, func(m *tableMeta) error {
 		for i := range m.Columns {
 			c := &m.Columns[i]
-			if l, ok := need[c.field()]; ok && tagRank(l) > tagRank(c.TagValues) {
+			if l, ok := need.levels[c.field()]; ok && tagRank(l) > tagRank(c.TagValues) {
 				c.TagValues = l
+			}
+			if need.nans[c.field()] && c.Type.Kind.isFloat() {
+				c.NaNs = true
 			}
 		}
 		return nil

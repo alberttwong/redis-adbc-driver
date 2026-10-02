@@ -54,10 +54,10 @@ var subqueryStats struct {
 type eqClass uint8
 
 const (
-	clsNone        eqClass = iota // no key: NaN, or a kind not listed here
+	clsNone        eqClass = iota // no key: a kind not listed here
 	clsNum                        // integers and decimals, compared exactly
 	clsBool                       // compared with integers and decimals as 0/1
-	clsFloat                      // floats other than NaN
+	clsFloat                      // floats (NaNs are equal)
 	clsStr                        // strings and binary, compared bytewise
 	clsInterval                   // compared by total length
 	clsDate                       // compared by day
@@ -102,10 +102,7 @@ func eqKey(v Value) (eqClass, string) {
 	if c == clsNone {
 		return c, ""
 	}
-	k, ok := joinKey(v)
-	if !ok {
-		return clsNone, "" // NaN
-	}
+	k, _ := joinKey(v)
 	return c, k
 }
 
@@ -309,7 +306,7 @@ func sameEqClass(a, b ColType) bool {
 }
 
 // semiKey returns the key of a non-NULL key value expected to be of type t;
-// ok is false when the value is of another class or has no key (NaN).
+// ok is false when the value is of another class.
 func semiKey(v Value, t ColType) (string, bool) {
 	if !sameEqClass(v.T, t) {
 		return "", false

@@ -146,7 +146,8 @@ func comparison(c Expr) (*ColumnRef, string, Expr, bool) {
 // planWhere pushes down every predicate the index can answer: ranges on
 // NUMERIC columns and equality on TAG (string) columns. Predicates the index
 // may answer inexactly (double rounding of large integers, strings the TAG
-// index doesn't hold exactly) are pushed down inclusively and also kept in
+// index doesn't hold exactly, a float compared with NaN or +Infinity, which
+// the index doesn't tell apart) are pushed down inclusively and also kept in
 // the residual, as are predicates widened to the rows that read a column's
 // missing value (widenMissing).
 func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, params []Value) (wherePlan, error) {
@@ -277,13 +278,16 @@ func (e *executor) planWhere(ctx context.Context, where Expr, meta *tableMeta, p
 				addResidual(c)
 				continue
 			}
-			bound := encodeStored(v)
+			bound := numericBound(v)
 			exact := true
 			switch ct.Kind {
 			case KindInt64, KindTime, KindTimestamp:
 				exact = v.I > -exactDoubleLimit && v.I < exactDoubleLimit
 			case KindDecimal:
 				exact = ct.Precision <= 15
+			case KindFloat32, KindFloat64:
+				// NaN and +Infinity are both +inf in the index (see nan.go).
+				exact = bound != "+inf"
 			}
 			// A constant that doesn't fit the column type (1.5 for an
 			// integer, 1.249 for NUMERIC(6,2), a timestamp with a time of
@@ -609,7 +613,8 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 		}
 		col, ok := meta.column(c.Name)
 		// Rows that read a missing value have no index entry to sort on,
-		// and strings cut at a NUL byte sort on what is left.
+		// strings cut at a NUL byte sort on what is left, and NaNs tie with
+		// +Infinity.
 		if !ok || !col.Indexed || col.MissingThrough > 0 || !col.sortsExactly() {
 			indexSort = false
 			break
@@ -863,11 +868,12 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		}
 		col, ok := meta.column(c.Name)
 		// The index doesn't see the missing values of rows without a field,
-		// and groups strings cut at a NUL byte by what is left.
+		// groups strings cut at a NUL byte by what is left, and NaNs with
+		// +Infinity.
 		if !ok || !col.Indexed || !simpleName(col.field()) || col.MissingThrough > 0 || !col.sortsExactly() {
 			return nil, false, nil
 		}
-		if !(col.Type.Kind == KindString || pushableKind(col.Type.Kind, e.pushdown)) {
+		if !(col.Type.Kind == KindString || col.pushable(e.pushdown)) {
 			return nil, false, nil
 		}
 		groupCols = append(groupCols, col)
@@ -926,7 +932,7 @@ func (e *executor) indexAggregate(ctx context.Context, plan *selectPlan, wp wher
 		if !ok || !col.Indexed || !simpleName(col.field()) || col.Name == rowIDField || col.MissingThrough > 0 {
 			return nil, false, nil
 		}
-		if f.Name != "COUNT" && !pushableKind(col.Type.Kind, e.pushdown) {
+		if f.Name != "COUNT" && !col.pushable(e.pushdown) {
 			return nil, false, nil
 		}
 		if (f.Name == "BOOL_OR" || f.Name == "BOOL_AND" || f.Name == "EVERY") && col.Type.Kind != KindBool {
@@ -1355,7 +1361,7 @@ func unionQuery(cm columnMeta, values []Value, z tzZone) (string, bool) {
 			}
 			parts = append(parts, lit)
 		} else if cm.Type.Kind.indexedAsNumeric() {
-			b := encodeStored(cv)
+			b := numericBound(cv) // +inf for NaN and +Infinity (see nan.go)
 			parts = append(parts, fmt.Sprintf("@%s:[%s %s]", cm.field(), b, b))
 		} else {
 			return "", false

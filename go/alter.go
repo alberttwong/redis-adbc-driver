@@ -507,6 +507,7 @@ func (e *executor) alterAddColumn(ctx context.Context, m *tableMeta, cmd AlterCm
 	if col.TagsChecked {
 		col.TagValues = tagLevelOf(col.Missing)
 	}
+	col.NaNs = col.Indexed && col.Type.Kind.isFloat() && col.Missing == nanStored
 	m.Columns = append(m.Columns, col)
 	res.added = append(res.added, addedColumn{col, missing})
 	res.log("add %q field %q type %s indexed %v missing %v %q default %q", col.Name, col.field(), col.Type.SQLName(), col.Indexed, missing, col.Missing, col.Default)
