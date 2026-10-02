@@ -298,7 +298,7 @@ func TestSQLSubqueries(t *testing.T) {
 	h.expectRows(`SELECT id FROM it_orders WHERE amount > (SELECT AVG(amount) FROM it_orders) ORDER BY id`, "2", "4")
 	h.expectRows(`SELECT (SELECT MAX(qty) FROM it_orders) AS m`, "10")
 	h.expectRows(`SELECT (SELECT id FROM it_orders WHERE id = 99)`, "NULL")
-	h.expectError(`SELECT (SELECT id FROM it_orders)`, "returned 6 rows")
+	h.expectError(`SELECT (SELECT id FROM it_orders)`, "more than one row returned by a subquery used as an expression")
 	h.expectError(`SELECT id FROM it_orders WHERE id IN (SELECT id, qty FROM it_orders)`, "subquery has too many columns")
 
 	// IN / NOT IN with subqueries, including SQL NULL semantics.
@@ -338,6 +338,35 @@ func TestSQLSubqueries(t *testing.T) {
 		ORDER BY name`,
 		"Ada", "Bo")
 	h.expectError(`SELECT id FROM it_orders WHERE nope.id = 1`, `missing FROM-clause entry for table "nope"`)
+}
+
+// A scalar subquery that returns more than one row is an error wherever it
+// is used, with Postgres 16's status and message.
+func TestSQLScalarSubqueryRows(t *testing.T) {
+	h := newSQLHarness(t)
+	h.exec("DROP TABLE IF EXISTS it_ssq")
+	h.exec("CREATE TABLE it_ssq (id INTEGER, v INTEGER)")
+	h.t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_ssq") })
+	h.exec("INSERT INTO it_ssq VALUES (1, 10), (2, 10), (3, 20)")
+
+	const msg = "more than one row returned by a subquery used as an expression"
+	for _, sql := range []string{
+		`SELECT (SELECT x.id FROM it_ssq x) FROM it_ssq`,
+		`SELECT id FROM it_ssq WHERE id > (SELECT x.id FROM it_ssq x)`,
+		// Correlated: two rows have v = 10.
+		`SELECT (SELECT x.id FROM it_ssq x WHERE x.v = it_ssq.v) FROM it_ssq`,
+		`SELECT v FROM it_ssq GROUP BY v HAVING v > (SELECT x.v FROM it_ssq x)`,
+		`SELECT id FROM it_ssq ORDER BY (SELECT x.id FROM it_ssq x)`,
+		`SELECT COALESCE((SELECT x.id FROM it_ssq x), 0)`,
+		`UPDATE it_ssq SET v = (SELECT x.v FROM it_ssq x) WHERE id = 1`,
+		`INSERT INTO it_ssq VALUES ((SELECT x.id FROM it_ssq x), 0)`,
+	} {
+		h.expectQueryError(sql, adbc.StatusInvalidArgument, msg)
+	}
+	h.expectRows(`SELECT id, v FROM it_ssq ORDER BY id`, "1|10", "2|10", "3|20")
+	// One row is its value, and no row is NULL.
+	h.expectRows(`SELECT id, (SELECT x.id FROM it_ssq x WHERE x.v = it_ssq.v) FROM it_ssq WHERE v = 20`, "3|3")
+	h.expectRows(`SELECT (SELECT x.id FROM it_ssq x WHERE x.id > 5)`, "NULL")
 }
 
 func TestSQLDerivedTablesAndCTEs(t *testing.T) {
