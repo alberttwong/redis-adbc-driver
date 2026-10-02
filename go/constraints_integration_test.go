@@ -663,9 +663,7 @@ func TestSQLCheckLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.exec(`ALTER TABLE it_chk_life2 RENAME TO it_chk_life3`)
-	if prefix, _ := h.tableNames(raw, "public", "it_chk_life3"); prefix != "public:it_chk_life3:" {
-		t.Errorf("a re-keying rename left the rows under %q", prefix)
-	}
+	h.namesN(raw, "public", "it_chk_life3", "it_chk_life3") // the new name's keys
 	h.expectChecks(raw, "it_chk_life3", checks[0], checks[3])
 	h.expectError(`INSERT INTO it_chk_life3 VALUES (5, -1, 100, 1)`, `new row for relation "it_chk_life3" violates check constraint "it_chk_life_amount_check"`)
 	h.expectError(`UPDATE it_chk_life3 SET ident = -1`, `violates check constraint "it_chk_life_id_check"`)

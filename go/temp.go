@@ -118,6 +118,38 @@ type tempSpace struct {
 	objects map[string]bool
 	stop    context.CancelFunc
 	done    chan struct{}
+	// Key prefixes, which are never reused (see claimNames): lastNames is
+	// the last N handed out per table name (plain prefix), and used holds
+	// every prefix handed out. Only this connection creates tables in its
+	// schema, and releases aren't counted in adbc:{meta}:released.
+	lastNames map[string]int64
+	used      map[string]bool
+}
+
+func (s *store) tempLastNames(base string) int64 {
+	s.temp.mu.Lock()
+	defer s.temp.mu.Unlock()
+	return s.temp.lastNames[base]
+}
+
+func (s *store) tempUsedPrefix(prefix string) bool {
+	s.temp.mu.Lock()
+	defer s.temp.mu.Unlock()
+	return s.temp.used[prefix]
+}
+
+// noteTempNames records names reserved in a temporary schema.
+func (s *store) noteTempNames(nm tableNames) {
+	if !nm.temp {
+		return
+	}
+	s.temp.mu.Lock()
+	defer s.temp.mu.Unlock()
+	if s.temp.lastNames == nil {
+		s.temp.lastNames, s.temp.used = map[string]int64{}, map[string]bool{}
+	}
+	s.temp.lastNames[nm.base] = max(s.temp.lastNames[nm.base], nm.n)
+	s.temp.used[nm.prefix] = true
 }
 
 // tempSchema returns the connection's temporary schema, or pg_temp (which

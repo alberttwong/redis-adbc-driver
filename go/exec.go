@@ -1431,7 +1431,8 @@ func newRowChange(meta *tableMeta, key string, cols []int, vals []Value) rowChan
 // writeUpdates applies row changes to a table with pipelined HSET / HDEL.
 // The index follows the HASHes by itself, once the levels of the strings
 // written are recorded (see tags.go). Like every write, it is refused
-// while a re-key moves the table's rows (see checkWritable in rekey.go).
+// while a re-key moves the table's rows (see checkWritable in rekey.go),
+// and it checks the table's keys between pipelines as writeRows does.
 func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []rowChange) error {
 	if len(changes) == 0 {
 		return nil
@@ -1443,10 +1444,17 @@ func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []
 		return err
 	}
 	for start := 0; start < len(changes); start += pipelineChunk {
+		if start > 0 {
+			if err := e.store.checkWritten(ctx, meta); err != nil {
+				return err
+			}
+		}
 		end := min(start+pipelineChunk, len(changes))
 		pipe := e.store.client.Pipeline()
 		for _, ch := range changes[start:end] {
 			if len(ch.set) > 0 {
+				// An HSET on a row the table's DROP deleted makes a new key.
+				meta.wrote.keys = append(meta.wrote.keys, ch.key)
 				pipe.HSet(ctx, ch.key, ch.set...)
 			}
 			if len(ch.del) > 0 {
@@ -1456,6 +1464,9 @@ func (e *executor) writeUpdates(ctx context.Context, meta *tableMeta, changes []
 		if _, err := pipe.Exec(ctx); err != nil {
 			return wrapRedis(err, "failed to update rows")
 		}
+	}
+	if len(changes) > pipelineChunk {
+		return e.store.checkKeys(ctx, meta, true)
 	}
 	return e.store.checkWritten(ctx, meta)
 }

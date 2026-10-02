@@ -107,13 +107,18 @@ func TestSQLRekeyDbtPattern(t *testing.T) {
 
 	h.exec(`CREATE TABLE it_rk_model (id INTEGER, label VARCHAR)`)
 	h.exec(`INSERT INTO it_rk_model VALUES (100, 'old')`)
+	// Key prefixes are never reused, so each run's names take a new ~N.
+	seen := map[string]bool{}
+	lastTmp, last := int64(0), h.namesN(raw, "public", "it_rk_model", "it_rk_model")
 	for run := 1; run <= 2; run++ {
 		h.exec(`CREATE TABLE it_rk_model__dbt_tmp (id INTEGER NOT NULL, label VARCHAR, amount NUMERIC(10,2), blob VARBINARY, note VARCHAR NOINDEX)`)
 		h.exec(fmt.Sprintf(`INSERT INTO it_rk_model__dbt_tmp VALUES
 			(1, 'a', 1.50, X'00ff', 'n1'), (2, 'b', NULL, NULL, NULL), (3, 'c', 3.25, X'01', 'n3'), (4, NULL, -4.00, NULL, 'run %d')`, run))
 		tmpPrefix, tmpIndex := h.tableNames(raw, "public", "it_rk_model__dbt_tmp")
-		if tmpPrefix != "public:it_rk_model__dbt_tmp:" || tmpIndex != "idx:public:it_rk_model__dbt_tmp" {
-			t.Fatalf("run %d: tmp table names %q, %q", run, tmpPrefix, tmpIndex)
+		if n := h.namesN(raw, "public", "it_rk_model__dbt_tmp", "it_rk_model__dbt_tmp"); n <= lastTmp || seen[tmpPrefix] {
+			t.Fatalf("run %d: tmp table names %q, %q were used before", run, tmpPrefix, tmpIndex)
+		} else {
+			lastTmp, seen[tmpPrefix] = n, true
 		}
 		h.exec(`DROP TABLE it_rk_model`)
 		h.exec(`ALTER TABLE it_rk_model__dbt_tmp RENAME TO it_rk_model`)
@@ -121,8 +126,10 @@ func TestSQLRekeyDbtPattern(t *testing.T) {
 		// The rows and the index carry the new name, and nothing is left
 		// under the old one, on every run.
 		prefix, index := h.tableNames(raw, "public", "it_rk_model")
-		if prefix != "public:it_rk_model:" || index != "idx:public:it_rk_model" {
-			t.Fatalf("run %d: renamed table names %q, %q", run, prefix, index)
+		if n := h.namesN(raw, "public", "it_rk_model", "it_rk_model"); n <= last || seen[prefix] {
+			t.Fatalf("run %d: renamed table names %q, %q were used before", run, prefix, index)
+		} else {
+			last, seen[prefix] = n, true
 		}
 		if n := h.prefixKeyCount(raw, prefix); n != 4 {
 			t.Errorf("run %d: %d keys under %q, want 4", run, n, prefix)
@@ -172,9 +179,10 @@ func TestSQLRekeyDbtPattern(t *testing.T) {
 	h.expectError(`ALTER TABLE it_rk_model RENAME TO it_rk_model__dbt_tmp`, "already exists")
 	h.expectError(`ALTER TABLE it_rk_model RENAME TO it_rk_view`, "already exists as a view")
 	h.expectError(`ALTER TABLE it_rk_model RENAME TO secondary.x`, "another schema")
+	before, _ := h.tableNames(raw, "public", "it_rk_model")
 	h.exec(`ALTER TABLE it_rk_model RENAME TO it_rk_model`)
-	if prefix, _ := h.tableNames(raw, "public", "it_rk_model"); prefix != "public:it_rk_model:" {
-		t.Errorf("renaming to the same name moved the rows to %q", prefix)
+	if prefix, _ := h.tableNames(raw, "public", "it_rk_model"); prefix != before {
+		t.Errorf("renaming to the same name moved the rows from %q to %q", before, prefix)
 	}
 }
 
@@ -191,11 +199,14 @@ func TestSQLRekeyManyPages(t *testing.T) {
 	if err := h.ingest("it_rk_pages", adbc.OptionValueIngestModeCreate, false, ids...); err != nil {
 		t.Fatal(err)
 	}
+	oldPrefix, oldIndex := h.tableNames(raw, "public", "it_rk_pages")
 	h.exec(`ALTER TABLE it_rk_pages RENAME TO it_rk_pages2`)
-	if got := h.prefixKeyCount(raw, "public:it_rk_pages2:"); got != n {
+	h.namesN(raw, "public", "it_rk_pages2", "it_rk_pages2")
+	newPrefix, _ := h.tableNames(raw, "public", "it_rk_pages2")
+	if got := h.prefixKeyCount(raw, newPrefix); got != n {
 		t.Errorf("%d keys under the new prefix, want %d", got, n)
 	}
-	h.expectReleased(raw, "public:it_rk_pages:", "idx:public:it_rk_pages")
+	h.expectReleased(raw, oldPrefix, oldIndex)
 	h.expectRows(`SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM it_rk_pages2`,
 		fmt.Sprintf("%d|%d|1|%d", n, n*(n+1)/2, n))
 	h.expectRows(fmt.Sprintf(`SELECT id FROM it_rk_pages2 ORDER BY id LIMIT 2 OFFSET %d`, cursorCount-1),
@@ -222,10 +233,11 @@ func TestSQLRekeyDefaultOff(t *testing.T) {
 	}
 	h.exec(`CREATE TABLE it_rk_off (id INTEGER)`)
 	h.exec(`INSERT INTO it_rk_off VALUES (1), (2)`)
+	oldPrefix, oldIndex := h.tableNames(raw, "public", "it_rk_off")
 	h.exec(`ALTER TABLE it_rk_off RENAME TO it_rk_off2`)
 	prefix, index := h.tableNames(raw, "public", "it_rk_off2")
-	if prefix != "public:it_rk_off:" || index != "idx:public:it_rk_off" {
-		t.Errorf("names after a plain rename: %q, %q", prefix, index)
+	if prefix != oldPrefix || index != oldIndex {
+		t.Errorf("names after a plain rename: %q, %q, want %q, %q", prefix, index, oldPrefix, oldIndex)
 	}
 	if got := h.prefixKeyCount(raw, prefix); got != 2 {
 		t.Errorf("%d keys under %q, want 2", got, prefix)
@@ -248,9 +260,8 @@ func TestSQLRekeyConnectionOption(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.exec(`ALTER TABLE it_rk_conn RENAME TO it_rk_conn2`)
-	if prefix, _ := h.tableNames(raw, "public", "it_rk_conn2"); prefix != "public:it_rk_conn2:" {
-		t.Errorf("connection option on: prefix %q", prefix)
-	}
+	h.namesN(raw, "public", "it_rk_conn2", "it_rk_conn2")
+	movedPrefix, _ := h.tableNames(raw, "public", "it_rk_conn2")
 
 	// Another connection of a database with the option on, turned off.
 	other := newRekeyHarness(t, map[string]string{OptionStringRenameRekey: "true"})
@@ -258,8 +269,8 @@ func TestSQLRekeyConnectionOption(t *testing.T) {
 		t.Fatal(err)
 	}
 	other.exec(`ALTER TABLE it_rk_conn2 RENAME TO it_rk_conn3`)
-	if prefix, _ := h.tableNames(raw, "public", "it_rk_conn3"); prefix != "public:it_rk_conn2:" {
-		t.Errorf("connection option off: prefix %q", prefix)
+	if prefix, _ := h.tableNames(raw, "public", "it_rk_conn3"); prefix != movedPrefix {
+		t.Errorf("connection option off: prefix %q, want %q", prefix, movedPrefix)
 	}
 	other.expectRows(`SELECT COUNT(*) FROM it_rk_conn3`, "3")
 
@@ -287,6 +298,12 @@ func TestSQLRekeyTempTable(t *testing.T) {
 	h.expectRows(`SELECT id, label FROM it_rk_tmp2 WHERE label = 'b'`, "2|b")
 	h.expectRows(`SELECT table_schema, table_type, key_prefix FROM information_schema.tables WHERE table_name = 'it_rk_tmp2'`,
 		"pg_temp|LOCAL TEMPORARY|"+prefix)
+	// Moving it back takes new names: the old ones are never reused.
+	h.exec(`ALTER TABLE it_rk_tmp2 RENAME TO it_rk_tmp`)
+	if n := h.namesN(raw, schema, "it_rk_tmp", "it_rk_tmp"); n != 2 {
+		t.Errorf("temporary table moved back to the names of N = %d, want 2", n)
+	}
+	h.expectRows(`SELECT id, label FROM it_rk_tmp ORDER BY id`, "1|a", "2|b")
 }
 
 // Every field is copied, including __rowid and the fields of dropped
@@ -352,6 +369,20 @@ func TestSQLRekeyResumes(t *testing.T) {
 	h.exec(`INSERT INTO it_rk_res VALUES (1, 'a'), (2, 'b'), (3, 'c')`)
 	oldPrefix, oldIndex := h.tableNames(raw, "public", "it_rk_res")
 
+	// The names that a move took are released when it is rolled back, but
+	// never handed out again.
+	used := map[string]bool{}
+	newNames := func(job *rekeyJob) {
+		t.Helper()
+		if used[job.KeyPrefix] || used[job.IndexName] {
+			t.Errorf("new names %q, %q were used by an earlier move", job.KeyPrefix, job.IndexName)
+		}
+		used[job.KeyPrefix], used[job.IndexName] = true, true
+		if !strings.HasPrefix(job.KeyPrefix, "public:it_rk_res2") || !strings.HasPrefix(job.IndexName, "idx:public:it_rk_res2") {
+			t.Errorf("new names %q, %q", job.KeyPrefix, job.IndexName)
+		}
+	}
+
 	// stop copies the rows and switches if asked, then stops as if the
 	// process had exited: the lease goes, the rest is left over.
 	stop := func(switched bool) *rekeyJob {
@@ -360,9 +391,7 @@ func TestSQLRekeyResumes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if job.KeyPrefix != "public:it_rk_res2:" || job.IndexName != "idx:public:it_rk_res2" {
-			t.Errorf("new names %q, %q: not released by an earlier rollback?", job.KeyPrefix, job.IndexName)
-		}
+		newNames(job)
 		if err := st.moveRows(h.ctx, job, start, time.Now()); err != nil {
 			t.Fatal(err)
 		}
@@ -392,6 +421,7 @@ func TestSQLRekeyResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	newNames(job)
 	if err := st.moveRows(h.ctx, job, start, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -524,15 +554,20 @@ func TestSQLRekeyConcurrentStatements(t *testing.T) {
 	// failed delete only removed an old key.
 	h.expectRows(`SELECT id FROM it_rk_conc2 ORDER BY id`, "1", "2", "3", "3", "3")
 
-	// A new table that takes the released prefix doesn't fool statements
-	// with the old metadata, and its own statements pass.
+	// A new table of the old name gets new keys (prefixes are never reused).
+	// Statements with the old metadata fail, also fast ones, which find a
+	// different table when they allocate row ids; its own statements pass.
 	h.exec(`CREATE TABLE it_rk_conc (id INTEGER)`)
 	reused := load("it_rk_conc")
-	if reused.prefix() != stale.prefix() || reused.PrefixGen != stale.PrefixGen+1 {
+	if reused.prefix() == stale.prefix() || reused.PrefixGen != 0 {
 		t.Fatalf("new table: prefix %q gen %d; old: %q gen %d", reused.prefix(), reused.PrefixGen, stale.prefix(), stale.PrefixGen)
 	}
 	_, err = st.insertRows(h.ctx, slow(stale), row)
 	expectErr(err, "may be lost", "slow write through the old metadata")
+	freshStale := *stale
+	freshStale.readAt = time.Now()
+	_, err = st.insertRows(h.ctx, &freshStale, row)
+	expectErr(err, "may be lost", "fast write through the old metadata")
 	expectErr(st.checkReads(h.ctx, []*tableMeta{slow(stale)}), "while this statement was reading", "slow read through the old metadata")
 	if _, err := st.insertRows(h.ctx, slow(reused), row); err != nil {
 		t.Errorf("slow write to the new table: %v", err)
@@ -540,19 +575,19 @@ func TestSQLRekeyConcurrentStatements(t *testing.T) {
 	if err := st.checkReads(h.ctx, []*tableMeta{slow(reused)}); err != nil {
 		t.Errorf("slow read of the new table: %v", err)
 	}
-	// A re-keying rename that takes a released prefix (dbt's swap: drop,
-	// then rename into place) is caught the same way.
+	h.expectRows(`SELECT COUNT(*) FROM it_rk_conc`, "1")
+	// A re-keying rename into a dropped table's name (dbt's swap: drop, then
+	// rename into place) gets new keys too, and is caught the same way.
 	h.exec(`DROP TABLE it_rk_conc`)
 	other := newRekeyHarness(t, map[string]string{OptionStringRenameRekey: "true"})
 	other.exec(`ALTER TABLE it_rk_conc2 RENAME TO it_rk_conc`)
-	if prefix, _ := h.tableNames(raw, "public", "it_rk_conc"); prefix != reused.prefix() {
-		t.Fatalf("renamed table prefix %q, want %q", prefix, reused.prefix())
+	if prefix, _ := h.tableNames(raw, "public", "it_rk_conc"); prefix == reused.prefix() || prefix == stale.prefix() {
+		t.Fatalf("renamed table prefix %q was used before", prefix)
 	}
 	_, err = st.insertRows(h.ctx, slow(reused), row)
-	expectErr(err, "have gone to another table", "slow write to a table dropped and replaced by a rename")
-	// Its row did reach the table that has the keys now, which is what the
-	// error says.
-	h.expectRows(`SELECT COUNT(*) FROM it_rk_conc`, "6")
+	expectErr(err, "may be lost", "slow write to a table dropped and replaced by a rename")
+	// None of its rows reached the table that has the name now.
+	h.expectRows(`SELECT COUNT(*) FROM it_rk_conc`, "5")
 }
 
 // A move stops once its lease can't be renewed.
@@ -608,20 +643,25 @@ func TestSQLRekeyInformationSchema(t *testing.T) {
 	h.dropTables("it_rk_is", "it_rk_is2", "it_rk_is3")
 	h.exec("DROP VIEW IF EXISTS it_rk_isv")
 	t.Cleanup(func() { h.exec("DROP VIEW IF EXISTS it_rk_isv") })
+	raw := h.rawClient()
 	h.exec(`CREATE TABLE it_rk_is (id INTEGER)`)
 	h.exec(`CREATE VIEW it_rk_isv AS SELECT id FROM it_rk_is`)
 	q := `SELECT table_name, table_type, key_prefix, index_name FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name LIKE 'it_rk_is%' ORDER BY table_name`
-	h.expectRows(q, "it_rk_is|BASE TABLE|public:it_rk_is:|idx:public:it_rk_is", "it_rk_isv|VIEW|NULL|NULL")
+	names := func(table, named string) string {
+		nm := namesFor("public", named, h.namesN(raw, "public", table, named))
+		return nm.prefix + "|" + nm.index
+	}
+	h.expectRows(q, "it_rk_is|BASE TABLE|"+names("it_rk_is", "it_rk_is"), "it_rk_isv|VIEW|NULL|NULL")
 
 	// A plain rename keeps the names; a re-keying one changes them.
 	h.exec(`ALTER TABLE it_rk_is RENAME TO it_rk_is2`)
-	h.expectRows(q, "it_rk_is2|BASE TABLE|public:it_rk_is:|idx:public:it_rk_is", "it_rk_isv|VIEW|NULL|NULL")
+	h.expectRows(q, "it_rk_is2|BASE TABLE|"+names("it_rk_is2", "it_rk_is"), "it_rk_isv|VIEW|NULL|NULL")
 	if err := h.setConnOption(OptionStringRenameRekey, "true"); err != nil {
 		t.Fatal(err)
 	}
 	h.exec(`ALTER TABLE it_rk_is2 RENAME TO it_rk_is3`)
-	h.expectRows(q, "it_rk_is3|BASE TABLE|public:it_rk_is3:|idx:public:it_rk_is3", "it_rk_isv|VIEW|NULL|NULL")
+	h.expectRows(q, "it_rk_is3|BASE TABLE|"+names("it_rk_is3", "it_rk_is3"), "it_rk_isv|VIEW|NULL|NULL")
 }
 
 // tryExec runs a statement and returns the rows affected and its error.
@@ -650,6 +690,7 @@ func TestSQLRekeyConcurrentWriters(t *testing.T) {
 	if err := h.ingest("it_rk_cw", adbc.OptionValueIngestModeCreate, false, ids...); err != nil {
 		t.Fatal(err)
 	}
+	oldPrefix, oldIndex := h.tableNames(raw, "public", "it_rk_cw")
 
 	// The writer inserts rows and moves one row's id along -1, -2, ….
 	w := newSQLHarness(t)
@@ -713,10 +754,11 @@ func TestSQLRekeyConcurrentWriters(t *testing.T) {
 	if len(rows) != len(got) {
 		t.Errorf("%d rows, %d distinct ids", len(rows), len(got))
 	}
-	if n := h.prefixKeyCount(raw, "public:it_rk_cw2:"); n != len(rows) {
+	newPrefix, _ := h.tableNames(raw, "public", "it_rk_cw2")
+	if n := h.prefixKeyCount(raw, newPrefix); n != len(rows) {
 		t.Errorf("%d keys under the new prefix, %d rows", n, len(rows))
 	}
-	h.expectReleased(raw, "public:it_rk_cw:", "idx:public:it_rk_cw")
+	h.expectReleased(raw, oldPrefix, oldIndex)
 	if len(inserted) == 0 || moved == 1 {
 		t.Errorf("the writer made no progress before the rename")
 	}

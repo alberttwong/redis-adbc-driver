@@ -20,8 +20,9 @@ package redis
 // and index name it was created with: one that dbt builds as
 // <name>__dbt_tmp and renames into place keeps that name in its keys. With
 // rename_rekey set, RENAME TO also moves the rows to the new name's prefix
-// and index (<schema>:<new>: and idx:<schema>:<new>, or ~N if those are
-// still reserved). It reads and writes every row, in four steps:
+// and index (<schema>:<new>: and idx:<schema>:<new>, or ~N if a table has
+// had those before: prefixes are never reused, see claimNames). It reads
+// and writes every row, in four steps:
 //
 //  1. Begin. One transaction reserves the new prefix and index name, sets
 //     rekey_to in the table's metadata, which refuses writes and other
@@ -44,11 +45,13 @@ package redis
 //
 // Other connections read a table's metadata at the start of each statement
 // (nothing is cached between statements), so a statement that overlaps a
-// re-key may still use the old names, even after another table has taken
-// them over. Every key prefix has a generation, the number of times it was
-// released (adbc:{meta}:released, bumped by DROP TABLE and by step 4), and
-// a table's metadata records the generation of its prefix (prefix_gen), so
-// that a statement can tell its table's rows moved away (checkKeys):
+// re-key may still use the old names after they were released. Every key
+// prefix has a generation, the number of times it was released
+// (adbc:{meta}:released, bumped by DROP TABLE and by step 4), and a table's
+// metadata records the generation of its prefix (prefix_gen), so that a
+// statement can tell its table's rows moved away (checkKeys). A released
+// prefix is never taken again (claimNames), so prefix_gen is 0 for tables
+// created since; earlier versions reused prefixes.
 //
 //   - Writers that read the metadata after step 1 are refused. One that
 //     read it just before may still be writing, so the copy waits until
@@ -56,7 +59,8 @@ package redis
 //     reading the metadata has been copied, and a slower one checks
 //     afterwards, and fails if the prefix is being moved or was released,
 //     since its changes may be lost or have gone to another table
-//     (checkWritten).
+//     (checkWritten). Once the prefix is released, it also deletes what it
+//     wrote there (discardWritten).
 //   - Readers use the old index and rows until the switch and the new ones
 //     after it. A statement that read the metadata during the move, or ran
 //     for rekeyFence or more, checks afterwards, and fails if the prefix was
@@ -199,6 +203,7 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 	for attempt := 0; attempt < 20; attempt++ {
 		var job *rekeyJob
 		var start tableMeta
+		var names tableNames
 		sent := time.Now()
 		err := s.client.Watch(ctx, func(tx *goredis.Tx) error {
 			cur, err := s.getTableWith(ctx, tx, schema, from)
@@ -220,26 +225,16 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 			} else if busy {
 				return errorf(adbc.StatusIO, "an earlier rename of table %q.%q has not finished cleaning up; try again later", displaySchema(schema), from)
 			}
-			prefix, err := firstFree(ctx, tx, prefixesKey, rowPrefix(schema, to), func(b string, n int) string {
-				return strings.TrimSuffix(b, ":") + "~" + strconv.Itoa(n) + ":"
-			})
-			if err != nil {
-				return err
-			}
-			index, err := firstFree(ctx, tx, indexesKey, indexName(schema, to), func(b string, n int) string {
-				return b + "~" + strconv.Itoa(n)
-			})
-			if err != nil {
-				return err
-			}
-			gen, err := prefixGen(ctx, tx, prefix)
+			// Names no table has had, as for a new table (claimNames), so
+			// the generation of the new prefix is 0.
+			names, err = s.freeNames(ctx, tx, schema, to)
 			if err != nil {
 				return err
 			}
 			job = &rekeyJob{Schema: schema, From: from, To: to, OldPrefix: cur.KeyPrefix, OldIndex: cur.IndexName,
-				KeyPrefix: prefix, IndexName: index, OldPrefixGen: cur.PrefixGen, KeyPrefixGen: gen, Owner: owner}
+				KeyPrefix: names.prefix, IndexName: names.index, OldPrefixGen: cur.PrefixGen, Owner: owner}
 			start = *cur
-			cur.RekeyTo = prefix
+			cur.RekeyTo = names.prefix
 			rawMeta, err := marshalMeta(cur)
 			if err != nil {
 				return err
@@ -249,8 +244,7 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 				return err
 			}
 			_, err = tx.TxPipelined(ctx, func(p goredis.Pipeliner) error {
-				p.SAdd(ctx, prefixesKey, prefix)
-				p.SAdd(ctx, indexesKey, index)
+				reserveNames(ctx, p, names)
 				p.HSet(ctx, rekeyKey, job.OldPrefix, rawJob)
 				p.Set(ctx, rekeyAliveKey(owner), "1", rekeyTTL)
 				p.Set(ctx, oldKey, rawMeta, 0)
@@ -264,38 +258,11 @@ func (s *store) beginRekey(ctx context.Context, schema, from, to string) (*rekey
 		if err != nil {
 			return nil, nil, wrapRedis(err, "failed to start the rename")
 		}
+		s.noteTempNames(names)
 		job.lease = s.holdLease(context.WithoutCancel(ctx), owner, sent)
 		return job, &start, nil
 	}
 	return nil, nil, errorf(adbc.StatusIO, "table %q.%q is being changed concurrently; try again", displaySchema(schema), from)
-}
-
-// firstFree returns the first of base, suffix(base, 2), … that is not in a
-// registry set, inside a transaction that watches the set (see claim).
-func firstFree(ctx context.Context, tx *goredis.Tx, set, base string, suffix func(string, int) string) (string, error) {
-	for n := 1; n < 10000; n++ {
-		cand := base
-		if n > 1 {
-			cand = suffix(base, n)
-		}
-		used, err := tx.SIsMember(ctx, set, cand).Result()
-		if err != nil {
-			return "", err
-		}
-		if !used {
-			return cand, nil
-		}
-	}
-	return "", errorf(adbc.StatusInternal, "could not reserve a unique name for %q", base)
-}
-
-// prefixGen returns a key prefix's generation: how often it was released.
-func prefixGen(ctx context.Context, c goredis.Cmdable, prefix string) (int64, error) {
-	n, err := c.HGet(ctx, releasedKey, prefix).Int64()
-	if errors.Is(err, goredis.Nil) {
-		return 0, nil
-	}
-	return n, err
 }
 
 // lease is a connection's hold on a re-key. It is renewed every rekeyTTL/4,
@@ -823,9 +790,9 @@ func (s *store) checkReads(ctx context.Context, metas []*tableMeta) error {
 
 // checkKeys fails if a table's rows may have moved away since its metadata
 // was read: its prefix was released (the table was re-keyed or dropped, even
-// if another table has the prefix now), or is being moved by a re-key
-// (which only matters to readers once it has switched). Otherwise the
-// metadata counts as read again now.
+// if an earlier version of the driver gave the prefix to another table
+// since), or is being moved by a re-key (which only matters to readers once
+// it has switched). Otherwise the metadata counts as read again now.
 func (s *store) checkKeys(ctx context.Context, meta *tableMeta, writing bool) error {
 	sent := time.Now()
 	pipe := s.client.Pipeline()
@@ -850,10 +817,21 @@ func (s *store) checkKeys(ctx context.Context, meta *tableMeta, writing bool) er
 		return nil
 	}
 	if writing {
-		return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table",
-			displaySchema(meta.Schema), meta.Name)
+		// No table has the prefix any more, and none will take it again
+		// (claimNames), so what this statement wrote there is left over.
+		if !kept.Val() {
+			s.discardWritten(ctx, meta)
+		}
+		return writeMovedErr(meta)
 	}
 	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, or dropped, while this statement was reading it; try again",
+		displaySchema(meta.Schema), meta.Name)
+}
+
+// writeMovedErr is the error of a statement whose table's rows moved away,
+// or that was dropped, while it was writing to it.
+func writeMovedErr(meta *tableMeta) error {
+	return errorf(adbc.StatusIO, "table %q.%q was renamed with its rows moved to new keys, or dropped, while this statement was writing to it; some of its changes may be lost or have gone to another table",
 		displaySchema(meta.Schema), meta.Name)
 }
 

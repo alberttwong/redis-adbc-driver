@@ -20,6 +20,8 @@ package redis
 // rounded to doubles; percentiles follow PostgreSQL's formulas.
 
 import (
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -50,6 +52,27 @@ func (h *sqlHarness) setupAggregates() {
 		(6, 'b', 'z', 10, -1.00, 8.0, false),
 		(7, 'c', NULL, NULL, NULL, NULL, NULL)`)
 	h.t.Cleanup(func() { h.exec("DROP TABLE IF EXISTS it_agg") })
+}
+
+// expectRowsNear checks a one-row result of doubles, each within 1e-12 of
+// the value wanted (relative).
+func (h *sqlHarness) expectRowsNear(sql string, want ...float64) {
+	h.t.Helper()
+	rows, _ := h.query(sql)
+	if len(rows) != 1 {
+		h.t.Fatalf("%s\n got: %q, want one row", sql, rows)
+	}
+	got := strings.Split(rows[0], "|")
+	if len(got) != len(want) {
+		h.t.Fatalf("%s\n got: %q, want %v", sql, rows[0], want)
+	}
+	for i, s := range got {
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.Abs(f-want[i]) > 1e-12*math.Abs(want[i]) {
+			h.t.Errorf("%s\n got: %q, want %v", sql, rows[0], want)
+			return
+		}
+	}
 }
 
 // expectTypeIDs checks the Arrow type IDs of a result's columns.
@@ -180,8 +203,11 @@ func TestSQLAggStatistics(t *testing.T) {
 	// Decimals are summed exactly too; doubles use Welford's algorithm.
 	h.expectRows(`SELECT VAR_SAMP(n), VAR_POP(n), STDDEV_SAMP(n), STDDEV_POP(n) FROM it_agg`,
 		"16.925|13.54|4.1140004861448425|3.6796738985948196")
-	h.expectRows(`SELECT VAR_SAMP(f), VAR_POP(f), STDDEV_SAMP(f), STDDEV_POP(f) FROM it_agg`,
-		"9.05|7.24|3.0083217912982647|2.6907248094147422")
+	// Welford's last bits depend on the order the rows come in, which on a
+	// cluster depends on the shards their keys hash to (and so on the
+	// table's key prefix, new each time the table is created).
+	h.expectRowsNear(`SELECT VAR_SAMP(f), VAR_POP(f), STDDEV_SAMP(f), STDDEV_POP(f) FROM it_agg`,
+		9.05, 7.24, 3.0083217912982647, 2.6907248094147422)
 
 	// Per group: the sample statistics of one value are NULL, the population
 	// ones 0; no values give NULL.
@@ -331,7 +357,10 @@ func TestSQLAggFilter(t *testing.T) {
 			t.Errorf("%s: aggregated in the index", q)
 		}
 	}
-	if _, _, indexAgg := h.planOf(`SELECT g, COUNT(*), SUM(v) FROM it_agg GROUP BY g`); !indexAgg {
+	// SUM(id), not SUM(v): on a cluster a shard whose rows of a group all
+	// lack v reports its SUM as nan, and the driver then aggregates itself.
+	// Which shard has which rows depends on the table's key prefix.
+	if _, _, indexAgg := h.planOf(`SELECT g, COUNT(*), SUM(id) FROM it_agg GROUP BY g`); !indexAgg {
 		t.Errorf("COUNT / SUM without FILTER: not aggregated in the index")
 	}
 
