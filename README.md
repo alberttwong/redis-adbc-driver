@@ -2507,6 +2507,15 @@ are skipped when `REDIS_URI` is unset (from `go`):
 REDIS_URI=redis://localhost:6379/0 go test -run TestSQL ./...
 ```
 
+To run every test, pass `-p 1` (as `make test` does), so the driver's and
+`redis-arrow`'s packages don't test against the server at once. Any
+connection that opens rolls back an abandoned move, including the ones the
+driver's rename tests set up and then expect to find.
+
+```bash
+REDIS_URI=redis://localhost:6379/0 go test -p 1 ./...
+```
+
 `TestSQLRowValueScale` times dbt's `delete+insert` with a composite key
 (with `-v`) on 20,000 rows; `REDIS_ROW_VALUES_ROWS=200000` runs it on
 200,000 (a multiple of 200), as measured under Performance.

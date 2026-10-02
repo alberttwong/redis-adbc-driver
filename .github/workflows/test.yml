@@ -68,12 +68,15 @@ jobs:
           docker compose up --detach --wait redis
           docker compose --profile cluster up --detach --wait redis-cluster
 
+      # -p 1: the packages' integration tests share the server, and a
+      # connection opened by one rolls back the abandoned moves another set
+      # up (see the Makefile's test target).
       - name: Test (standalone)
         working-directory: go
         env:
           REDIS_URI: redis://localhost:6379/0
         run: |
-          go test -count=1 ./...
+          go test -count=1 -p 1 ./...
           cd validation && uv run pytest -q tests/
 
       - name: Test (3-shard cluster)
@@ -81,5 +84,5 @@ jobs:
         env:
           REDIS_URI: redis://localhost:7001/0
         run: |
-          go test -count=1 ./...
+          go test -count=1 -p 1 ./...
           cd validation && uv run pytest -q tests/
