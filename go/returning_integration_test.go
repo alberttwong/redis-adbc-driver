@@ -430,6 +430,9 @@ func (h *sqlHarness) queryWith(sql string, rec arrow.RecordBatch) (string, []str
 			rows = append(rows, strings.Join(cells, "|"))
 		}
 	}
+	if err := rdr.Err(); err != nil {
+		h.t.Fatalf("%s: %v", sql, err)
+	}
 	slices.Sort(rows)
 	return fieldNames(rdr.Schema()), rows, n
 }

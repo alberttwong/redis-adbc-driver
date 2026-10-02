@@ -16,7 +16,10 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 )
@@ -115,6 +118,41 @@ func (s *store) countMatches(ctx context.Context, index, query string) (int64, e
 
 // aggregate runs the pipeline and reads every cursor page.
 func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error) {
+	c, err := s.openAggregate(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer c.close(ctx)
+	var rows []aggRow
+	for {
+		page, err := c.next(ctx)
+		if errors.Is(err, io.EOF) {
+			return rows, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, page...)
+	}
+}
+
+// aggCursor reads the results of an FT.AGGREGATE pipeline a cursor page at
+// a time. The cursor lives on the node that ran the query, so every page is
+// read through the same connection. Redis deletes a cursor left unread for
+// its idle time (300 seconds by default).
+type aggCursor struct {
+	node  searchConn
+	index string
+	count int
+	// first is the page the pipeline returned, until next returns it.
+	first   []aggRow
+	pending bool
+	// cursor is 0 once every page has been read, or the cursor deleted.
+	cursor int64
+}
+
+// openAggregate runs the pipeline and reads its first page.
+func (s *store) openAggregate(ctx context.Context, req *aggRequest) (*aggCursor, error) {
 	maxRows := int64(0)
 	if len(req.sortBy) > 0 {
 		if req.limit != nil {
@@ -125,13 +163,11 @@ func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error
 				return nil, err
 			}
 			if n == 0 && len(req.groupBy) == 0 {
-				return nil, nil
+				return &aggCursor{}, nil
 			}
 			maxRows = n
 		}
 	}
-	// The cursor lives on the node that ran the query, so every page is read
-	// through the same connection.
 	node, err := s.search(ctx, req.index)
 	if err != nil {
 		return nil, err
@@ -140,25 +176,57 @@ func (s *store) aggregate(ctx context.Context, req *aggRequest) ([]aggRow, error
 	if err != nil {
 		return nil, wrapRedis(err, "FT.AGGREGATE failed")
 	}
-	var rows []aggRow
-	for {
-		page, cursor, err := parseCursorReply(reply)
-		if err != nil {
-			return nil, err
-		}
-		rows = append(rows, page...)
-		if cursor == 0 {
-			return rows, nil
-		}
-		reply, err = node.Do(ctx, "FT.CURSOR", "READ", req.index, cursor, "COUNT", req.pageRows()).Result()
-		if err != nil {
-			_ = node.Do(ctx, "FT.CURSOR", "DEL", req.index, cursor).Err()
-			return nil, wrapRedis(err, "FT.CURSOR READ failed")
-		}
+	c := &aggCursor{node: node, index: req.index, count: req.pageRows(), pending: true}
+	if c.first, c.cursor, err = parseCursorReply(reply); err != nil {
+		c.close(ctx)
+		return nil, err
 	}
+	return c, nil
+}
+
+// next returns the next page of rows, or io.EOF after the last one. The
+// cursor is deleted when next fails.
+func (c *aggCursor) next(ctx context.Context) ([]aggRow, error) {
+	if c.pending {
+		c.pending = false
+		page := c.first
+		c.first = nil
+		return page, nil
+	}
+	if c.cursor == 0 {
+		return nil, io.EOF
+	}
+	reply, err := c.node.Do(ctx, "FT.CURSOR", "READ", c.index, c.cursor, "COUNT", c.count).Result()
+	if err != nil {
+		c.close(ctx)
+		if strings.Contains(err.Error(), "Cursor not found") {
+			return nil, errorf(adbc.StatusIO, "the query's cursor expired: Redis deletes a cursor that isn't "+
+				"read for its idle time (300 seconds by default). Read results sooner, or set %s=false", OptionStringStreamResults)
+		}
+		return nil, wrapRedis(err, "FT.CURSOR READ failed")
+	}
+	page, cursor, err := parseCursorReply(reply)
+	c.cursor = cursor
+	if err != nil {
+		c.close(ctx)
+		return nil, err
+	}
+	return page, nil
+}
+
+// close deletes the cursor if it is still open. It runs even when ctx is
+// cancelled, so that the cursor doesn't stay on the server until it
+// expires.
+func (c *aggCursor) close(ctx context.Context) {
+	if c.cursor != 0 {
+		_ = c.node.Do(context.WithoutCancel(ctx), "FT.CURSOR", "DEL", c.index, c.cursor).Err()
+		c.cursor = 0
+	}
+	c.pending, c.first = false, nil
 }
 
 // parseCursorReply parses a RESP2 WITHCURSOR reply: [[total, row...], cursor].
+// The cursor id is 0 when the last page has been read.
 func parseCursorReply(reply any) ([]aggRow, int64, error) {
 	outer, ok := reply.([]any)
 	if !ok || len(outer) != 2 {
@@ -168,9 +236,11 @@ func parseCursorReply(reply any) ([]aggRow, int64, error) {
 	if !ok {
 		return nil, 0, errorf(adbc.StatusInternal, "unexpected cursor id %T", outer[1])
 	}
+	// From here on, an error comes with the cursor, so that it can be
+	// deleted.
 	results, ok := outer[0].([]any)
 	if !ok {
-		return nil, 0, errorf(adbc.StatusInternal, "unexpected FT.AGGREGATE results %T", outer[0])
+		return nil, cursor, errorf(adbc.StatusInternal, "unexpected FT.AGGREGATE results %T", outer[0])
 	}
 	if len(results) == 0 {
 		return nil, cursor, nil
@@ -179,7 +249,7 @@ func parseCursorReply(reply any) ([]aggRow, int64, error) {
 	for _, r := range results[1:] {
 		fields, ok := r.([]any)
 		if !ok {
-			return nil, 0, errorf(adbc.StatusInternal, "unexpected FT.AGGREGATE row %T", r)
+			return nil, cursor, errorf(adbc.StatusInternal, "unexpected FT.AGGREGATE row %T", r)
 		}
 		row := make(aggRow, len(fields)/2)
 		for i := 0; i+1 < len(fields); i += 2 {

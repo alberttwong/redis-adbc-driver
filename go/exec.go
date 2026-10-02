@@ -68,6 +68,8 @@ type execResult struct {
 	cols     []resultColumn
 	rows     [][]Value
 	affected int64
+	// stream, if set, holds the rows instead (see stream.go).
+	stream *streamReader
 }
 
 func invalidArg(err error) error {
@@ -157,13 +159,15 @@ func (e *executor) loadTable(ctx context.Context, t TableName) (*tableMeta, erro
 	return meta, err
 }
 
-func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType) (res execResult, err error) {
+// execute runs one statement. With so set, a query's rows may be streamed
+// (see stream.go).
+func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, paramTypes []ColType, so *streamOpts) (res execResult, err error) {
 	e.cache = newExecCache()
 	// Tables read while their rows were being moved are checked once the
-	// statement is done (see rekey.go).
+	// statement is done (see rekey.go), or its stream has ended.
 	cache := e.cache
 	defer func() {
-		if err == nil {
+		if err == nil && res.stream == nil {
 			err = e.store.checkReads(ctx, cache.loaded)
 		}
 	}()
@@ -178,6 +182,9 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 		plan, err := e.planSelect(ctx, st, paramTypes)
 		if err != nil {
 			return execResult{}, err
+		}
+		if so != nil && plan.streamable() {
+			return e.streamSelect(ctx, plan, params, so)
 		}
 		rows, err := e.runSelect(ctx, plan, params)
 		if err != nil {
@@ -237,22 +244,33 @@ func (e *executor) execute(ctx context.Context, ps ParsedStmt, params []Value, p
 // ZONE column, or a timestamp in a text one). In UTC the conversion to
 // Arrow values (buildRecord) does the same.
 func (e *executor) fitResult(res execResult, err error) (execResult, error) {
-	z := e.zone()
-	if err != nil || !res.isQuery || z.isUTC() {
+	if err != nil || !res.isQuery {
 		return res, err
 	}
+	z := e.zone()
 	for _, row := range res.rows {
-		for j, v := range row {
-			if j < len(res.cols) && !v.Null && v.T != res.cols[j].Type {
-				cv, err := coerceIn(v, res.cols[j].Type, z)
-				if err != nil {
-					return execResult{}, invalidArg(err)
-				}
-				row[j] = cv
-			}
+		if err := fitRow(row, res.cols, z); err != nil {
+			return execResult{}, err
 		}
 	}
 	return res, nil
+}
+
+// fitRow is fitResult for one row.
+func fitRow(row []Value, cols []resultColumn, z tzZone) error {
+	if z.isUTC() {
+		return nil
+	}
+	for j, v := range row {
+		if j < len(cols) && !v.Null && v.T != cols[j].Type {
+			cv, err := coerceIn(v, cols[j].Type, z)
+			if err != nil {
+				return invalidArg(err)
+			}
+			row[j] = cv
+		}
+	}
+	return nil
 }
 
 // runSession runs transaction control, SET and SHOW (session.go).

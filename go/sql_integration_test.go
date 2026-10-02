@@ -120,6 +120,9 @@ func (h *sqlHarness) query(sql string) ([]string, *arrow.Schema) {
 			rows = append(rows, strings.Join(cells, "|"))
 		}
 	}
+	if err := rdr.Err(); err != nil {
+		h.t.Fatalf("%s: %v", sql, err)
+	}
 	return rows, rdr.Schema()
 }
 

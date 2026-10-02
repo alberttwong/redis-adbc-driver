@@ -29,7 +29,9 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"slices"
@@ -407,10 +409,51 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 	if req.where.none {
 		return nil, nil, nil
 	}
-	meta := req.meta
-	if meta.isMem {
+	if req.meta.isMem {
 		return e.scanMem(ctx, req, params)
 	}
+	if req.where.keys != nil {
+		it, fields, _ := e.newScanIter(ctx, req, params)
+		fetched, err := e.store.fetchRows(ctx, req.where.keys, fields)
+		if err != nil {
+			return nil, nil, err
+		}
+		return it.keep(req.where.keys, fetched)
+	}
+	it, err := e.openScan(ctx, req, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer it.close(ctx)
+	var keys []string
+	var rows []map[string]Value
+	for {
+		k, r, err := it.next(ctx)
+		if errors.Is(err, io.EOF) {
+			return keys, rows, nil
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		keys, rows = append(keys, k...), append(rows, r...)
+	}
+}
+
+// scanIter reads the rows of a scan: decodes them and applies the residual
+// predicate, a cursor page at a time for a scan through the index.
+type scanIter struct {
+	meta     *tableMeta
+	need     map[string]bool
+	residual Expr
+	env      *evalEnv
+	cur      *aggCursor
+}
+
+// newScanIter returns a scanIter for req without a cursor, and the HASH
+// fields to read: exactly is set when LOAD reads each of them exactly (see
+// loadsExactly).
+func (e *executor) newScanIter(ctx context.Context, req scanRequest, params []Value) (it *scanIter, fields []string, exactly bool) {
+	meta := req.meta
 	need := map[string]bool{}
 	for k := range req.need {
 		need[k] = true
@@ -418,65 +461,87 @@ func (e *executor) scan(ctx context.Context, req scanRequest, params []Value) ([
 	if req.where.residual != nil {
 		columnRefs(req.where.residual, need)
 	}
-	var fields []string
-	exact := true
+	exactly = true
 	for _, c := range meta.Columns {
 		if need[c.Name] {
 			fields = append(fields, c.field())
-			exact = exact && loadsExactly(c)
+			exactly = exactly && loadsExactly(c)
 			if c.MissingThrough > 0 {
 				fields = append(fields, nullMarker(c.field()))
 			}
 		}
 	}
-	keys := req.where.keys
-	var fetched []aggRow
-	if keys != nil {
-		var err error
-		if fetched, err = e.store.fetchRows(ctx, keys, fields); err != nil {
-			return nil, nil, err
-		}
-	} else {
-		ar := &aggRequest{
-			index:  meta.index(),
-			query:  req.where.query,
-			sortBy: req.sortBy,
-			limit:  req.limit,
-		}
-		if exact {
-			ar.load = append([]string{"__key", rowIDField}, fields...)
-			ar.width = len(ar.load)
-		} else {
-			ar.load, ar.loadAll = []string{"__key"}, true
-			ar.width = len(meta.Columns) + 2
-		}
-		var err error
-		if fetched, err = e.store.aggregate(ctx, ar); err != nil {
-			return nil, nil, err
-		}
-		keys = make([]string, len(fetched))
-		for i, r := range fetched {
-			if _, ok := r[rowIDField]; !ok {
-				fetched[i] = nil // deleted after the index matched it
-				continue
-			}
-			keys[i] = r["__key"]
-		}
+	it = &scanIter{meta: meta, need: need, residual: req.where.residual, env: e.newEnv(ctx, meta.types(), params)}
+	return it, fields, exactly
+}
+
+// openScan starts a scan through the index (req.where.keys nil) and reads
+// its first page.
+func (e *executor) openScan(ctx context.Context, req scanRequest, params []Value) (*scanIter, error) {
+	it, fields, exactly := e.newScanIter(ctx, req, params)
+	meta := req.meta
+	ar := &aggRequest{
+		index:  meta.index(),
+		query:  req.where.query,
+		sortBy: req.sortBy,
+		limit:  req.limit,
 	}
-	env := e.newEnv(ctx, meta.types(), params)
+	if exactly {
+		ar.load = append([]string{"__key", rowIDField}, fields...)
+		ar.width = len(ar.load)
+	} else {
+		ar.load, ar.loadAll = []string{"__key"}, true
+		ar.width = len(meta.Columns) + 2
+	}
+	cur, err := e.store.openAggregate(ctx, ar)
+	if err != nil {
+		return nil, err
+	}
+	it.cur = cur
+	return it, nil
+}
+
+// next returns the matching rows of the next cursor page, which may be
+// none, and their keys; io.EOF after the last page.
+func (it *scanIter) next(ctx context.Context) ([]string, []map[string]Value, error) {
+	page, err := it.cur.next(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys := make([]string, len(page))
+	for i, r := range page {
+		if _, ok := r[rowIDField]; !ok {
+			page[i] = nil // deleted after the index matched it
+			continue
+		}
+		keys[i] = r["__key"]
+	}
+	return it.keep(keys, page)
+}
+
+// close deletes the scan's cursor, if it is still open.
+func (it *scanIter) close(ctx context.Context) {
+	if it.cur != nil {
+		it.cur.close(ctx)
+	}
+}
+
+// keep decodes fetched rows, skipping nil ones, and returns those the
+// residual predicate accepts, with their keys.
+func (it *scanIter) keep(keys []string, fetched []aggRow) ([]string, []map[string]Value, error) {
 	outKeys := make([]string, 0, len(keys))
 	rows := make([]map[string]Value, 0, len(keys))
 	for i, raw := range fetched {
 		if raw == nil {
 			continue
 		}
-		vals, err := decodeRow(meta, raw, need)
+		vals, err := decodeRow(it.meta, raw, it.need)
 		if err != nil {
 			return nil, nil, err
 		}
-		if req.where.residual != nil {
-			env.row = vals
-			ok, err := env.eval(req.where.residual)
+		if it.residual != nil {
+			it.env.row = vals
+			ok, err := it.env.eval(it.residual)
 			if err != nil {
 				return nil, nil, invalidArg(err)
 			}
@@ -585,10 +650,31 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	if plan.aggregate {
 		return e.selectAggregate(ctx, plan, params)
 	}
+	sc, err := e.prepareScan(ctx, plan, params)
+	if err != nil {
+		return nil, err
+	}
+	return e.selectScanned(ctx, plan, sc, params)
+}
+
+// selectScan is how a SELECT on one table reads its rows (prepareScan).
+type selectScan struct {
+	req scanRequest
+	// indexSort is set when the rows come in ORDER BY order (or insertion
+	// order, without ORDER BY) from the index, and pushLimit when LIMIT
+	// and OFFSET run there too.
+	indexSort bool
+	pushLimit bool
+}
+
+// prepareScan plans how a SELECT on one table (not an aggregate) reads its
+// rows: what the index matches, the columns to read, and whether the index
+// sorts and limits them.
+func (e *executor) prepareScan(ctx context.Context, plan *selectPlan, params []Value) (selectScan, error) {
 	meta := plan.meta
 	wp, err := e.planWhere(ctx, plan.sel.Where, meta, params)
 	if err != nil {
-		return nil, err
+		return selectScan{}, err
 	}
 	req := scanRequest{meta: meta, where: wp, need: maps.Clone(plan.extraNeed)}
 	if req.need == nil {
@@ -643,8 +729,14 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 		}
 		req.limit = &[2]int64{off, *sel.Limit}
 	}
+	return selectScan{req: req, indexSort: indexSort, pushLimit: pushLimit}, nil
+}
 
-	_, rows, err := e.scan(ctx, req, params)
+// selectScanned reads the rows prepareScan planned, then computes windows,
+// sorts, limits and evaluates the select list.
+func (e *executor) selectScanned(ctx context.Context, plan *selectPlan, sc selectScan, params []Value) ([][]Value, error) {
+	meta, sel, indexSort, pushLimit := plan.meta, plan.sel, sc.indexSort, sc.pushLimit
+	_, rows, err := e.scan(ctx, sc.req, params)
 	if err != nil {
 		return nil, err
 	}
@@ -680,17 +772,26 @@ func (e *executor) runSelect(ctx context.Context, plan *selectPlan, params []Val
 	out := make([][]Value, 0, len(idx))
 	for _, i := range idx {
 		setRow(i)
-		row := make([]Value, len(plan.items))
-		for i, it := range plan.items {
-			v, err := env.eval(it.expr)
-			if err != nil {
-				return nil, invalidArg(err)
-			}
-			row[i] = v
+		row, err := evalItems(env, plan.items)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// evalItems evaluates a select list on env's row.
+func evalItems(env *evalEnv, items []planItem) ([]Value, error) {
+	row := make([]Value, len(items))
+	for i, it := range items {
+		v, err := env.eval(it.expr)
+		if err != nil {
+			return nil, invalidArg(err)
+		}
+		row[i] = v
+	}
+	return row, nil
 }
 
 // runDistinct runs a SELECT DISTINCT without its LIMIT / OFFSET (so they
